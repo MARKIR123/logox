@@ -1,0 +1,111 @@
+# Logox 内置默认配置（与 config/schema.py 的字段默认值**逐字段一致**）
+#
+# 本文件不是加载路径的一部分——真正的默认值来自 schema.py 的 pydantic 字段默认值，
+# 由测试 T-30 守护两者不漂移。它的作用是让人**一眼看到全部可配置项与默认值**，
+# 可以整段复制到 ~/.logox/config.toml 再按需修改。
+#
+# 注意：密钥只能通过 api_key_env 指向环境变量，禁止在此写 api_key（会被拒绝）。
+
+schema_version = 1
+
+[provider]
+name = "openai-compatible"
+model = ""
+temperature = 0.2
+max_tokens = 16384
+request_timeout_s = 120.0
+thinking_effort = "auto"          # off | low | medium | high | auto（D42）
+
+# [providers.example]
+# kind = "openai_compat"          # openai_compat | anthropic
+# base_url = "https://api.deepseek.com/v1"
+# api_key_env = "DEEPSEEK_API_KEY"
+# models = ["deepseek-chat", "deepseek-reasoner"]
+
+[kernel]
+max_iterations = 50               # 一个回合内最多几轮「模型要工具 → 执行 → 再要」（M3/D94）
+max_retries = 3                   # 可重试错误的最大重试次数（D22 / D52）
+retry_base_s = 0.5                # 首次退避；此后指数增长（±20% 抖动）
+retry_max_s = 30.0                # 退避上限，也是厂商 Retry-After 的裁剪上限
+concurrency = 4                   # 只读工具批的并发度（D27）
+
+[context]
+compact_threshold = 0.75
+keep_recent_turns = 6
+tool_result_keep_turns = 3
+max_tool_result_chars = 8000
+project_memory_enabled = true
+reasoning_in_context = false      # D31：推理内容不计入上下文预算
+
+[shell]
+backend = "auto"                  # auto | gitbash | wsl | powershell（D19）
+timeout_s = 120.0
+kill_tree = true                  # D22：Esc 时杀灭进程树
+
+[permissions]
+default_decision = "ask"          # allow | deny | ask（D10 / D34）
+learn_scope = "project"           # session | project | global
+
+[tools]
+enabled = ["read", "write", "edit", "glob", "grep", "shell", "todo"]   # D18
+readonly_concurrency = 4          # D27
+
+[hooks]
+enabled = true                    # D23：仅观察型钩子
+blocking = true
+timeout_s = 5.0
+
+# [[hooks.entries]]
+# event = "post_tool_use"         # session_start | post_tool_use | pre_compact | notification | stop
+# matcher = "edit|write"
+# command = "ruff format $LOGOX_FILE_PATH"
+
+[mcp]
+enabled = true                    # D20
+default_timeout = 30.0            # D109
+
+# [[mcp.servers]]
+# name = "filesystem"
+# transport = "stdio"             # stdio | http
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# enabled = true
+# startup_timeout_s = 20.0
+
+[ui]
+theme = "logox-dark"              # D43：logox-dark | logox-light | logox-contrast
+layout = "auto"                   # auto | dual | single
+sidebar_width = 32
+diff_context_lines = 3
+stream_fps = 10
+show_reasoning = "collapsed"      # collapsed | expanded | hidden（D31）
+icon_set = "unicode"              # unicode | ascii | nerd
+animations = true
+
+# D42：默认仅开 4 项（model 已含思考档位）
+[ui.status_items]
+model = true
+context = true
+throughput = true
+cache = true
+tool = false
+turn = false
+usage = false
+timing = false
+permission = false
+git = false
+session = false
+
+[ui.timing_fields]
+total = true
+llm = true
+tool = true
+
+[session]
+store_dir = ""
+log_events = true                 # D25
+log_redact = true
+
+[plugins]
+enabled = true
+paths = []

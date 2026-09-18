@@ -1,0 +1,5 @@
+# Logox workspace ignore (D119)
+.env
+state.toml
+runs/
+*.log

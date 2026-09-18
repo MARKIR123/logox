@@ -1,0 +1,82 @@
+/* Logox 主布局（UI-SPEC §2）
+ *
+ * 颜色一律用 CSS 变量 —— 变量由 App.get_css_variables() 从主题的 18 个语义 token
+ * 注入（见 tui/theme.py）。因此**本文件里不出现任何字面色值**，
+ * 换主题 = 换一组变量（UI-SPEC §3.1 红线）。
+ */
+
+Screen {
+    background: $bg-base;
+    color: $text-primary;
+}
+
+/* 垂直堆叠顺序（UI-SPEC §2.3）：
+ *   时间线（弹性） → 队列框（有内容时） → 输入区 → 状态栏（固定最后一行）
+ * 提示行已移除：键位改由 `/help` 或 F1 查看。
+ */
+#body {
+    height: 1fr;
+    width: 100%;
+}
+
+TimelineView {
+    height: 1fr;
+    width: 1fr;
+    background: $bg-base;
+}
+
+SidePanel {
+    width: 32;
+    height: 1fr;
+    background: $bg-raised;
+    border-left: solid $border-subtle;
+}
+
+QueueView {
+    height: auto;
+    max-height: 8;
+    width: 100%;
+    background: $bg-overlay;
+}
+
+PromptInput {
+    height: auto;
+    min-height: 1;
+    max-height: 8;
+    border: none;
+    background: $bg-base;
+    color: $text-primary;
+}
+
+/* 生成中输入区加一条弱边框，提示"当前正在跑"（UI-SPEC §5.9） */
+PromptInput.busy {
+    border-left: solid $accent;
+}
+
+StatusBar {
+    height: 1;
+    width: 100%;
+    background: $bg-raised;
+}
+
+/* 专注模式：隐藏侧栏与状态栏，最大化阅读区（R6） */
+Screen.focus-mode SidePanel {
+    display: none;
+}
+
+Screen.focus-mode StatusBar {
+    display: none;
+}
+
+/* 窄屏降级（UI-SPEC §2.2）：<100 列时侧栏收窄；<80 列时整体隐藏 */
+Screen.narrow SidePanel {
+    width: 24;
+}
+
+Screen.compact SidePanel {
+    display: none;
+}
+
+.hidden {
+    display: none;
+}

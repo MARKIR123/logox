@@ -1,0 +1,90 @@
+[project]
+name = "logox"
+version = "0.1.0"
+description = "Logox —— 内核极简、外延极松、界面体面的终端 Agent（TUI）"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+keywords = ["agent", "llm", "tui", "coding-agent", "terminal"]
+
+# 依赖下限区间由本文件声明，精确版本由 uv.lock 锁定（D33）。
+#
+# ⚠️ **textual 已在 D85 移除**：界面改成自研的行式渲染器
+# （`src/logox/tui/render/`，对齐 Pi agent）之后，全项目**没有一处**再用它。
+# 它曾经是最大的运行时依赖（拉进来 20 多个传递包），却只为一个已经被删掉的
+# 全屏界面服务——留着它就是"菜单上有一道没人点的菜"。
+dependencies = [
+    "rich",
+    "pydantic>=2",
+    "httpx>=0.27",
+    "openai>=1.0",
+    "anthropic",
+    "mcp",
+    "platformdirs>=4",
+]
+
+[project.scripts]
+logox = "logox.cli:main"
+
+# 开发期依赖（可选）。测试本身用标准库 unittest 编写（D45），pytest 只是可选的运行器。
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/logox"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    # 行宽由 formatter 逻辑管理；超长行大多是中文注释与断言消息，截断反而更难读
+    "E501",
+    # UP042 建议把 `class X(str, Enum)` 换成 `StrEnum`（3.11+）。
+    # **刻意不采纳**：`ErrorCategory` / `Decision` / `TurnStatus` 是**跨模块的公开契约**，
+    # 参与 JSON 序列化、事件载荷与错误消息格式化。`(str, Enum)` 与 `StrEnum` 在
+    # `__str__` / `__format__` 上的行为**不完全一致**（f-string 插值尤其），
+    # 而这三处已有测试与外部消费者。为了一个风格规则去动公开契约的行为，
+    # 收益是 0、风险不为 0 —— 这属于"lint 是工具，不是权威"。
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里刻意用私有属性检查内部状态（如游标、消费者任务），这在测试中是合理的
+"tests/**" = ["SLF001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["logox"]
+
+# 测试用标准库 unittest 编写（D45）：无网络环境下也能运行。
+# pytest 可用时可直接收集这些测试（pytest 原生支持 unittest 风格），无需改写。
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# 把 pytest 的缓存目录从仓库根挪进 `.test-tmp/`。
+#
+# **背景**：默认值 `.pytest_cache` 落在仓库根，而 pytest 9 写缓存失败时不会只是
+# "放弃写入"——它会先 `tempfile.mkdtemp(prefix="pytest-cache-files-")` 在**仓库根**
+# 造一个探测目录。历史上（DSH 沙箱 + CPython 对 0o700 的特判，见
+# docs/DEV-ENVIRONMENT.md §4）那批目录是用 mode 0o700 建的，于是**每跑一次 pytest
+# 就在仓库里多一个既读不了也删不掉的空目录**（实测累计 49 个）。
+#
+# 现在 `tools/pyshim` 已把这个坑从源头去掉了，所以这条设置从"必须"降级为
+# **卫生习惯**：pytest 的缓存本来就不该出现在仓库根，而 `.test-tmp/` 已 gitignore。
+cache_dir = ".test-tmp/pytest-cache"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/logox"]
+strict = false
+warn_unused_ignores = true
+disallow_untyped_defs = true
