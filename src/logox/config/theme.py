@@ -174,6 +174,57 @@ def validate_contrast(theme: ThemeFile) -> list[str]:
     if muted < MIN_CONTRAST_MUTED:
         problems.append(f"text_muted/bg_base 对比度 {muted:.2f}:1 低于要求的 {MIN_CONTRAST_MUTED}:1")
 
+    # -- D152-b：输入框专属 token 的**下限校验** --
+    #
+    # 为什么必须进校验，而不是"把内置主题的值改亮就行"：
+    # 只改内置值的话，**下一个自定义主题照样能配出看不见的输入框**，而症状
+    # （"输入框看不清"）与原因（"主题配错了"）之间的因果链很长 —— 用户只会再报一次同样的障。
+    # 写进校验后，错误在**加载时**就带着 token 名与实测对比度被拒绝。
+    #
+    # `input_text` 是**正文**，与 text_primary 同级要求；
+    # `input_border` 是"聚焦框"（UI-SPEC:102 的措辞），取次要级 3.0 ——
+    # 而它原来借用的 border_subtle 只有 1.30:1，正是用户报障的那个数。
+    input_text_ratio = contrast_ratio(palette.input_text, palette.bg_base)
+    if input_text_ratio < primary_min:
+        problems.append(
+            f"input_text/bg_base 对比度 {input_text_ratio:.2f}:1 低于要求的 {primary_min}:1"
+            + ("（高对比主题）" if high else "")
+        )
+
+    input_border_ratio = contrast_ratio(palette.input_border, palette.bg_base)
+    if input_border_ratio < MIN_CONTRAST_MUTED:
+        problems.append(
+            f"input_border/bg_base 对比度 {input_border_ratio:.2f}:1 低于要求的 "
+            f"{MIN_CONTRAST_MUTED}:1（输入框框线是**聚焦框**，不能弱到看不见）"
+        )
+
+    # -- D161：思考与工具输出的专属 token（接通后补的校验）--
+    #
+    # 为什么这批也要校验：它们**刚刚才从"死配置"变成"真的会被画出来"**。
+    # 在接通之前，`thinking_off` 只有 1.91:1（dark）/ 1.54:1（light）而**没有任何人受影响**——
+    # 因为没人读它。接通之后同一个值会真的显示出来：一个 1.54:1 的档位词＝看不见的字。
+    # **值没变，但后果变了** —— 这正是"接通"必须配套"加校验"的原因。
+    #
+    # 阈值口径：
+    #   * `tool_output_fg` 是**工具结果正文**（用户展开卡片就想读它）→ 正文级
+    #   * `thinking_text` 是展开的思考正文，读它是"可选行为" → 次要级
+    #   * 4 个档位色是状态行的词 → 次要级
+    tool_output_ratio = contrast_ratio(palette.tool_output_fg, palette.bg_base)
+    if tool_output_ratio < primary_min:
+        problems.append(
+            f"tool_output_fg/bg_base 对比度 {tool_output_ratio:.2f}:1 低于要求的 {primary_min}:1"
+            + ("（高对比主题）" if high else "")
+            + "（工具结果正文，用户展开卡片就是为了读它）"
+        )
+
+    for token in ("thinking_text", "thinking_off", "thinking_low", "thinking_medium", "thinking_high"):
+        ratio = contrast_ratio(getattr(palette, token), palette.bg_base)
+        if ratio < MIN_CONTRAST_MUTED:
+            problems.append(
+                f"{token}/bg_base 对比度 {ratio:.2f}:1 低于要求的 {MIN_CONTRAST_MUTED}:1"
+                "（它会作为**文字**画在屏幕上：思考正文或状态行的档位词）"
+            )
+
     for name in ("accent", "success", "warning", "danger", "info"):
         ratio = contrast_ratio(getattr(palette, name), palette.bg_base)
         if ratio < MIN_CONTRAST_MUTED:

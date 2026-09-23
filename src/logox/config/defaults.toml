@@ -30,12 +30,18 @@ retry_max_s = 30.0                # 退避上限，也是厂商 Retry-After 的�
 concurrency = 4                   # 只读工具批的并发度（D27）
 
 [context]
-compact_threshold = 0.75
-keep_recent_turns = 6
-tool_result_keep_turns = 3
-max_tool_result_chars = 8000
-project_memory_enabled = true
-reasoning_in_context = false      # D31：推理内容不计入上下文预算
+# 压缩判据 = 窗口 − reserve_tokens（不是"窗口 × 比例"：那在 1M 窗口下会把触发点压到 8%）
+reserve_tokens = 32768            # 给"回答 + 估算误差"预留；默认 = 默认 max_tokens 的两倍
+low_watermark_ratio = 0.5         # 修剪后降到窗口的这个比例以下即算完成
+max_budget_tokens = 0             # 成本闸门：只能压低水位线，不能抬高；0 = 不封顶
+
+keep_recent_turns = 2             # 压缩时保留多少个**完整轮次**
+keep_recent_tool_results = 2      # 全局保留最近多少**条工具结果**
+
+rehydrate_files = 5               # 折叠后重新读回最近 N 个碰过的文件（0 = 关闭）
+rehydrate_max_chars = 2000        # 每个文件最多读回多少字符
+
+project_memory_enabled = true     # 关掉则完全不读项目 LOGOX.md
 
 [shell]
 backend = "auto"                  # auto | gitbash | wsl | powershell（D19）
@@ -75,6 +81,7 @@ default_timeout = 30.0            # D109
 [ui]
 theme = "logox-dark"              # D43：logox-dark | logox-light | logox-contrast
 layout = "auto"                   # auto | dual | single
+fullscreen = false
 sidebar_width = 32
 diff_context_lines = 3
 stream_fps = 10

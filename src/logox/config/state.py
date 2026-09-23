@@ -261,6 +261,23 @@ class StateStore:
         self.update(transform)
         return True
 
+    def revoke_permission(self, kind: str, rule: str) -> bool:
+        """从 state.toml 中撤销一条权限规则（D132）。**不存在时不写盘**。"""
+        if kind not in ("allow", "deny"):
+            raise ValueError(f"kind 只能是 'allow' 或 'deny'，收到 {kind!r}")
+
+        def transform(state: StateFile) -> StateFile:
+            bucket: list[str] = getattr(state.permissions, kind)
+            if rule in bucket:
+                bucket.remove(rule)
+            return state
+
+        current = self.read()
+        if rule not in getattr(current.permissions, kind):
+            return False
+        self.update(transform)
+        return True
+
     def set_permission_mode(self, mode: str) -> None:
         """设置权限运行模式（D130：default / creative）。"""
         if mode not in ("default", "creative"):
@@ -436,6 +453,10 @@ class LayeredStateStore:
         确保项目间的命令与路径白名单物理隔离。
         """
         return self.project_store.learn_permission(kind, rule)
+
+    def revoke_permission(self, kind: str, rule: str) -> bool:
+        """从项目 state.toml 中撤销一条权限规则（D132）。"""
+        return self.project_store.revoke_permission(kind, rule)
 
     def set_permission_mode(self, mode: str) -> None:
         """设置权限运行模式（D130：严格单写当前项目 project_store，绝不污染全局）。"""

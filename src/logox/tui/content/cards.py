@@ -6,8 +6,10 @@
 
 关于 diff 数据
 --------------
-:class:`DiffHunk` 与 :func:`parse_unified_diff` 在 M1.5 先放在这里。
-**生成侧**（``tools/edit/diff.py``，M5）将产出同一结构，届时本模块只保留渲染职责。
+:class:`DiffHunk` 与 :func:`parse_unified_diff` 住在 :mod:`logox.difftext`
+（D140 / F-50 搬迁完成）—— 因为**工具层的生成侧也要用它们**，
+放在这里会让 `import logox.tools.*` 连带加载界面层。本模块现在只保留渲染职责，
+并按老路径把它们**转出**（兼容既有 import）。
 """
 
 from __future__ import annotations
@@ -50,6 +52,13 @@ STATE_TOKEN: dict[str, str] = {
 #: 窄屏阈值：低于此宽度时 diff 只显示变更行（UI-SPEC §5.6）
 COMPACT_WIDTH = 80
 
+#: 工具卡展开后**最多显示多少行输出**（F-43 / D136）。
+#:
+#: 为什么必须有上限：`shell` / `read` 的输出动辄几百行，全部铺开会把时间线冲掉 ——
+#: 而用户按下 `Ctrl+O` 想看的通常是"这台命令报了什么错"，不是从头读一遍日志。
+#: 完整内容仍可从 `transcript.jsonl` / 工具 blob 里查。
+LARGE_OUTPUT_PREVIEW = 30
+
 #: 大 diff 阈值与折叠后的预览行数（UI-SPEC §5.6）
 LARGE_DIFF_LINES = 200
 LARGE_DIFF_PREVIEW = 20
@@ -72,60 +81,14 @@ class CardContext:
 
 
 # --------------------------------------------------------------------------- #
-# diff 数据与解析
+# diff 数据（D140：类型与解析已下沉到 `logox.difftext`）
 # --------------------------------------------------------------------------- #
-
-DiffLineKind = Literal["context", "add", "del", "meta"]
-
-
-@dataclass(frozen=True)
-class DiffHunk:
-    """一个 hunk（``@@`` 块）。``lines`` 为 ``(kind, text)`` 序列。"""
-
-    header: str
-    lines: tuple[tuple[DiffLineKind, str], ...] = ()
-
-    @property
-    def added(self) -> int:
-        return sum(1 for kind, _ in self.lines if kind == "add")
-
-    @property
-    def removed(self) -> int:
-        return sum(1 for kind, _ in self.lines if kind == "del")
-
-
-def parse_unified_diff(text: str) -> list[DiffHunk]:
-    """把 unified diff 文本解析成 hunks（文件头 ``---``/``+++`` 由调用方处理）。"""
-    hunks: list[DiffHunk] = []
-    header: str | None = None
-    lines: list[tuple[DiffLineKind, str]] = []
-
-    def flush() -> None:
-        nonlocal header, lines
-        if header is not None:
-            hunks.append(DiffHunk(header=header, lines=tuple(lines)))
-        header, lines = None, []
-
-    for raw in text.splitlines():
-        if raw.startswith("@@"):
-            flush()
-            header = raw
-            continue
-        if header is None:
-            continue
-        if raw.startswith("+++") or raw.startswith("---"):
-            continue
-        if raw.startswith("+"):
-            lines.append(("add", raw[1:]))
-        elif raw.startswith("-"):
-            lines.append(("del", raw[1:]))
-        elif raw.startswith("\\"):
-            lines.append(("meta", raw))
-        else:
-            lines.append(("context", raw[1:] if raw.startswith(" ") else raw))
-    flush()
-    return hunks
-
+#
+# ⚠️ 这里**只做转出**，不再自己定义：`DiffHunk` / `parse_unified_diff` 的消费者有两个层
+# （工具层的生成侧 + 界面层的渲染侧），所以它们的家是**两边之下的中立模块**。
+# 留在本模块会导致 `import logox.tools.*` 顺手把界面层拖进来（F-50）。
+# 老的 `from logox.tui.content.cards import DiffHunk` 写法依然可用 —— 这是**故意**的兼容。
+from logox.difftext import DiffHunk, DiffLineKind, parse_unified_diff
 
 # --------------------------------------------------------------------------- #
 # 纯渲染函数
@@ -177,7 +140,22 @@ def render_tool_card(
     expanded: bool = False,
     indent: int = 0,
 ) -> Text:
-    """渲染一张工具卡片（**整宽状态底色块**：折叠态一行 + 可选展开内容）。
+    """渲染一张工具卡片：**折叠态只有一行**，展开态才在下面挂内容（D132）。
+
+    两个状态各写什么（用户裁定）：
+
+    ============ ==================================================================
+    折叠态         **一行**：状态字形/颜色（= 执行结果）+ 工具名（= 操作） +
+                   ``args_summary``（= 参数）[+ 耗时]。**没有**变更徽标、**没有**键位提示
+    展开态         同一行 + 变更徽标 + ``Ctrl+O 折叠``，下面缩进挂参数正文/工具输出
+    ============ ==================================================================
+
+    ⚠️ **为什么折叠态要把徽标与提示都拿掉**：它们原先各占一行/一段（``└ diff +1 -1``
+    外加 ``Ctrl+O 展开``）。用户的原话是"虽然没有完全展开，但 diff 和工具调用还是有一块在"
+    —— 也就是说那种"折叠了但还占一块"的中间态正是要消灭的东西。
+
+    ⚠️ **同时补上了"怎么收回"的提示**（D132）：原先只在折叠态写 ``Ctrl+O 展开``，
+    展开后一个字都不写 —— 用户展开完就找不到收回的路，合理地以为"关不掉、没这个快捷键"。
 
     状态用**符号 + 前景色**表达，**不用底色**（D81，用户裁定）。
     运行中 / 成功 / 失败各有一个字形（``⏺``/``✓``/``✗``）与颜色，
@@ -201,24 +179,46 @@ def render_tool_card(
         glyphs=context.glyphs,
     )
     pad = " " * indent
-    out = Text(pad + clip(summary, width - indent), style=getattr(palette, STATE_TOKEN[state]))
+    summary_width = max(4, width - indent)
 
+    if not expanded:
+        # ★ D132：折叠态 **就这一行**（多一个字都不加，见 docstring）
+        return Text(
+            pad + clip(summary, summary_width),
+            style=getattr(palette, STATE_TOKEN[state]),
+        )
+
+    # 展开态：摘要 +（可选）变更徽标 + **怎么收回**的提示。
+    # ⚠️ 先把尾巴的宽度算出来再裁摘要 —— 否则尾巴会把行撑超宽，
+    #    而渲染器的兜底是**硬切**，被切掉的恰好是那句提示（等于没写）。
+    tail: list[tuple[str, str]] = []
     badge = render_diff_badge(change_stat)
     if badge != EMPTY:
-        # D40：编辑类卡片默认折叠，只在摘要下追加一行**变更徽标**
-        out.append("\n" + pad + "  └ ")
-        out.append(badge, style=palette.text_muted)
-        if not expanded:
-            out.append("      Ctrl+O 展开", style=palette.text_faint)
+        tail.append(("  " + badge, palette.text_muted))
+    tail.append(("   Ctrl+O 折叠", palette.text_faint))
+    budget = max(8, summary_width - sum(cell_len(text) for text, _ in tail))
 
-    if expanded:
-        # 展开内容用**缩进**挂在摘要下（缩进是可依赖的结构信号，底色不是）
-        if args_text:
+    out = Text(pad + clip(summary, budget), style=getattr(palette, STATE_TOKEN[state]))
+    for text, style in tail:
+        out.append(text, style=style)
+
+    # 展开内容用**缩进**挂在摘要下（缩进是可依赖的结构信号，底色不是）
+    # ★ D139：两个内容块（① 完整参数、② 结果主体）走**同一个**渲染函数。
+    # ★ D182：展开后 100% 完整展示全部输出，不再截断，亦不再打印“另有xx行未显示”占位提示。
+    def append_content(text: str, style: str) -> None:
+        lines = text.splitlines() or [""]
+        for line in lines:
             out.append("\n" + pad + "  ")
-            out.append(clip(args_text, content_width), style=palette.text_muted)
-        if payload:
-            out.append("\n" + pad + "  ")
-            out.append(clip(payload, content_width), style=palette.text_primary)
+            out.append(clip(line, content_width), style=style)
+
+    # 顺序即 UI-SPEC §5.6 的顺序：① 完整参数 → ② 结果主体
+    if args_text:
+        append_content(args_text, palette.text_muted)
+    if payload:
+        # ★ D161：工具**结果主体**用专属 token（此前借 text_primary）。
+        #   它和"完整参数"（text_muted）是两个不同的东西：参数是你想看"它到底干了什么"，
+        #   结果是你想看"它得到了什么"—— 分开之后两者可以各自调深浅。
+        append_content(payload, palette.tool_output_fg)
     return out
 
 
@@ -269,29 +269,22 @@ def render_diff(
     if badge != EMPTY:
         out.append(f"   {badge}", style=palette.text_muted)
     if not expanded:
+        # D125-b：折叠态必须给出**怎么展开**的提示。
+        # 原先这里直接 return、一个字都不留 —— 用户看到一行路径 + 徽标，
+        # 无从知道按哪个键能看到 diff（对比工具卡就写了 `Ctrl+O 展开`）。
+        out.append("   Ctrl+O 展开", style=palette.text_faint)
         return out
 
-    total = sum(len(hunk.lines) for hunk in hunks)
-    truncated = total > LARGE_DIFF_LINES
-    shown = 0
-
+    # ★ D182：展开后 100% 完整展示全部 diff，不再截断行数
     for hunk in hunks:
         out.append("\n" + pad + clip(hunk.header, width), style=palette.text_faint)
         for kind, text in hunk.lines:
             if compact and kind == "context":
                 continue  # 窄屏：上下文一律不显示
-            if truncated and shown >= LARGE_DIFF_PREVIEW:
-                continue
             # 注意：Rich 的 append 只接 str，要插入带样式的片段必须用 append_text
             out.append("\n" + pad)
             out.append_text(_diff_line(kind, text, width, palette))
-            shown += 1
 
-    if truncated:
-        out.append(
-            f"\n{pad}… 共 {total} 行，只预览前 {LARGE_DIFF_PREVIEW} 行（Ctrl+O 展开全部）",
-            style=palette.text_faint,
-        )
     return out
 
 
@@ -332,15 +325,18 @@ def render_reasoning(
             f"{pad}{glyph} 思考 ({format_duration(duration_ms)} · {cell_len(text)} 字)",
             style=palette.text_muted,
         )
-        if not expanded:
-            out.append("   Ctrl+O 展开", style=palette.text_faint)
+    if not expanded:
+        # D125：思考链归 `Ctrl+T`（**不再是 `Ctrl+O`** —— 那个键改成只切工具与 diff）。
+        out.append("   Ctrl+T 展开", style=palette.text_faint)
 
     if expanded and text:
+        # ★ D182：展开后 100% 完整展示全部思考文本，不再截断，亦不再打印“另有xx行未显示”占位提示。
         lines = text.splitlines() or [text]
-        if len(lines) > MAX_REASONING_LINES:
-            lines = [*lines[:MAX_REASONING_LINES], f"… 另有 {len(lines) - MAX_REASONING_LINES} 行未显示"]
         for line in lines:
             out.append(f"\n{pad}│ ", style=palette.border_subtle)
-            out.append(clip(line, width), style=f"italic {palette.text_muted}")
+            # ★ D161：展开的思考正文用**专属** token（此前借 text_muted）。
+            #   接通的意义不是"改外观"（两者当前取值相同）而是**交出控制权** ——
+            #   从此你可以只调思考正文而不动状态行/思考标题。
+            out.append(clip(line, width), style=f"italic {palette.thinking_text}")
     return out
 

@@ -21,7 +21,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -29,14 +32,13 @@ from rich.text import Text
 
 from logox.config.schema import StatusItems, TimingFields
 from logox.kernel import events as ev
+from logox.permission_types import PermissionAsk, PermissionChoice
 from logox.tui.content.cards import CardContext
-from logox.tui.content.permission import PermissionAsk, PermissionChoice
 from logox.tui.content.status import StatusContext, build_status_line
 from logox.tui.content.timeline import (
     Block,
     TimelineBuffer,
     TimelineRenderCache,
-    render_blocks,
     render_cached,
 )
 from logox.tui.metrics import MetricsReducer
@@ -103,6 +105,18 @@ class TimelineComponent:
     缓存的不变量（D56，踩过坑）：**缓存只覆盖 `blocks[:-1]`**。
     最后一块随时可能被写入（正文仍在流式、工具卡片仍在运行），
     缓存它就会渲染出过时的内容——而症状是"内容悄悄不对"，没有任何报错。
+
+    第二层缓存：**已切好的行**（D126）
+    --------------------------------
+    `render_cached` 交给我们的是一段 ``Text``，而帧要的是**行列表**，
+    所以中间还要切一次（`split_styled_lines`）。这一步以前是对**整段文本**做的，
+    于是它的代价与会话长度成正比 —— 实测：40 条消息的会话里，
+    每敲一个字要在这一步花掉约 **28ms**（打字明显跟不上手，且**会话越长越卡**）。
+
+    修法是让这一步也只处理尾部：前缀那一段的行在上一帧已经切好了，**复用**即可。
+    复用的依据是 ``RenderResult.prefix_text`` 的**对象身份**（`render_cached` 返回的是
+    缓存里那个原对象，只要缓存没作废它就是同一个），因此比对是 O(1)，
+    而不是再去比较几万个字符。
     """
 
     def __init__(self, palette: Any, *, max_height: int = 0) -> None:
@@ -110,9 +124,15 @@ class TimelineComponent:
         self.buffer = TimelineBuffer()
         self.max_height = max_height
         self._cache = TimelineRenderCache()
+        #: 渲染行与 Block 的区间映射 [(start_line, end_line, block)]
+        self.block_ranges: list[tuple[int, int, Block]] = []
+        #: 前缀**行**缓存：`_prefix_rows` 对应的源文本（身份比对用）
+        self._prefix_rows: list[Text] = []
+        self._prefix_rows_key: Text | None = None
         #: 度量（测试与 /debug 用）：命中次数、作废次数、上一帧耗时
         self.prefix_hits = 0
         self.cache_invalidations = 0
+        self.prefix_row_reuses = 0
         self.last_frame_ms = 0.0
 
     @property
@@ -129,48 +149,124 @@ class TimelineComponent:
         if not blocks and not self.buffer.active_status:
             # 空会话且无活跃状态**一行都不出**：`render_blocks([])` 会返回一个空串，
             # 于是启动时输入框上面会多出一条莫名的空行（看着像 bug 而不是留白）。
+            self.block_ranges = []
             return []
 
-        if not self._cache.matches(expand_all=self.buffer.expand_all, width=width):
-            # 渲染参数变了（宽度 / 展开状态）→ 缓存整体作废
-            self._cache = TimelineRenderCache()
-
+        # 缓存的有效性判断与重建**全在 `render_cached` 里**（D126）：
+        # 这样"重建"那一帧也能立刻拿到稳定的前缀对象，上层才能只切尾部。
         result = render_cached(
             blocks,
             self._cache,
             context=context,
-            expand_all=self.buffer.expand_all,
+            expand_tools=self.buffer.expand_tools,
+            expand_reasoning=self.buffer.expand_reasoning,
+            # ★ D176：双轨标记的显示开关（`Ctrl+B`）
+            show_track=self.buffer.show_track,
             active_status=self.buffer.active_status,
         )
-
-        # 缓存只覆盖"除最后一块之外"的部分（见类 docstring 的不变量）
-        cacheable = blocks[:-1] if blocks else []
-        if result.prefix_hit and self._cache.covers == len(cacheable):
-            self.prefix_hits += 1
-        else:
-            # ⚠️ `blocks` 与 `text` 必须**同生共死**：分开更新过一次，
-            # 症状是屏幕上少一条消息且毫无报错（见 `TimelineRenderCache`）。
-            self._cache = TimelineRenderCache(
-                blocks=cacheable,
-                text=render_blocks(cacheable, context, expand_all=self.buffer.expand_all)
-                if cacheable
-                else None,
-                expand_all=self.buffer.expand_all,
-                width=width,
-            )
+        self.block_ranges = result.block_ranges
+        if result.cache_rebuilt:
             self.cache_invalidations += 1
+        else:
+            self.prefix_hits += 1
 
-        text = result.text
-        rows = split_styled_lines(text)
+        rows = self._split_rows(result)
         # 只保留**尾部**若干行（`max_height` > 0 时）：主屏下"上面滚掉"是自然的，
         # 不需要虚拟化。默认 0 = 不裁剪，全部交给终端滚动（会话历史进回滚缓冲）。
         if self.max_height and len(rows) > self.max_height:
             rows = rows[-self.max_height :]
         return rows
 
+    def toggle_card_at_line(self, line_idx: int) -> bool:
+        """根据渲染行号切换对应卡片的独立展开/收起状态 (3A)。
+
+        若命中了 tool / reasoning / diff 块，将其 expanded 状态翻转，
+        并调用 self.invalidate() 使缓存失效，返回 True；
+        未命中可折叠卡片则返回 False。
+        """
+        target_block: Block | None = None
+        target_block_idx: int = -1
+        for b_idx, (s_line, e_line, block) in enumerate(self.block_ranges):
+            if s_line <= line_idx < e_line:
+                target_block = block
+                target_block_idx = b_idx
+                break
+
+        if target_block is None or target_block.kind not in ("tool", "reasoning", "diff"):
+            return False
+
+        if target_block.kind == "reasoning":
+            cur = target_block.expanded if target_block.expanded is not None else self.buffer.expand_reasoning
+            target_block.expanded = not cur
+        elif target_block.kind == "tool":
+            cur = target_block.expanded if target_block.expanded is not None else self.buffer.expand_tools
+            target_block.expanded = not cur
+            try:
+                buf_idx = self.buffer.blocks.index(target_block)
+                if buf_idx + 1 < len(self.buffer.blocks):
+                    next_block = self.buffer.blocks[buf_idx + 1]
+                    if next_block.kind == "diff":
+                        next_block.expanded = not cur
+            except ValueError:
+                pass
+        elif target_block.kind == "diff":
+            cur = target_block.expanded if target_block.expanded is not None else self.buffer.expand_tools
+            target_block.expanded = not cur
+
+        self.invalidate()
+        return True
+
+    def _split_rows(self, result: Any) -> list[Text]:
+        """把 ``RenderResult`` 切成帧要用的行列表，**只切尾部、前缀复用**（D126）。
+
+        正确性边界（三条，缺一条就会"内容错位但界面不报错"）：
+
+        1. ``reusable_prefix is None``（缓存刚作废 / 有折叠头部）→ 从头切，
+           并把复用缓存清空；
+        2. 前缀文本与上一帧**不是同一个对象** → 重新切一遍前缀；
+        3. 前缀**没有以换行结尾**时，它的最后一行其实与尾部第一行是同一行
+           —— 这时增量拼接不成立，退回到整体切分。
+           今天造不出这种情况（每个块渲染完都会补 `\n`），但"今天造不出"不等于
+           "永远不会"，而错了的表现是**两行内容被劈成三行**，很难对上号。
+        """
+        prefix_text = result.reusable_prefix
+        if prefix_text is None:
+            # 没有可复用的前缀（有折叠头部、或还没攒出前缀）→ 整段重切
+            self._prefix_rows = []
+            self._prefix_rows_key = None
+            return split_styled_lines(result.text)
+
+        if prefix_text is not self._prefix_rows_key:
+            self._prefix_rows = split_styled_lines(prefix_text)
+            self._prefix_rows_key = prefix_text
+        else:
+            self.prefix_row_reuses += 1
+
+        if self._prefix_rows and not prefix_text.plain.endswith("\n"):
+            # 前缀没以换行结尾 → 它的末行与尾部首行是同一行，增量拼接不成立
+            return split_styled_lines(result.text)
+        return [*self._prefix_rows, *split_styled_lines(result.tail_text)]
+
     def handle_input(self, key: Key) -> bool:
+        """时间线自己不抢键，只处理两个**全局展开开关**（D125）。
+
+        这里是**输入框不消费时的冒泡落点**（`Screen.handle_key` 的冒泡链路）。
+        与 `InlineApp._dispatch` 那一条路径**必须同时维护** —— 只改一处的话，
+        症状是"某个状态下按键失效"（取决于按键是先到编辑器还是先到应用级）。
+        """
         if key.ctrl and key.name == "o":
-            self.buffer.toggle_expand_all()
+            self.buffer.toggle_expand_tools()
+            self.invalidate()
+            return True
+        if key.ctrl and key.name == "b":
+            # ★ D176：切换**双轨标记**（`▌` / `▎`）—— 要拖选复制干净文本时关掉它。
+            #   终端里「占了格子的字形一定会被复制」，所以唯一可靠的办法是让标记**消失**
+            #   （不是换成空格 —— 那样复制出来仍会多两个空格）。
+            self.buffer.toggle_track()
+            self.invalidate()
+            return True
+        if key.ctrl and key.name == "t":
+            self.buffer.toggle_expand_reasoning()
             self.invalidate()
             return True
         return False
@@ -275,11 +371,13 @@ class AppLayout:
         self.editor = editor
         self.status = status
         self.screen = screen
+        #: `/` 补全提示框（D162）。`None` = 不显示。它**不是浮层**，见 `render()` 的说明。
+        self.completion: Any | None = None
 
     def render(self, width: int) -> list[Text]:
         tl_rows = self.timeline.render(width)
 
-        # 检查是否有激活的可见浮层（对标 Pi 的独占提示框：弹窗时让出常规输入区）
+        # 检查是否有激活的可见浮层（对标 Pi 的独占提示框：**模态**弹窗时让出常规输入区）
         has_active_overlay = False
         if self.screen is not None and hasattr(self.screen, "overlays"):
             for h in self.screen.overlays:
@@ -290,9 +388,16 @@ class AppLayout:
         if has_active_overlay:
             return tl_rows
 
+        # ★ D162 修正：`/` 补全提示框**画在这里** —— 时间线与输入框之间。
+        #   为什么不做成浮层：`AppLayout` 一见到浮层就会让出输入区（上面那段），
+        #   于是列表正好落在输入框原来的位置上，把它遮住（用户报障）。
+        #   作为布局的一部分则天然满足"在输入框上方、且不遮挡它"：
+        #   帧在中间长高 ⇒ 时间线尾部滚进回滚缓冲，**输入框位置不动**。
+        completion_rows = self.completion.render(width) if self.completion is not None else []
+
         ed_rows = self.editor.render(width)
         st_rows = self.status.render(width)
-        return tl_rows + ed_rows + st_rows
+        return tl_rows + completion_rows + ed_rows + st_rows
 
     def handle_input(self, key: Key) -> bool:
         if self.editor.handle_input(key):
@@ -303,6 +408,23 @@ class AppLayout:
         self.timeline.invalidate()
         self.editor.invalidate()
         self.status.invalidate()
+        if self.completion is not None and hasattr(self.completion, "invalidate"):
+            self.completion.invalidate()
+
+
+def user_themes_dir(runtime: Any) -> Path | None:
+    """用户主题目录（``~/.logox/themes``）；取不到时返回 ``None``（= 只有内置主题）。
+
+    为什么集中成**一个**函数（D152-c）：它被**四处**需要 ——
+    装配根的一次主题加载、界面的两次（构造 + `/theme` 热切换）、以及 `/theme` 的列表。
+    任何一处漏传都会造出"只有用户会撞上"的不一致：列表里有它但选不中、
+    或选得中但列表里没有。这类症状很难自查，所以来源必须唯一。
+
+    ``runtime`` 用 ``getattr`` 逐层探测：测试里的假 runtime 可能没有 ``paths``，
+    而"探不到"的正确语义正是"没有用户主题目录"（退回内置），不是报错。
+    """
+    themes = getattr(getattr(runtime, "paths", None), "themes", None)
+    return Path(themes) if themes is not None else None
 
 
 class InlineApp:
@@ -318,15 +440,19 @@ class InlineApp:
     ) -> None:
         self.runtime = runtime
         self.terminal = terminal or make_terminal()
+        #: 用户主题目录（`~/.logox/themes`）。**只认用户目录，不读项目级**（D152-c）。
+        #: 属性名刻意不叫 `user_themes_dir` —— 那会和上面的模块级函数同名，
+        #: 后来的人写 `self.user_themes_dir(...)` 想调用函数就会撞上"不可调用"。
+        self.themes_dir = user_themes_dir(runtime)
         config = getattr(runtime, "config", None)
         # 主题名：配置里写的优先（用户可能选过 logox-light），否则用主题默认
         chosen = theme_name or (
             getattr(getattr(config, "ui", None), "theme", "") or "logox-dark"
         )
         try:
-            self.theme = load_theme(chosen)
+            self.theme = load_theme(chosen, self.themes_dir)
         except Exception:  # 主题坏了不该让界面起不来（装配根已经警告过一次）
-            self.theme = load_theme("logox-dark")
+            self.theme = load_theme("logox-dark", self.themes_dir)
         palette = self.theme.palette
 
         self.screen = Screen(self.terminal)
@@ -342,9 +468,18 @@ class InlineApp:
             on_submit=self._on_submit,
             # 空输入时右侧的指路牌：键位在状态行被度量挤掉了，这里补回可发现性
             hint="Enter 发送 · /help 键位 · Ctrl+C 中断 · Ctrl+D 退出",
-            hint_style=palette.text_faint,
+            hint_style=str(palette.input_hint),
         )
-        self.editor = BoxedEditor(core_editor, border_style=str(palette.border_subtle))
+        self.editor = BoxedEditor(
+            core_editor,
+            # ★ D152-a：输入框三个元素各用**专属** token。
+            #   此前它们是借来的（border_subtle / text_primary / text_faint），
+            #   而 border_subtle 是共享的装饰色（对 bg_base 仅 1.30:1）——
+            #   既看不清，又"改输入框 = 帮助分隔线/工具卡竖线/浮层底边一起变"，
+            #   谈不上微调。现在这三个值可以独立调。
+            border_style=str(palette.input_border),
+            text_style=str(palette.input_text),
+        )
         self.status = StatusComponent(
             palette,
             items=getattr(getattr(config, "ui", None), "status_items", None),
@@ -382,6 +517,8 @@ class InlineApp:
         self._busy = False
         #: 上一次空闲时按 Ctrl+C 的时间（两下退出用；见 `_interrupt`）
         self._ctrl_c_armed_at: float | None = None
+        # ★ D162：`/` 命令补全（状态在 app，编辑器不认识它）
+        self._completion: Any | None = None  # 只存状态；提示框挂在 self.root.completion 上
         #: `run()` 启动的后台任务（退出时要取消，否则 sleep 会在关闭的循环上抛）
         self._tickers: list[Any] = []
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -393,6 +530,8 @@ class InlineApp:
         self._kitty_active = False
         self._modify_other_keys_active = False
         self._kitty_timer: asyncio.TimerHandle | None = None
+        #: 事件循环所在线程的 id（D133：用来判断"现在是不是在读线程上"）
+        self._loop_thread_id: int | None = None
         #: 退订句柄。**在构造时订阅**而不是在 `run()` 里——
         #: 这样"事件能不能到达界面"是**构造后立刻可测**的（测试不必先跑起事件循环）。
         self._unsubscribe: list[Any] = []
@@ -593,15 +732,32 @@ class InlineApp:
         self.screen.request_render(force=True)
 
     def apply_theme(self, name: str) -> str:
-        """换主题。**失败时抛异常**，由命令层解释成一行提示（不崩、不退出）。"""
-        theme = load_theme(name)
+        """换主题。**失败时抛异常**，由命令层解释成一行提示（不崩、不退出）。
+
+        ⚠️ 换主题要同步**三处**输入框颜色（D152-a）：
+        ``input_border`` / ``input_text`` / ``input_hint``。
+        漏掉任何一处，那个元素就会**停留在旧主题的颜色**上 ——
+        在 `logox-dark → logox-light` 这种深浅互换里，后果是"白字白底、完全看不见"，
+        而它不会报错、测试也未必抓得到（旧色在旧主题里是合法的）。
+
+        为什么 hint 要绕一层：它在**内层** ``Editor`` 上（`BoxedEditor` 是装饰器，
+        只代理协议方法，不代理这个字段）。
+        """
+        theme = load_theme(name, self.themes_dir)
         self.theme = theme
         palette = theme.palette
         self.timeline.palette = palette
         self.timeline.invalidate()  # 卡片颜色变了 → 缓存必须作废
         self.status.palette = palette
+
         if hasattr(self.editor, "border_style"):
-            self.editor.border_style = str(palette.border_subtle)
+            self.editor.border_style = str(palette.input_border)
+        if hasattr(self.editor, "text_style"):
+            self.editor.text_style = str(palette.input_text)
+        inner = getattr(self.editor, "inner", None)
+        if inner is not None and hasattr(inner, "hint_style"):
+            inner.hint_style = str(palette.input_hint)
+
         self.screen.request_render(force=True)
         return theme.name
 
@@ -689,7 +845,36 @@ class InlineApp:
     # ------------------------------------------------------------------ #
 
     def _on_raw_input(self, data: str) -> None:
-        """终端字节 → 按键 → 组件。"""
+        """终端字节 → 按键 → 组件。
+
+        ★ D133：**读线程只负责把字节交过来，解析/派发/渲染全在事件循环线程做**。
+
+        为什么必须这样：渲染要写终端并 `flush`（Windows 上很贵）。以前它是**在读线程里**
+        同步做的 —— 一旦某个批次要画很多帧，读线程就被阻塞，而控制台的输入缓冲是
+        **有限且会堆积的**：用户按住 `a` 时事件持续进队，写屏却跟不上，于是
+        "松开手之后还会继续打一会儿"、退格"多删几个"。
+
+        交回事件循环还顺带修掉一个更隐蔽的问题：**两个线程同时渲染同一个终端**
+        （读线程走 `request_render(force=True)`，事件循环走定时器/事件）——
+        两边各写半帧就可能把画面撕开。现在只有一条线程写终端。
+
+        ⚠️ 只在**真的跑起来之后**才转投（`run()` 里记录线程号）：测试与
+        `app.send()` 这类同步入口仍然直接走完，语义不依赖事件循环。
+        """
+        loop = self._loop
+        if (
+            loop is not None
+            and self._loop_thread_id is not None
+            and threading.get_ident() != self._loop_thread_id
+        ):
+            # 转投到事件循环：那里才是解析、派发与渲染的唯一线程
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._on_raw_input, data)
+                return
+        self._parse_and_dispatch(data)
+
+    def _parse_and_dispatch(self, data: str) -> None:
+        """真的解析并派发一批字节（**只在事件循环线程上跑**）。"""
         # 终端的"协议回应"必须**先**挑出来：它不是用户按的键。
         # 漏掉这一步的症状是——启动时输入框里凭空多出几个字符。
         # ⚠️ 只删这一段、不丢整包：回应可能与用户的第一次按键挤在同一次读取里。
@@ -702,7 +887,26 @@ class InlineApp:
             self._dispatch(key)
         if self.keys.pending == "\x1b":
             self._schedule_escape_flush()
-        self.screen.request_render()
+        # ⚠️ 这里**不能**再无条件请求一次重绘（D126）。
+        #
+        # 以前这一行是在的，后果是**每敲一个字要画两帧**：
+        # `Key 被编辑器消费 → handle_key 已经请求了一帧（force=True）`，
+        # 紧接着这一行又请求第二帧（完全相同的内容）。
+        # 单帧 50ms 的会话里，这意味着一次按键要付出 100ms —— 用户感受到的
+        # "输入卡顿"有一半是这一帧白画的。
+        #
+        # （D133 之后多次请求会被**合并成同一帧**，所以这一行的危害已经变小；
+        #   但仍然不恢复它 —— "谁改数据谁请求重绘"这条纪律更清楚。）
+        #
+        # 那为什么不干脆删掉、改由"谁状态变了谁请求重绘"：因为确实有几条路
+        # 只改内容、不画屏（Ctrl+C 的提示、浮层 "/login" 流程里的提示行）。
+        # 所以规矩改成：**这些路径自己负责请求重绘**（见 `_interrupt`），
+        # 而这里不再当"背锅侠"——否则它每帧都会背一次。
+        #
+        # 注意：
+        #   * 没有被任何组件消费的按键（比如空闲时的 `Esc`）本来就不改内容，不需要画；
+        #   * `keys.feed` 返回空（半个转义序列到了、剩下的还在路上）也不需要画。
+        # 两者都由"谁改数据谁 `request_render`"这条已有的纪律兜住。
 
     def _dispatch(self, key: Key) -> None:
         if key.ctrl and key.name == "c":
@@ -713,7 +917,21 @@ class InlineApp:
             self.stop()
             return
         if key.ctrl and key.name == "o":
-            self.timeline.buffer.toggle_expand_all()
+            # D125：`Ctrl+O` 只切**工具卡 + diff**（归一类"动作产物"）；
+            # 思考链改用 `Ctrl+T`，见下面那条。
+            self.timeline.buffer.toggle_expand_tools()
+            self.timeline.invalidate()
+            self.screen.request_render(force=True)
+            return
+        if key.ctrl and key.name == "b":
+            # ★ D176：双轨标记开关（与 Ctrl+O / Ctrl+T 同型：组件与 app **都**处理，
+            #   因为焦点在时间线组件上时按键先到它那里）
+            self.timeline.buffer.toggle_track()
+            self.screen.request_render(force=True)
+            return
+        if key.ctrl and key.name == "t":
+            # D125：`Ctrl+T` 只切**思考链**。与 `Ctrl+O` **互不影响**（两个正交开关）。
+            self.timeline.buffer.toggle_expand_reasoning()
             self.timeline.invalidate()
             self.screen.request_render(force=True)
             return
@@ -730,7 +948,90 @@ class InlineApp:
             self.timeline.buffer.add_notice("已中断", token="warning")
             self.screen.request_render(force=True)
             return
+        # ★ D162：补全列表**不抢焦点**（抢了用户就打不了字），所以它的按键
+        #   必须在**交给编辑器之前**在这里拦下来。`↑↓` 到底归谁，只有在这一处才看得清。
+        if self._completion is not None and self._handle_completion_key(key):
+            return
+
         self.screen.handle_key(key)
+        # 编辑器内容可能刚变（输入/退格/粘贴）⇒ 重算候选（纯计算，代价可忽略）
+        self._refresh_completion()
+
+    # ------------------------------------------------------------------ #
+    # `/` 命令补全（D162）
+    # ------------------------------------------------------------------ #
+
+    def _handle_completion_key(self, key: Key) -> bool:
+        """列表开着时消费补全相关按键；返回 True 表示已处理（不再透传）。"""
+        from logox.tui.content import completion as completion_module
+
+        state = self._completion
+        assert state is not None
+        if key.name == "escape":
+            self._close_completion()
+            return True
+        if key.name in ("up", "down"):
+            # ★ D175：复用 picker 的状态机（`move` 环绕、返回 None）——
+            #   不能再按返回值判断"有没有变化"，直接刷新即可（列表本来就要重画窗口）。
+            state.move(-1 if key.name == "up" else 1)
+            self._show_completion()
+            return True
+        if key.name in ("tab", "enter"):
+            # 接受的文本 = `/命令名 `（带尾随空格：它让"光标前不得有空白"的触发判据失效，
+            # 于是列表自然收起，不需要额外的"已接受"状态）
+            current = state.current
+            text = f"/{current.value} " if current is not None else ""
+            if text:
+                apply_to_editor = getattr(self.editor, "apply_completion", None)
+                if callable(apply_to_editor):
+                    apply_to_editor(text)
+            self._close_completion()
+            if key.name == "tab":
+                self.screen.request_render(force=True)
+                return True
+            # `Enter`：**先补全、再提交**（否则 `/mo` + Enter 会得到"未知命令 /mo"）。
+            # 关闭列表后按 Enter 才是"按字面提交"—— 见设计文档 §3.4（与 Pi 的字面行为有差异）
+            self._on_submit(self.editor.text)
+            return True
+        return False
+
+    def _refresh_completion(self) -> None:
+        """重算候选并显示/隐藏列表（**纯计算**，每帧最多一次）。"""
+        from logox.tui.content import completion as completion_module
+
+        # 模态浮层（如 `/model` 选择框）开着时让位，避免两个交互框叠在一起。
+        # （补全自己**不是浮层**，所以这里可以直接用 `has_overlay()`，不必再排除自己。）
+        if self.screen is not None and self.screen.has_overlay():
+            self._close_completion()
+            return
+        editor = self.editor
+        cursor_getter = getattr(editor, "cursor", None)
+        if cursor_getter is None:
+            self._close_completion()
+            return
+        row, col = cursor_getter
+        state = completion_module.completion_for(editor.text, row=row, col=col)
+        if state is None:
+            self._close_completion()
+            return
+        self._completion = state
+        self._show_completion()
+
+    def _show_completion(self) -> None:
+        """把候选提示框挂到布局上（**不是浮层** —— 见 `AppLayout.render` 的说明）。"""
+        from logox.tui.render.components.completion import CompletionComponent
+
+        if self._completion is None:
+            return
+        self.root.completion = CompletionComponent(self._completion, self.theme.palette)
+        self.screen.request_render(force=True)
+
+    def _close_completion(self) -> None:
+        if getattr(self.root, "completion", None) is not None:
+            self.root.completion = None
+            self.screen.request_render(force=True)
+        self._completion = None
+
 
     def _interrupt(self) -> None:
         """``Ctrl+C``：正在跑就打断；空闲时要**按两下**才退出（D69）。
@@ -749,6 +1050,8 @@ class InlineApp:
             self.timeline.buffer.clear_active_status()
             self._ctrl_c_armed_at = None
             self.timeline.buffer.add_notice("已中断", token="warning")
+            # 见 `_on_raw_input` 的说明：改内容的路径**自己负责**请求重绘。
+            self.screen.request_render(force=True)
             return
         now = time.monotonic()
         armed = self._ctrl_c_armed_at
@@ -761,6 +1064,7 @@ class InlineApp:
             "是为了不误伤终端的「复制」）",
             token="text_faint",
         )
+        self.screen.request_render(force=True)
 
     def _schedule_escape_flush(self) -> None:
         """孤立的 ``ESC`` 要等一小会儿才能确定（见 `keys.ESC_TIMEOUT_MS`）。"""
@@ -786,6 +1090,8 @@ class InlineApp:
     async def run(self) -> None:
         """跑起来：清屏、协商键盘协议、公示会话、开始画、等 `stop()`。"""
         self._loop = asyncio.get_running_loop()
+        # ★ 记下事件循环线程：读线程交上来的字节要转投到这里（D133）
+        self._loop_thread_id = threading.get_ident()
         self._clear_screen()
         self._enable_keyboard_protocols()
         self.screen.start()

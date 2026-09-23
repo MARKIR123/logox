@@ -73,20 +73,27 @@ def usage_from_anthropic(
 
     Anthropic 在流式下把 input 放在 ``message_start``、output 放在 ``message_delta``，
     因此必须两处都看。缺任一必需项 → ``None``（**不伪造 0**，E-6）。
+
+    ⚠️ **三个 input 字段的关系**（这是本适配器独有的口径，下游不该去猜）：
+    ``input_tokens`` 是**未命中缓存**的那部分，而 ``cache_creation_input_tokens``
+    （写入缓存）与 ``cache_read_input_tokens``（读缓存）是**并列**的另外两块 ——
+    **总量 = 三者之和**。OpenAI 兼容端点恰好相反（``prompt_tokens`` 本身就是总量）。
+    所以 ``context_tokens`` 必须在这里算好：**只有适配器知道厂商的口径**（D9）。
     """
-    input_tokens = int_or_none((start_usage or {}).get("input_tokens"))
-    cached = int_or_none((start_usage or {}).get("cache_read_input_tokens"))
-    if cached is None:
-        cached = int_or_none((start_usage or {}).get("cache_creation_input_tokens"))
+    plain_input = int_or_none((start_usage or {}).get("input_tokens"))
+    cache_read = int_or_none((start_usage or {}).get("cache_read_input_tokens"))
+    cache_write = int_or_none((start_usage or {}).get("cache_creation_input_tokens"))
+    cached = cache_read if cache_read is not None else cache_write
     output_tokens = int_or_none((delta_usage or {}).get("output_tokens"))
     if output_tokens is None:
         output_tokens = int_or_none((start_usage or {}).get("output_tokens"))
-    if input_tokens is None or output_tokens is None:
+    if plain_input is None or output_tokens is None:
         return None
     return Usage(
-        input_tokens=input_tokens,
+        input_tokens=plain_input,
         output_tokens=output_tokens,
         cached_input_tokens=cached,
+        context_tokens=plain_input + (cache_read or 0) + (cache_write or 0),
     )
 
 
@@ -151,14 +158,21 @@ class AnthropicProvider:
 
     def build_payload(self, request: ChatRequest) -> dict[str, Any]:
         """中立请求 → Anthropic 请求体。"""
+        # ★ 角色归一化（D7）：把「中立模型允许、Anthropic 不允许」的两种形状在本层消化。
+        #   顺序有讲究：先搬走 system（它不该在 messages 里），
+        #   再合并相邻同角色（搬走 system 后，它左右两边可能变成相邻同角色）。
+        system_text, converted = self._hoist_system_messages(
+            [self._convert_message(message) for message in request.messages],
+            request.system,
+        )
         payload: dict[str, Any] = {
             "model": request.model,
             "max_tokens": request.max_tokens or DEFAULT_MAX_TOKENS,  # Anthropic 必填
-            "messages": [self._convert_message(message) for message in request.messages],
+            "messages": self._merge_adjacent_same_role(converted),
             "stream": True,
         }
-        if request.system:
-            payload["system"] = request.system  # 顶层参数，不是消息
+        if system_text:
+            payload["system"] = system_text  # 顶层参数，不是消息
 
         if request.tools:
             payload["tools"] = [
@@ -178,6 +192,62 @@ class AnthropicProvider:
             # 预算按档位如实下发，不够就上调 max_tokens——见 _thinking_payload 的说明。
             payload["max_tokens"] = max(payload["max_tokens"], thinking["budget_tokens"] + BUDGET_HEADROOM)
         return payload
+
+    @staticmethod
+    def _hoist_system_messages(
+        messages: list[dict[str, Any]], top_level_system: str
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """把消息序列里 ``role="system"`` 的内容**并入顶层 ``system`` 参数**。
+
+        为什么必须做：``Message.role`` 的 Literal 里声明了 ``"system"``，
+        而 Anthropic 的 ``messages`` 只接受 ``user`` / ``assistant``。
+        **契约说允许、适配器不兜住，就是将一个非法载荷发给厂商换回 400。**
+
+        为什么选择“翻译”而不是“报错”：内容仍然到达模型，只是被搬到它唯一能待的地方。
+        代价是**位置信息丢失**（顶层 ``system`` 没有位置概念）——
+        这是 Anthropic 协议本身的限制，不是这里的取舍。
+        """
+        parts: list[str] = [top_level_system] if top_level_system else []
+        kept: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") != "system":
+                kept.append(message)
+                continue
+            content = message.get("content")
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    parts.append(str(block["text"]))
+        return "\n\n".join(parts), kept
+
+    @staticmethod
+    def _merge_adjacent_same_role(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把相邻的同角色消息合并成一条。
+
+        Anthropic 要求 ``user`` / ``assistant`` **严格交替**；而中立模型允许相邻同角色：
+        压缩归档摘要后紧跟的提问、一批并发的 ``tool_result``
+        （中立的 ``tool`` 消息映射后也是 ``user``）、思考块被剥离后的空 assistant……
+
+        合并是**线级归一化**：不改中立模型，也不影响其它适配器
+        （OpenAI 完全允许相邻同角色）。判定依据是**映射后**的角色，不是中立角色。
+        """
+
+        def blocks_of(content: Any) -> list[dict[str, Any]]:
+            if isinstance(content, list):
+                return list(content)
+            return [{"type": "text", "text": content or ""}]
+
+        merged: list[dict[str, Any]] = []
+        for message in messages:
+            if merged and merged[-1].get("role") == message.get("role"):
+                combined = blocks_of(merged[-1].get("content")) + blocks_of(message.get("content"))
+                # ``tool_result`` 块必须排在最前：这是 Anthropic 对“响应 tool_use 的那条消息”的格式要求
+                is_result = lambda b: isinstance(b, dict) and b.get("type") == "tool_result"  # noqa: E731
+                tool_results = [b for b in combined if is_result(b)]
+                others = [b for b in combined if not is_result(b)]
+                merged[-1] = {**merged[-1], "content": [*tool_results, *others]}
+            else:
+                merged.append(dict(message))
+        return merged
 
     @staticmethod
     def _convert_tool(tool: ToolSchema) -> dict[str, Any]:
@@ -353,10 +423,29 @@ class AnthropicProvider:
             if isinstance(finalized, ToolCallEvent):
                 yield finalized
             else:
+                # ★ D160：与 `openai_compat` **对齐**，打上 `is_truncated` 标记。
+                #
+                # 为什么必须打：`kernel/loop.py:607` 的 D121 自愈闭环**只认这一个标记** ——
+                #     if failure.is_truncated and truncation_healing_count < max_truncation_healings:
+                # 而此前**只有 OpenAI 那条路打了它**（`openai_compat.py:388`），
+                # 于是 Anthropic 用户撞到"参数被输出上限截断"时，
+                # 得到的仍是那个**无可挽回的闪退**，D121 承诺的自愈一次都不会触发。
+                #
+                # 判据：Anthropic 用 `max_tokens` 表示"被输出上限截断"（对应 OpenAI 的 `length`）。
+                # 与 openai 侧同样，**只改消息与标记，不改 category**：
+                # `BAD_REQUEST` 的 `feedable_to_model=True`，所以它本来就会回灌给模型，
+                # 只是少了"这是截断、请分批"这条关键提示。
+                base_msg = str(finalized.get("error", "工具调用装配失败"))
+                is_truncated = stop_raw in ("max_tokens", "length")
+                if is_truncated:
+                    msg = f"{base_msg}（输出已达到 Token 上限并被截断，请简化操作或分批写入）"
+                else:
+                    msg = base_msg
                 yield ProviderErrorEvent(
                     category=ErrorCategory.BAD_REQUEST,
-                    message=str(finalized.get("error", "工具调用装配失败")),
+                    message=msg,
                     detail=str(finalized.get("detail", "")) or None,
+                    is_truncated=is_truncated,
                 )
 
         usage = usage_from_anthropic(start_usage, delta_usage)

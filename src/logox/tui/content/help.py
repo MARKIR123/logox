@@ -76,9 +76,12 @@ def layout_for(width: int) -> tuple[int, int, int]:
     """按终端宽度算出 ``(内容宽度, 左栏宽度, 行为列宽度)``。
 
     内容宽度要扣掉浮层边框（2）与横向内边距——算漏了就会出现"整行被折行、
-    右栏错位"（`render/components/overlay.py` 的 `_frame` 会在两边各加 1 格）。
+    右栏错位"（`render/components/overlay.py` 的 `frame_box` 会在两边各加 1 格）。
     """
-    content = max(COMPACT_MIN_WIDTH, min(BOX_WIDTH, width - 6))
+    # ★ D165：**整宽**（用户要求「所有提示框一律整宽展示」）。
+    #   原先 `min(BOX_WIDTH, width - 6)` 会在宽终端上留出两侧空白，而权限/选择弹窗是整宽的 ——
+    #   同一屏里两种宽度看着像没对齐。
+    content = max(COMPACT_MIN_WIDTH, width - 4)
     left = content - RIGHT_COLUMN - GAP
     action = left - 2 - SECTION_COLUMN - KEY_COLUMN
     return content, left, max(10, action)

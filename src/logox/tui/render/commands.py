@@ -48,7 +48,7 @@ from logox.tui.commands import (
 )
 from logox.tui.content.help import render_help
 from logox.tui.content.overlay import Choice, PickerState
-from logox.tui.format import clip, format_ratio, format_tokens
+from logox.tui.format import clip, format_cost, format_duration, format_ratio, format_tokens
 from logox.tui.render.components.overlay import (
     ConfirmComponent,
     PanelComponent,
@@ -56,7 +56,7 @@ from logox.tui.render.components.overlay import (
     PromptComponent,
 )
 
-__all__ = ["EFFORT_LEVELS", "CommandHost", "CommandRunner"]
+__all__ = ["EFFORT_LEVELS", "CommandHost", "CommandRunner", "_render_summary_content"]
 
 logger = logging.getLogger("logox.tui.render.commands")
 
@@ -428,15 +428,31 @@ class CommandRunner:
     async def _switch_model(self, model: str) -> None:
         """切换模型：改内核 → 更新状态行 → 写 `state.toml`。"""
         runtime = self._runtime
-        setter = getattr(getattr(runtime, "kernel", None), "set_model", None)
-        if callable(setter):
-            try:
-                setter(model)
-            except Exception as exc:
-                self.host.notice(f"无法切换到 {model}：{exc}", token="danger")
-                return
-        runtime.model = model
-        self.host.notice(f"—— 模型已切换为 {model}（下一次请求生效）——", token="text_faint")
+        # ★ D159：优先走装配根的 `apply_model` —— 它会把**内核 + 上下文计量（窗口/κ 桶）
+        #   + 状态栏窗口**一起更新。此前只调 `kernel.set_model()`，于是换到窗口更小的
+        #   模型后水位线仍按旧窗口算，压缩永不触发（请求会撞厂商 400）。
+        applier = getattr(runtime, "apply_model", None)
+        window: int | None = None
+        try:
+            if callable(applier):
+                window = applier(model)
+            else:  # 兼容：测试里的假 runtime 只提供 kernel
+                setter = getattr(getattr(runtime, "kernel", None), "set_model", None)
+                if callable(setter):
+                    setter(model)
+                runtime.model = model
+        except Exception as exc:
+            self.host.notice(f"无法切换到 {model}：{exc}", token="danger")
+            return
+        if window is None and callable(applier):
+            # 自定义模型名（不在预设表里）⇒ 查不到上下文窗口：如实告知，而不是默默沿用旧窗口
+            self.host.notice(
+                f"—— 模型已切换为 {model}；未查到该模型的上下文窗口，压缩阈值沿用当前值 ——",
+                token="warning",
+            )
+        else:
+            size = f"，窗口 {window // 1000}k" if window else ""
+            self.host.notice(f"—— 模型已切换为 {model}{size}（下一次请求生效）——", token="text_faint")
         self.host.refresh_status()
         await self._persist(
             lambda: runtime.state_store.set_last_model(model=model), f"模型 {model}"
@@ -451,7 +467,10 @@ class CommandRunner:
         from logox.tui import theme as theme_module
 
         name = argument.strip()
-        available = theme_module.list_themes()
+        # ★ D152-c：列表必须带上**用户主题目录**，否则会出现
+        #   "文件已放好、`/theme` 里却看不到它"（而 `load_theme` 其实能加载它）——
+        #   列表与加载两条路各持一份事实，正是本轮要消灭的那类不一致。
+        available = theme_module.list_themes(getattr(self.host, "themes_dir", None))
         if not name:
             choices = [
                 Choice(
@@ -526,6 +545,188 @@ class CommandRunner:
         )
 
     # ------------------------------------------------------------------ #
+    # /mode（D130 权限运行模式切换：default / creative）
+    # ------------------------------------------------------------------ #
+
+    async def _cmd_mode(self, argument: str) -> None:
+        """切换权限模式（/mode default|creative）。"""
+        runtime = self._runtime
+        arg = argument.strip().lower()
+        valid_modes = ("default", "creative")
+
+        current_mode = getattr(runtime, "permission_mode", "default")
+
+        target_mode: str | None = None
+        if arg:
+            if arg not in valid_modes:
+                self.host.notice(
+                    f"未知权限模式 '{argument.strip()}'；可用模式：default、creative",
+                    token="warning",
+                )
+                return
+            target_mode = arg
+        else:
+            choices = [
+                Choice(
+                    value="default",
+                    label="[1] default (默认防护)",
+                    hint="每项未授权写操作均需人工确认 (安全推荐)",
+                ),
+                Choice(
+                    value="creative",
+                    label="[2] creative (创造模式)",
+                    hint="除高危黑名单与越界敏感文件外，常规操作免打扰放行",
+                ),
+            ]
+            state = self._state("选择权限模式", choices, current=current_mode)
+            picked = await self._pick(state)
+            if picked is None:
+                self.host.notice("已取消（权限模式未变）", token="text_faint")
+                return
+            target_mode = picked.value
+
+        if target_mode == current_mode:
+            self.host.notice(f"当前已处于 {target_mode} 模式（未变）", token="text_faint")
+            return
+
+        if hasattr(runtime, "set_permission_mode"):
+            runtime.set_permission_mode(target_mode)
+
+        await self._persist(
+            lambda: self._runtime.state_store.set_permission_mode(target_mode),
+            f"权限模式 → {target_mode}",
+        )
+
+        reducer = getattr(runtime, "reducer", None) or getattr(self.host, "reducer", None)
+        if reducer and hasattr(reducer, "metrics"):
+            reducer.metrics.permission_mode = target_mode
+        self.host.refresh_status()
+
+        desc = "除高危与越界敏感文件外直接执行" if target_mode == "creative" else "常规写操作需人工审批"
+        self.host.notice(f"—— 权限模式已切换为 {target_mode}（{desc}） ——", token="text_faint")
+
+    async def _cmd_permissions(self, argument: str) -> None:
+        """/permissions（或 /permission、/perm）：弹出权限规则与物理沙箱管理框（D132）。"""
+        del argument
+        runtime = self._runtime
+
+        getter = getattr(runtime, "get_permission_snapshot", None)
+        snapshot = getter() if callable(getter) else None
+        if not snapshot:
+            root = Path(getattr(runtime, "cwd", None) or ".").resolve()
+            mode = getattr(runtime, "permission_mode", "default")
+            snapshot = {
+                "workspace_root": root,
+                "mode": mode,
+                "project_rules": [],
+                "session_rules": [],
+                "sensitive_items": [".git/", ".env", ".logox/config.toml", ".logox/permissions.toml"],
+            }
+
+        workspace_root = str(snapshot.get("workspace_root", "") or ".")
+        mode = str(snapshot.get("mode", "default") or "default")
+        mode_desc = "创造免打扰" if mode == "creative" else "严格审批"
+        sensitive_list = ", ".join(snapshot.get("sensitive_items", []) or [".git/", ".env"])
+
+        header_lines = [
+            f"  [工作区沙箱] {workspace_root}",
+            f"  [敏感文件保护] {sensitive_list}",
+            f"  [当前运行模式] {mode} ({mode_desc})",
+        ]
+
+        choices: list[Choice] = []
+
+        # 1. 项目持久化规则 (state.toml)
+        project_rules = snapshot.get("project_rules", []) or []
+        for rule in project_rules:
+            rule_str = rule.to_str() if hasattr(rule, "to_str") else str(rule)
+            decision = getattr(rule, "decision", "allow")
+            dec_str = "allow" if str(decision).lower().endswith("allow") else "deny"
+            label_prefix = "[项目允许]" if dec_str == "allow" else "[项目拒绝]"
+            hint = "state.toml · 持久放行" if dec_str == "allow" else "state.toml · 持久拦截"
+            choices.append(
+                Choice(
+                    value=f"project:{dec_str}:{rule_str}",
+                    label=f"{label_prefix} {rule_str}",
+                    hint=hint,
+                )
+            )
+
+        # 2. 会话临时规则 (内存)
+        session_rules = snapshot.get("session_rules", []) or []
+        for rule in session_rules:
+            rule_str = rule.to_str() if hasattr(rule, "to_str") else str(rule)
+            decision = getattr(rule, "decision", "allow")
+            dec_str = "allow" if str(decision).lower().endswith("allow") else "deny"
+            label_prefix = "[会话允许]" if dec_str == "allow" else "[会话拒绝]"
+            hint = "会话内存 · 临时放行" if dec_str == "allow" else "会话内存 · 临时拦截"
+            choices.append(
+                Choice(
+                    value=f"session:{dec_str}:{rule_str}",
+                    label=f"{label_prefix} {rule_str}",
+                    hint=hint,
+                )
+            )
+
+        has_rules = bool(project_rules or session_rules)
+        if not has_rules:
+            choices.append(
+                Choice(
+                    value="none",
+                    label="（暂无自定义规则 · 工具审批通过选择记住时自动记录）",
+                    hint="按 Esc 退出",
+                )
+            )
+
+        state = self._state("权限规则与沙箱防护 (/permission)", choices)
+        state.header_lines = header_lines
+        state.allow_delete = True
+        state.delete_prompt = "确定撤销权限规则「{target_name}」？"
+        state.footer = (
+            "↑↓ 切换 · Ctrl+D/Delete 撤销规则 · 输入可筛选 · Esc 退出"
+            if has_rules
+            else "↑↓ 浏览 · Esc 退出"
+        )
+
+        def handle_delete(choice: Choice) -> bool:
+            if getattr(choice, "disabled", False) or not choice.value.startswith(("project:", "session:")):
+                self.host.notice("系统沙箱与内置信息项不可删除", token="warning")
+                return True
+
+            parts = choice.value.split(":", 2)
+            if len(parts) != 3:
+                return True
+            scope, kind, rule_str = parts
+
+            revoker = getattr(runtime, "revoke_permission_rule", None)
+            success = False
+            if callable(revoker):
+                success = revoker(scope, kind, rule_str)
+            elif hasattr(runtime, "permission_decider"):
+                dec = runtime.permission_decider
+                if hasattr(dec, "revoke_permission_rule"):
+                    success = dec.revoke_permission_rule(scope, kind, rule_str)
+                elif hasattr(dec, "engine") and hasattr(dec.engine, "revoke_by_str"):
+                    # 不在此处 import permissions.models（严格恪守 T41 架构红线）
+                    # 直接传字符串由底层自行处理或通过 getattr
+                    engine = dec.engine
+                    try:
+                        success = engine.revoke_by_str(rule_str, scope=scope, decision=kind)
+                    except Exception:
+                        success = False
+
+            scope_name = "项目持久" if scope == "project" else "会话临时"
+            if success:
+                self.host.notice(f"已撤销{scope_name}权限规则：{rule_str}", token="text_faint")
+            else:
+                self.host.notice(f"撤销规则未生效或未找到：{rule_str}", token="warning")
+            return True
+
+        picked = await self._pick(state, on_delete=handle_delete if has_rules else None)
+        if picked is None or picked.value == "none":
+            return
+
+    # ------------------------------------------------------------------ #
     # /help、/status、/debug
     # ------------------------------------------------------------------ #
 
@@ -535,6 +736,29 @@ class CommandRunner:
         await self.host.push_overlay(
             PanelComponent(body, palette=self._palette(), max_rows=self._panel_rows())
         )
+
+    async def _cmd_compact(self, argument: str) -> None:
+        """`/compact`：立即压缩上下文（本地重算，**不调模型**）。
+
+        与自动压缩共用同一条实现（`builder.force_compact`）与同一对事件，
+        所以：时间线会显示压缩提示、状态栏的 ctx 会立刻变小、`pre_compact` 钩子也会触发。
+        """
+        del argument  # 本项目压缩是确定性的（拼每轮摘要），没有"给模型的压缩指令"这回事
+        runtime = self._runtime
+        applier = getattr(runtime, "apply_compact", None)
+        if not callable(applier):
+            self.host.notice("当前环境不支持手动压缩", token="warning")
+            return
+        report = await applier()
+        if report is None:
+            self.host.notice("—— 无须压缩（当前上下文未超过阈值）——", token="text_faint")
+            return
+        self.host.notice(
+            f"—— 已压缩：{report.tokens_before:,} → {report.tokens_after:,} tokens"
+            f"（修剪 {report.pruned_count} 条工具结果，折叠 {report.folded_turns} 轮）——",
+            token="text_faint",
+        )
+        self.host.refresh_status()
 
     async def _cmd_status(self, argument: str) -> None:
         """一行行列出当前会话的**事实**，而不是让用户去猜。"""
@@ -548,7 +772,27 @@ class CommandRunner:
             ("工作目录", str(runtime.cwd)),
             ("工具", "、".join(runtime.tools) or "（无）"),
             ("主题", str(self.host.theme.name)),
+            # ★ D137：源码最后改动时间 —— 用来确认"我手上这个进程跑的是不是最新代码"
+            ("代码", _code_stamp_with_hint()),
         ]
+        # ★ D158/D159：上下文**计量方式**与 κ 样本数 ——
+        #   "精确锚点 / 纯估算"以及"这个模型校准过几次"都是排查压缩行为的关键事实
+        builder = getattr(runtime, "context_builder", None)
+        ledger = getattr(builder, "ledger", None)
+        estimator = getattr(builder, "estimator", None)
+        if ledger is not None:
+            anchor = getattr(ledger, "anchor", None)
+            mode = "锚点+增量" if anchor is not None else f"纯估算（{ledger.last_reason}）"
+            lines.append(("上下文计量", mode))
+        if estimator is not None:
+            key = f"{runtime.provider_name}/{runtime.model}"
+            samples = estimator.samples_for(key)
+            lines.append(
+                (
+                    "κ 校准",
+                    f"{estimator.factor_for(key):.3f}（{key}，样本 {samples}）",
+                )
+            )
         reducer = getattr(runtime, "reducer", None) or getattr(self.host, "reducer", None)
         metrics = getattr(reducer, "metrics", None)
         win = getattr(metrics, "context_window", 0) or (
@@ -564,6 +808,13 @@ class CommandRunner:
         )
         if getattr(runtime, "needs_login", False):
             lines.append(("登录状态", "尚未登录 —— 运行 /login"))
+        perm_mode = getattr(runtime, "permission_mode", "default")
+        mode_desc = (
+            "creative（创造模式，常规操作免打扰）"
+            if perm_mode == "creative"
+            else "default（默认防护，未授权写操作需确认）"
+        )
+        lines.append(("权限模式", mode_desc))
         body = Text()
         for label, value in lines:
             body.append(f"  {label:<10}", style=f"bold {palette.text_primary}")
@@ -572,6 +823,45 @@ class CommandRunner:
             body.append(f"\n  ⚠ {warning}\n", style=palette.warning)
         await self.host.push_overlay(
             PanelComponent(body, palette=palette, max_rows=self._panel_rows(), footer="Esc 关闭")
+        )
+
+    # ------------------------------------------------------------------ #
+    # /summary（D131 会话概览与用量大盘）
+    # ------------------------------------------------------------------ #
+
+    async def _cmd_summary(self, argument: str) -> None:
+        """查看当前会话演进脉络与用量大盘（/summary）。"""
+        del argument
+        runtime = self._runtime
+        palette = self._palette()
+
+        # 1. 聚合轮次列表（正序展示历史演进脉络）
+        lister = getattr(runtime, "list_checkpoints", None)
+        checkpoints = lister() if callable(lister) else []
+        chronology = list(reversed(checkpoints))
+
+        # 2. 采集指标
+        reducer = getattr(runtime, "reducer", None) or getattr(self.host, "reducer", None)
+        metrics = getattr(reducer, "metrics", None)
+
+        # 3. 排版 Rich Text
+        cost_estimator = getattr(runtime, "estimate_cost", None)
+        body = _render_summary_content(
+            chronology,
+            metrics,
+            palette,
+            model=str(getattr(runtime, "model", "")),
+            cost_estimator=cost_estimator,
+        )
+
+        # 4. 呼起浮层面板
+        await self.host.push_overlay(
+            PanelComponent(
+                body,
+                palette=palette,
+                max_rows=self._panel_rows(),
+                footer="↑↓ 滚动浏览 · Esc 关闭",
+            )
         )
 
     async def _cmd_debug(self, argument: str) -> None:
@@ -901,6 +1191,12 @@ class CommandRunner:
                     file_part = "纯对话 (无文件修改)"
 
                 summary_desc = getattr(cp, "turn_summary", "") or cp.user_prompt or ""
+                # ★ 用户裁定 Q-D：**标出摘要的来源**，否则用户分不清「模型自己写的」
+                # 与「我们补写/自动生成的」—— 也就没法据此判断该不该信这条摘要。
+                source = getattr(cp, "summary_source", "") or ""
+                if source in ("model_fallback", "deterministic"):
+                    mark = "，自动摘要" if source == "deterministic" else "，模型补写"
+                    summary_desc = f"{summary_desc}（{mark.lstrip('，')}）"
                 label = f"[{idx}] 轮次 {cp.turn} · {file_part}"
                 hint = summary_desc
                 choices.append(Choice(value=str(cp.turn), label=label, hint=hint))
@@ -960,3 +1256,140 @@ class CommandRunner:
 
     def _panel_rows(self) -> int:
         return int(getattr(self.host, "content_rows", 20))
+
+def _code_stamp_with_hint() -> str:
+    """`/status` 里那一行的值：源码时间 + 一句判定提示（D137）。"""
+    import time as _time
+
+    from logox.tui.buildinfo import code_root, code_stamp
+
+    stamp = code_stamp()
+    try:
+        latest = max(path.stat().st_mtime for path in code_root().rglob("*.py"))
+        started = getattr(_code_stamp_with_hint, "_process_started", None)
+        if started is None:
+            started = _code_stamp_with_hint._process_started = _time.time()  # type: ignore[attr-defined]
+        # 进程启动**早于**源码最后改动 ⇒ 这个进程跑的是旧代码（提示重启）
+        return f"{stamp}（⚠️ 进程启动于源码改动之前，重启 logox 才生效）" if latest > started else stamp
+    except OSError:  # pragma: no cover
+        return stamp
+
+
+def _render_summary_content(
+    chronology: list[Any],
+    metrics: Any,
+    palette: Any,
+    model: str = "",
+    cost_estimator: Callable[[Any, str], float | None] | None = None,
+) -> Text:
+    """排版会话演进脉络与用量大盘（D131 / MODULE_summary_command.md）。"""
+    body = Text()
+    body.append("会话概览与用量大盘 (/summary)\n\n", style=f"bold {palette.accent}")
+
+    # 1. 对话演进脉络
+    body.append("【对话演进脉络】\n", style=f"bold {palette.text_primary}")
+    if not chronology:
+        body.append("  （当前会话尚无交互轮次）\n\n", style=palette.text_faint)
+    else:
+        for idx, cp in enumerate(chronology, start=1):
+            if getattr(cp, "files", None):
+                file_names = [Path(f.path).name for f in cp.files]
+                names_summary = ", ".join(file_names[:2])
+                if len(file_names) > 2:
+                    names_summary += f" 等 {len(file_names)} 个文件"
+                file_part = f"改动 {len(cp.files)} 个文件: {names_summary}"
+            else:
+                file_part = "纯对话 (无文件修改)"
+
+            prompt_snippet = getattr(cp, "user_prompt", "") or ""
+            if prompt_snippet:
+                prompt_snippet = prompt_snippet.splitlines()[0].strip()
+                if len(prompt_snippet) > 30:
+                    prompt_snippet = prompt_snippet[:27] + "…"
+                header_line = f" #{idx} 轮次 {cp.turn} · {prompt_snippet} ({file_part})"
+            else:
+                header_line = f" #{idx} 轮次 {cp.turn} · {file_part}"
+
+            body.append(header_line + "\n", style=f"bold {palette.text_primary}")
+
+            # 意图/摘要
+            summary_desc = getattr(cp, "turn_summary", "") or ""
+            source = getattr(cp, "summary_source", "") or ""
+            if not summary_desc:
+                summary_desc = getattr(cp, "user_prompt", "（无轮次摘要）")
+            elif source in ("model_fallback", "deterministic"):
+                mark = "自动摘要" if source == "deterministic" else "模型补写"
+                summary_desc = f"{summary_desc}（{mark}）"
+
+            body.append(f"    意图: {summary_desc}\n\n", style=palette.text_muted)
+
+    # 2. 分割线
+    body.append("  " + "─" * 68 + "\n\n", style=palette.text_faint)
+
+    # 3. 全局统计大盘
+    body.append("【全局统计大盘】\n", style=f"bold {palette.text_primary}")
+
+    usage_in = getattr(metrics, "usage_input", 0) if metrics else 0
+    usage_out = getattr(metrics, "usage_output", 0) if metrics else 0
+    total_tokens = (
+        getattr(metrics, "total_tokens", usage_in + usage_out)
+        if metrics
+        else (usage_in + usage_out)
+    )
+    cached_in = getattr(metrics, "cached_input", None) if metrics else None
+    cache_ratio = getattr(metrics, "cache_ratio", None) if metrics else None
+
+    body.append(
+        f"  📊 Token 总量：{total_tokens:,} tokens\n",
+        style=f"bold {palette.text_primary}",
+    )
+    cached_str = (
+        f"{cached_in:,} tok ({format_ratio(cache_ratio)})"
+        if cached_in is not None
+        else "— (未上报)"
+    )
+    body.append(
+        f"     ├─ 输入: {usage_in:,} tok │ 输出: {usage_out:,} tok │ 缓存命中: {cached_str}\n",
+        style=palette.text_muted,
+    )
+
+    tool_calls = getattr(metrics, "tool_calls", 0) if metrics else 0
+    tool_ms = getattr(metrics, "tool_ms", 0) if metrics else 0
+    duration_str = format_duration(tool_ms) if tool_ms > 0 else "0s"
+    body.append(
+        f"  🛠️ 工具调用：{tool_calls} 次 (累计耗时 {duration_str})\n",
+        style=palette.text_muted,
+    )
+
+    cost_usd = getattr(metrics, "cost_usd", 0.0) if metrics else 0.0
+    model_name = model or getattr(metrics, "model", "") or "未知模型"
+    if cost_usd > 0:
+        cost_str = f"{format_cost(cost_usd)} USD"
+    elif total_tokens > 0 and cost_estimator is not None:
+        from logox.kernel.events import Usage
+
+        est = cost_estimator(
+            Usage(
+                input_tokens=usage_in,
+                output_tokens=usage_out,
+                cached_input_tokens=cached_in,
+            ),
+            model_name,
+        )
+        if est is not None:
+            cost_str = f"{format_cost(est)} USD"
+        else:
+            cost_str = "— (未知模型定价)"
+    elif total_tokens > 0:
+        cost_str = "— (未知模型定价)"
+    else:
+        cost_str = "$0 USD"
+
+    body.append(
+        f"  💰 预估费用：{cost_str} (当前模型: {model_name})\n",
+        style=palette.text_muted,
+    )
+
+    return body
+
+

@@ -40,6 +40,7 @@ from logox.tui.metrics import SessionMetrics
 __all__ = [
     "CONTEXT_DANGER",
     "CONTEXT_WARN",
+    "EFFORT_TOKENS",
     "SEPARATOR",
     "TRIM_PRIORITY",
     "StatusContext",
@@ -49,6 +50,27 @@ __all__ = [
 
 SEPARATOR = " · "
 """状态项之间的分隔符（UI-SPEC §5.1）。"""
+
+#: 思考档位 → 配色 token（★ D161 接通）。
+#:
+#: 为什么需要它：这 5 个 `thinking_*` token 从 D79 起就存在，但**从未被任何代码读取** ——
+#: 档位词一直写死用 `text_muted`。接通后"颜色即档位"这个设计意图才真正成立。
+#:
+#: ⚠️ 两处**刻意的不对称**（都是实测口径，不是笔误）：
+#:
+#: * ``auto`` **没有自己的 token**。档位一共有 5 个（``off``/``low``/``medium``/``high``/``auto``，
+#:   见 ``config/schema.py`` 的 ``Literal``），而 token 只有 4 个 ——
+#:   所以 ``auto`` 复用 ``thinking_medium``。它表达的是"由模型自己决定"，
+#:   视觉上落在中间档是**诚实**的（不假装它是高或低）。
+#: * ``off`` 此前**根本不显示**（旧代码是 ``if effort != "off"``）。现在显示了 ——
+#:   状态行的职责是**事实公示**，而"我把思考关掉了"正是一个应该看得见的事实。
+EFFORT_TOKENS: dict[str, str] = {
+    "off": "thinking_off",
+    "low": "thinking_low",
+    "medium": "thinking_medium",
+    "high": "thinking_high",
+    "auto": "thinking_medium",  # 无独立色 → 复用中间档（见上）
+}
 
 #: 裁剪优先级：数字越大**越先被裁掉**。见 UI-SPEC §5.1 的表。
 TRIM_PRIORITY: dict[str, int] = {
@@ -109,13 +131,16 @@ def _render_item(
     faint = palette.text_faint
 
     if key == "model":
-        # D42：`<模型名> · <思考档位>`；**非 off 档位均显示**
+        # D42：`<模型名> · <思考档位>`；★ D161：**任何档位都显示**（含 off），
+        # 且档位词按档位上色（此前写死 `muted`，那 5 个 thinking_* token 是没人读的死配置）。
         model = metrics.model or EMPTY
         effort = metrics.thinking_effort
         text = Text()
         text.append(model, style=palette.accent)
-        if effort and effort != "off":
-            text.append(f" · {effort}", style=muted)
+        if effort:
+            token = EFFORT_TOKENS.get(effort)
+            effort_style = getattr(palette, token, muted) if token else muted
+            text.append(f" · {effort}", style=effort_style)
         return text, False
 
     if key == "context":
@@ -173,12 +198,15 @@ def _render_item(
         return Text(" · ".join(parts), style=faint), False
 
     if key == "permission":
-        if metrics.pending_permissions <= 0:
-            return None
-        return (
-            Text(f"ask · {metrics.pending_permissions} pending", style=palette.warning),
-            metrics.pending_permissions > 0,
-        )
+        if metrics.pending_permissions > 0:
+            return (
+                Text(f"ask · {metrics.pending_permissions} pending", style=palette.warning),
+                True,
+            )
+        mode = getattr(metrics, "permission_mode", "default")
+        if mode == "creative":
+            return Text("creative", style=palette.warning), True
+        return Text("default", style=faint), False
 
     if key == "git":
         if not context.git_branch:
@@ -220,6 +248,8 @@ def build_status_line(metrics: SessionMetrics, context: StatusContext) -> Text:
     """
     palette = context.palette
     enabled = set(context.items.enabled_keys())
+    if metrics.pending_permissions > 0 or getattr(metrics, "permission_mode", "default") == "creative":
+        enabled.add("permission")
     right = _right_hint(metrics, context)
     right_width = cell_len(right.plain)
     # 左端还要给告警标记留位

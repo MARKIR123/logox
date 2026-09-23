@@ -83,6 +83,14 @@ class ToolResultBlock(BaseModel):
     id: str
     ok: bool = True
     content: str = ""
+    #: 内容是否已被**归档**（换成"索引 + 确定性节选"，原文在磁盘上）。
+    #:
+    #: 为什么必须靠**元数据**而不是去解构内容：早先的写法用"长度是否 > 150"
+    #: 判断"裁过没有"，而这在归档格式变化时会**静默失效** ——
+    #: 归档后的文本自己就 > 150，于是同一块被反复归档，每次都改写历史中前部的字节，
+    #: **让前缀缓存从那里断开，它之后的全部内容按全价重算**（已实测）。
+    #: 状态要有独立载体，不能从表现形式里反推。
+    archived: bool = False
 
 
 ContentBlock = Annotated[
@@ -101,6 +109,43 @@ class MessageMeta(BaseModel):
     #: 这条消息从哪来：正常会话 / 压缩产物 / 钩子注入
     source: Literal["session", "compaction", "hook"] = "session"
     turn_summary: str | None = None
+    #: 这条摘要**是怎么来的**（D135 第二步）。用户裁定 Q-D：来源必须能在
+    #: 历史消息与列表里看出来 —— 否则分不清"模型写的"与"我们兜底的"。
+    #:
+    #: * ``model_last_line`` —— 模型按契约写在最终答复最后一行（**期望路径**）
+    #: * ``model_tag`` —— 模型仍用了旧的 `<turn_summary>` 标签（过渡期的兼容路径）
+    #: * ``model_fallback`` —— 末尾行不合规，**又调了一次模型**补写（第 2 层兜底）
+    #: * ``deterministic`` —— 连补写都失败，本地自动生成（第 3 层兜底）
+    summary_source: Literal[
+        "model_last_line", "model_tag", "model_fallback", "deterministic"
+    ] | None = None
+
+    #: ★ CHANGE-052：这条消息来自 ``transcript.jsonl`` 的第几行（1-based）。
+    #:
+    #: 谁写：**只有 `store/replay.reconstruct_messages()`** —— 它读得到记录的
+    #: ``"line"`` 字段（`write_step` 自始就在写）。除此之外一律为 ``None``。
+    #:
+    #: 为什么需要它（这是"行号不可用"的根治办法）：
+    #: 从前压缩器只能拿"轮次号"当代理去**推断**行号，而轮次号是**进程内自增**的
+    #: ⇒ `/resume` 之后会与文件里已有的编号撞号（F-32），于是守卫只能"整体拒给"
+    #: ⇒ 索引渲染成"行号未知"，那条"可按行号 fs_read 回原文"的逃生门**从未生效**。
+    #: 行号则相反：`transcript.jsonl` 是 append-only，**写入即永久有效**。
+    #:
+    #: ⚠️ 它是**消息**的属性，不是轮的属性 —— 轮的行区间由该轮所有消息的
+    #: ``transcript_line`` 取 min/max 得到（见 `context/compaction.py`）。
+    transcript_line: int | None = None
+
+    #: ★ CHANGE-052：折叠轮原文在 ``transcript.jsonl`` 里的**行区间**（闭区间）。
+    #:
+    #: 只在**折叠产物**（``source="compaction"`` 的摘要消息）上有值 —— 它是
+    #: "这一轮的原样记录在哪"，供模型 `fs_read` 回读。
+    #:
+    #: ⚠️ 必须**存进 meta**、不能每次重算：第二次折叠时被折轮的原文**已不在视图里**
+    #: （视图里只剩 ``[user 逐字, 摘要]`` 对）⇒ 行区间必须**跨折叠存活**。
+    #: 这也是它与 `transcript_line` 分开的原因：前者是"我来自哪一行"，
+    #: 后者是"我代表的那段历史在哪几行"。
+    archived_from_line: int | None = None
+    archived_to_line: int | None = None
 
 
 class Message(BaseModel):

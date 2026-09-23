@@ -141,6 +141,8 @@ class Key:
     alt: bool = False
     shift: bool = False
     char: str | None = None
+    x: int = 0
+    y: int = 0
 
     @property
     def printable(self) -> bool:
@@ -264,8 +266,29 @@ def parse_key(data: str) -> Key | None:
     # 单字节控制字符
     if len(data) == 1:
         code = ord(data)
-        if code in (0x0D, 0x0A):
+        if code == 0x0D:
+            # CR = 回车 = **提交**
             return Key("enter")
+        if code == 0x0A:
+            # ★ LF = **换行**，不是提交（D128）。
+            #
+            # 为什么（这是三次踩坑才拿到的结论，有实测证据）：
+            #   * xterm 家族里 **``Ctrl+J`` 就是 LF**；
+            #   * **Windows Terminal 上 ``Ctrl+Enter`` 也是 LF**（用户机器上的探针实测：
+            #     依次按 Enter/Ctrl+Enter/Shift+Enter/Alt+Enter/Ctrl+J，收到
+            #     ``\r`` / ``\n`` / ``\r`` / （被 WT 的全屏快捷键吃掉）/ ``\n``）；
+            #   * 参考实现 Pi（``@mariozechner/pi-tui`` 的 ``editor.js``）把
+            #     “单独的 LF” 明确归入**换行**分支（``data === "\n" && data.length === 1``），
+            #     而 ``\r`` 归入提交 —— 两边**逐字节一致**。
+            #
+            # ⚠️ 代价（必须说清）：如果某个终端把 **Enter 键**发成 LF，那 "Enter = 提交"
+            # 就不再成立（那种终端上要用 ``Ctrl+M`` 发送，它发的仍是 CR）。
+            # 这与 Pi 的取舍相同：LF 代表“带修饰的 Enter”，CR 代表“Enter”。
+            #
+            # 用 ``ctrl=True`` 而不是新造一个名字：我们已有的键位表里
+            # ``ctrl+enter`` 与 ``ctrl+j`` 都指向换行（见 `editor.py` 的 `_HANDLERS`），
+            # 于是这里不需要在消费侧再加任何分支。
+            return Key("enter", **_modifiers(ctrl=True))
         if code == 0x09:
             return Key("tab")
         if code in (0x08, 0x7F):
@@ -296,6 +319,15 @@ def _parse_csi(data: str) -> Key | None:
     if body == "Z":
         return Key("tab", **_modifiers(shift=True))
 
+    # ★ 某些终端把 ``Shift+Enter`` 发成 ``CSI 13;2~``（与 Pi 的实现逐字节一致）。
+    #
+    # ⚠️ 它在 xterm 的“老式功能键”表里也是 ``Shift+F3`` —— 但 F3 在本项目里
+    # **没有任何绑定**，所以这个歧义不会让用户丢功能；反之不认它，
+    # 这些终端上用户就永远换不了行（那才是真正的损失）。
+    # （D129 曾随 `Shift+Enter` 键位一起去掉；D130 恢复。）
+    if body == "13;2~":
+        return Key("enter", **_modifiers(shift=True))
+
     # xterm ``modifyOtherKeys`` 模式 2：``CSI 27 ; <修饰> ; <码点> ~``
     # 这是拿不到 Kitty 协议时的退路，也是 Shift+Enter 在多数终端上唯一的希望。
     if body.startswith("27;") and body.endswith("~"):
@@ -305,14 +337,19 @@ def _parse_csi(data: str) -> Key | None:
     if body.endswith("u"):
         return _parse_kitty(body[:-1])
 
+    # SGR 1006 鼠标扩展协议：``CSI < <按键> ; <X> ; <Y> M/m``（D179）
+    if body.startswith("<") and (body.endswith("M") or body.endswith("m")):
+        return _parse_sgr_mouse(body)
+
     # ``CSI 1 ; 5 A`` 这类（修饰参数 + 方向键）
     if body[-1] in _CSI_FINAL:
         name = _CSI_FINAL[body[-1]]
         params = body[:-1].split(";")
-        # ⚠️ 修饰参数在**终止字母之前**。少看这一段的话，Shift+Up 会被
-        # 当成普通 Up —— 这类"修饰被静默忽略"的 bug 很难从症状反推。
-        shift = len(params) > 1 and params[1].split(":")[0] in ("2", "4", "6", "8")
-        return Key(name, **_modifiers(shift=shift))
+        raw_mod = int(params[1].split(":")[0]) if len(params) > 1 and params[1].split(":")[0].isdigit() else 1
+        mods = _decode_modifiers(raw_mod)
+        if name == "tab":  # Shift+Tab
+            mods["shift"] = True
+        return Key(name, **mods)
 
     # ``CSI 3 ~`` 这类
     if body.endswith("~"):
@@ -320,10 +357,53 @@ def _parse_csi(data: str) -> Key | None:
         name = _CSI_TILDE.get(params[0])
         if name is None:
             return None
-        shift = len(params) > 1 and params[1].split(":")[0] in ("2", "4", "6", "8")
-        return Key(name, **_modifiers(shift=shift))
+        raw_mod = int(params[1].split(":")[0]) if len(params) > 1 and params[1].split(":")[0].isdigit() else 1
+        return Key(name, **_decode_modifiers(raw_mod))
 
     return None
+
+
+def _parse_sgr_mouse(body: str) -> Key | None:
+    """解析 SGR 1006 鼠标扩展协议（``CSI < <按钮> ; <X> ; <Y> M/m``，D179/D180）。
+
+    末尾字符：``M`` 表示按下或移动拖拽，``m`` 表示释放。
+    """
+    is_release = body.endswith("m")
+    params = body[1:-1].split(";")
+    if len(params) < 3 or not params[0].isdigit() or not params[1].isdigit() or not params[2].isdigit():
+        return None
+    button = int(params[0])
+    x = int(params[1])
+    y = int(params[2])
+
+    shift = bool(button & 4)
+    alt = bool(button & 8)
+    ctrl = bool(button & 16)
+    base = button & ~0x1C  # 剔除修饰位
+
+    if is_release:
+        return Key("mouse_up", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+
+    # 滚轮事件
+    if base == 64:
+        return Key("wheel_up", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+    if base == 65:
+        return Key("wheel_down", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+
+    # 拖拽移动事件（按住鼠标移动时 base 带有 32）
+    if base & 32:
+        return Key("mouse_drag", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+
+    # 按键按下
+    if base == 0:
+        return Key("mouse_down", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+    if base == 1:
+        return Key("mouse_middle_down", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+    if base == 2:
+        return Key("mouse_right_down", ctrl=ctrl, alt=alt, shift=shift, x=x, y=y)
+
+    return None
+
 
 
 #: Kitty 协议的修饰位（``CSI <码>;<修饰>u`` 里那个数）
@@ -536,6 +616,25 @@ def _sequence_length(buffer: str) -> int | None:
         return None
 
     second = buffer[1]
+
+    # ``ESC ESC <序列>`` = Alt + 那个键（外层 ESC 是修饰位，内层是 CSI / SS3 的开头）。
+    #
+    # ⚠️ 必须**连内层一起**算长度。历史上这里对 ``\x1b\x1b`` 直接返回 2，于是
+    # ``ESC ESC [ D``（Alt+\u2190）被切成 ``Alt+Esc`` + ``[`` + ``D`` —— 症状是
+    # **按 Alt+方向键会在输入框里打出 ``[D``，而光标一动不动**。
+    #
+    # 为什么一直没被发现（值得记住的教训）：``parse_key``（无状态解析）对整串是**对的**，
+    # 而真实输入走的是**有状态**的 ``KeyParser`` —— 测试当时只盖了前者。
+    # 同一个函数还在 D127 里得到了第二个用处：Windows 上由控制台按键状态合成的
+    # ``\x1b[27;…~`` 万一前一条记录是 ESC，也靠这条规则才能整串解析。
+    if second == "\x1b":
+        inner = _sequence_length(buffer[1:])
+        if inner is None:
+            return None  # 内层还没收全（如 ``ESC ESC [``），等下一次
+        if inner <= 1:
+            # 内层就是"孤零零一个 ESC"→ 整个 ``ESC ESC`` 才算一个按键（Alt+Esc）
+            return 2
+        return 1 + inner
 
     # CSI：ESC [ ... 终止字节在 0x40–0x7E
     if second == "[":

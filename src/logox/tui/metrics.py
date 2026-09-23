@@ -89,8 +89,10 @@ class SessionMetrics(BaseModel):
     # 运行态
     generating: bool = False
     running_tool: str | None = None
+    tool_calls: int = 0
     queue_depth: int = 0
     pending_permissions: int = 0
+    permission_mode: str = "default"
     retry: RetryState | None = None
     last_error: str | None = None
 
@@ -183,6 +185,7 @@ class MetricsReducer:
         self.metrics.tool_ms = 0
         self.metrics.generating = False
         self.metrics.running_tool = None
+        self.metrics.tool_calls = 0
         self.metrics.queue_depth = 0
         self.metrics.pending_permissions = 0
         self.metrics.retry = None
@@ -216,7 +219,14 @@ class MetricsReducer:
         metrics.usage_input += event.usage.input_tokens
         metrics.usage_output += event.usage.output_tokens
         if event.usage.input_tokens > 0:
-            metrics.context_tokens = event.usage.input_tokens
+            # ★ 优先用“**上下文总量**”（CHANGE-005）：厂商口径不同 ——
+            #   OpenAI 兼容的 `input_tokens` 本身是总量，Anthropic 的**不含**缓存读写。
+            #   之前直接拿 `input_tokens` 当上下文大小，于是接 Anthropic 端点时
+            #   状态栏那个百分比会**偏低**（命中缓存越多偏得越离谱）——
+            #   而用户正是靠它判断“要不要压缩 / 刚才是压过了”。
+            #   缺失（老适配器 / 未上报）才退回旧口径。
+            total = event.usage.context_tokens
+            metrics.context_tokens = total if total is not None else event.usage.input_tokens
         if event.usage.cached_input_tokens is not None:
             metrics.cached_input = (metrics.cached_input or 0) + event.usage.cached_input_tokens
         if event.cost_usd is not None:
@@ -230,6 +240,7 @@ class MetricsReducer:
         self.metrics.running_tool = self._call_names.get(event.call_id, "tool")
 
     def _on_tool_finished(self, event: ToolCallFinished) -> None:
+        self.metrics.tool_calls += 1
         self.metrics.tool_ms += event.duration_ms
         self.metrics.running_tool = None
         self._call_names.pop(event.call_id, None)

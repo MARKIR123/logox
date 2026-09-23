@@ -44,6 +44,15 @@ from logox.kernel.messages import (
 from logox.kernel.registry import ToolRegistry
 from logox.kernel.scheduler import AllowAllDecider, BlobStoreProtocol, PermissionDecider, Scheduler
 from logox.kernel.turn import Turn, TurnStatus
+from logox.kernel.summary import (
+    SUMMARY_MODEL_FALLBACK_MIN_CHARS,
+    SUMMARY_SYSTEM_PROMPT,
+    deterministic_summary,
+    extract_trailing_summary,
+    interrupted_summary,
+    normalize_model_summary,
+    render_turn_transcript,
+)
 from logox.providers.base import (
     ChatRequest,
     DeltaEvent,
@@ -93,6 +102,53 @@ class TurnInProgressError(LogoxError):
 # --------------------------------------------------------------------------- #
 
 
+class CompactionReport(BaseModel):
+    """一次压缩的**事实报告**（D156）。
+
+    **为什么由 context 层产出、内核层发布**：压缩发生在 `context/`（L4），
+    而事件总线属于内核（L3）。让 L4 直接拿总线等于让下层反向依赖上层
+    （与"`kernel/events.py` 不能 import `tools`"是同一条规矩）。
+    所以这里定义**内核侧的中性数据**，由 L4 填写、L3 发布 —— 既守住分层，
+    也让"到底有没有发生压缩、压了多少"变成可单测的事实。
+
+    ⚠️ 背景（F-54）：在这之前 `CompactionStarted` / `CompactionFinished`
+    **全项目没有任何发布者**，于是四条订阅线全是死的 ——
+    时间线看不到压缩提示、`compact_count` 永远是 0、`pre_compact` 钩子永不触发、
+    事后也无从查证。本报告就是那根缺失的线。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tokens_before: int = Field(ge=0)
+    tokens_after: int = Field(ge=0)
+    message_count_before: int = Field(ge=0)
+    message_count_after: int = Field(ge=0)
+    #: 被修剪（归档/掏空）的工具结果条数
+    pruned_count: int = Field(default=0, ge=0)
+    #: 本次折叠掉的轮数（0 = 只做了工具修剪，没有折叠）
+    folded_turns: int = Field(default=0, ge=0)
+    #: ``"prune"`` 或 ``"prune+fold"``
+    strategy: str = "prune"
+    #: 折叠时是否用了**确定性兜底摘要**（某几轮没有 `turn_summary`）
+    degraded: bool = False
+
+
+class CompactionPlan(BaseModel):
+    """"这次组装**将要**发生压缩"的预测（D167）。
+
+    为什么单独一个类型：`pre_compact` 钩子需要在**改动历史之前**拿到"将要用多少 token、
+    涉及多少条消息"，而压缩本身发生在 `context/` 层（L4）里、总线属于内核（L3）。
+    于是由 builder 产出这份**纯数据**、内核据此发布 `CompactionStarted` —— 与
+    `CompactionReport` 是同一条分层规矩（L4 不碰总线）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: 预测的压缩前规模（锚点 + 增量）
+    tokens_before: int = Field(ge=0)
+    message_count_before: int = Field(ge=0)
+
+
 class ContextBundle(BaseModel):
     """组装好的模型输入。"""
 
@@ -105,12 +161,22 @@ class ContextBundle(BaseModel):
     token_estimate: int = 0
     memory_sources: list[str] = Field(default_factory=list)
     pruned_count: int = 0
+    #: ★ D156：本次组装**是否发生了压缩**（None = 没有）。内核据此发布 `CompactionFinished`。
+    compaction: CompactionReport | None = None
 
 
 class ContextBuilder(Protocol):
-    """上下文组装。**内核只调用它，不实现它**（L3 不认识 L4 的 context/）。"""
+    """上下文组装。**内核只调用它，不实现它**（L3 不认识 L4 的 context/）。
 
-    def build(self, history: list[Message]) -> ContextBundle: ...
+    ``last_usage``（CHANGE-005 裁定 1）：上一次模型请求厂商上报的真实用量。
+    压缩的触发判据要用它，因为**纯估算最坏会低估一半**（估算器的校准系数
+    被夹在 ``[0.5, 2.0]`` 里），而固定 reserve 拦不住“低估一半”。
+    适配层不认字段名的实现（如 ``SimpleContextBuilder``）直接忽略即可。
+    """
+
+    def build(
+        self, history: list[Message], *, last_usage: ev.Usage | None = None
+    ) -> ContextBundle: ...
 
 
 class CostEstimator(Protocol):
@@ -138,7 +204,9 @@ class SimpleContextBuilder:
         self._system = system
         self._memory_sources = list(memory_sources or [])
 
-    def build(self, history: list[Message]) -> ContextBundle:
+    def build(
+        self, history: list[Message], *, last_usage: ev.Usage | None = None
+    ) -> ContextBundle:
         return ContextBundle(
             system=self._system,
             messages=list(history),
@@ -161,7 +229,6 @@ class _ModelOutcome(BaseModel):
     tool_calls: list[ToolCallEvent] = Field(default_factory=list)
     stop_reason: str = "unknown"
     usage: ev.Usage | None = None
-    turn_summary: str | None = None
     #: 模型请求本身成功（不代表模型没报错）——失败时整个回合已经结束了
     ok: bool = True
 
@@ -176,14 +243,13 @@ class _Accumulator:
     （一个对象换来的是"按 Esc 不会抹掉你刚读到的内容"。）
     """
 
-    __slots__ = ("reasoning", "signature", "text", "tool_calls", "turn_summary")
+    __slots__ = ("reasoning", "signature", "text", "tool_calls")
 
     def __init__(self) -> None:
         self.text: list[str] = []
         self.reasoning: list[str] = []
         self.signature: str | None = None
         self.tool_calls: list[ToolCallEvent] = []
-        self.turn_summary: str | None = None
 
     @property
     def empty(self) -> bool:
@@ -197,7 +263,6 @@ class _Accumulator:
             tool_calls=list(self.tool_calls),
             stop_reason=stop_reason,
             usage=usage,
-            turn_summary=self.turn_summary,
         )
 
 
@@ -249,9 +314,16 @@ class KernelLoop:
         clock: Callable[[], float] | None = None,
         jitter: Callable[[], float] | None = None,
         blob_store: BlobStoreProtocol | None = None,
+        model_summary_fallback: bool = True,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations 必须 ≥ 1")
+        #: 第 2 层兜底（再调一次模型补写摘要）是否启用。
+        #:
+        #: 默认开 —— 它是「本来没拿到摘要」时的补救；关掉就只剩本地生成（第 3 层）。
+        #: 为什么做成开关而不是写死：这是一次**额外计费请求**，
+        #: 关心成本的用户、以及大量脚本化测试，都需要能关。
+        self._model_summary_fallback = model_summary_fallback
         if max_retries < 0:
             raise ValueError("max_retries 不能为负")
 
@@ -281,6 +353,11 @@ class KernelLoop:
 
         #: 会话消息历史。L2 的会话对象与持久化订阅者读它；内核只往里追加。
         self.history: list[Message] = []
+        #: ★ CHANGE-005：**上一次模型请求厂商上报的真实用量**。
+        #: 下一次组装上下文时把它交给 builder，作为压缩的触发判据。
+        #: 刻意保存**原始值**（未上报就是 None，而不是 0）—— 0 会被读成"上下文是空的"，
+        #: 于是压缩永远不触发。
+        self._last_request_usage: ev.Usage | None = None
         self._turns: list[Turn] = []
 
     # ------------------------------------------------------------------ #
@@ -294,7 +371,24 @@ class KernelLoop:
 
     @property
     def turn_index(self) -> int:
-        return len(self._turns)
+        """下一个轮次号减一 —— 即“历史里已有的用户输入数”（跨 resume 单调）。"""
+        return self._next_turn_index() - 1
+
+    def _next_turn_index(self) -> int:
+        """下一个轮次号 = 历史里已有的用户输入数 + 1。
+
+        ⚠️ **不能用** ``len(self._turns) + 1``：``_turns`` 是**进程级**的，
+        而 ``/resume`` 会把 ``history`` 整体换掉却不会同步它 —— 于是新进程里轮次号
+        从 1 重新开始，与文件里已有的轮次号**冲突**。
+
+        实测后果（真实会话 `tui-34248.jsonl`）：同一个文件里 ``turn=1`` 出现 **3 次**，
+        于是 ``SessionTranscriptWriter.turn_lines`` 把三次合并成一个区间
+        （``{1: (1, 238)}``，“第 1 轮”覆盖整个文件），归档索引里的
+        「第 N 轮 · 行 X~Y」就指向了**错误的行**（F-32）。
+
+        **从 history 推导则天然跨 resume 单调，而且状态只有一个来源。**
+        """
+        return 1 + sum(1 for message in self.history if message.role == "user")
 
     async def start(self, text: str) -> Turn:
         """开一个回合并**在后台运行**，立刻返回 :class:`Turn`。
@@ -312,7 +406,7 @@ class KernelLoop:
         if running is not None:
             raise TurnInProgressError(running.turn_index)
 
-        turn = Turn(turn_index=len(self._turns) + 1, history=self.history)
+        turn = Turn(turn_index=self._next_turn_index(), history=self.history)
         self._turns.append(turn)
         turn.task = asyncio.get_running_loop().create_task(
             self._run(turn, text), name=f"logox-turn-{turn.turn_index}"
@@ -397,19 +491,79 @@ class KernelLoop:
             turn.mark_cancelled()
             self._complete_history(turn)
             if not turn.turn_summary:
-                turn.turn_summary = f"在第 {turn.turn_index} 轮被中断"
+                # ★ CHANGE-052：摘要 = **用户问题 + 异常说明**（用户裁定）。
+                #   折叠之后该轮原文整段消失，"第 N 轮被中断"没说这一轮想干什么 ——
+                #   模型接着干活时不知道"用户当时要的东西"还需不需要做。
+                turn.turn_summary = interrupted_summary(text, "本轮被中断")
             await self._emit_turn_finished(turn, "cancelled")
         except _ProviderFailure:
             # ErrorOccurred 已经在 raise 之前发过了；这里只负责收尾
             turn.status = TurnStatus.FAILED
             self._complete_history(turn)
             if not turn.turn_summary:
-                turn.turn_summary = f"第 {turn.turn_index} 轮模型请求失败"
+                turn.turn_summary = interrupted_summary(text, "模型请求失败")
             await self._emit_turn_finished(turn, "error")
         except LogoxError:
             # 总线已关闭之类的框架级错误：状态登记好再放行，**绝不吞**
             turn.status = TurnStatus.FAILED
             raise
+
+    async def _build_context(self, turn: Turn) -> ContextBundle:
+        """组装视图并把 ``ContextBuilt`` 发到总线上。
+
+        回合开始时与**回合内复检**（CHANGE-005 裁定 8）共用同一个入口 ——
+        两处各写一遍，迟早会有一处忘了把``last_usage`` 传下去。
+        """
+        # ★ D167 / F-55：先问"这次会不会压"，会的话在**动手之前**发 `CompactionStarted`
+        #   —— 这正是 `pre_compact` 钩子需要的挂点（此前该事件没有任何发布者 ⇒ 钩子永不触发）。
+        #   调用 `plan()` 是可选的（`getattr`）：不认识它的 ContextBuilder 实现照旧工作
+        #   （与"适配层不认字段名的实现直接忽略"是同一风格）。
+        planner = getattr(self._builder, "plan", None)
+        if callable(planner):
+            plan = planner(self.history, last_usage=self._last_request_usage)
+            if plan is not None:
+                await self._bus.publish(
+                    ev.CompactionStarted(
+                        session_id=self._bus.session_id,
+                        turn=turn.turn_index,
+                        # 具体策略要等真正折叠时才知道（工具修剪 / 折叠 / 两者）
+                        strategy="auto",
+                        tokens_before=plan.tokens_before,
+                        message_count_before=plan.message_count_before,
+                    )
+                )
+
+        bundle = self._builder.build(self.history, last_usage=self._last_request_usage)
+        # ★ D156 / F-54：把"压缩发生了"这件事**发到总线上**。
+        #   在补上这一处之前，`CompactionStarted`/`CompactionFinished` 全项目没有发布者，
+        #   于是时间线提示、`compact_count`、`pre_compact` 钩子、事后查证**四条线全是死的**。
+        #   只发 Finished（不发 Started）：本项目的压缩是**本地纯计算、不调模型**，
+        #   亚毫秒级完成，"正在进行"这个阶段事实上不存在（详见 CHANGE-026 §2.2）。
+        if bundle.compaction is not None:
+            await self._bus.publish(
+                ev.CompactionFinished(
+                    session_id=self._bus.session_id,
+                    turn=turn.turn_index,
+                    tokens_after=bundle.compaction.tokens_after,
+                    message_count_after=bundle.compaction.message_count_after,
+                    degraded=bundle.compaction.degraded,
+                    tokens_before=bundle.compaction.tokens_before,
+                    pruned_count=bundle.compaction.pruned_count,
+                    folded_turns=bundle.compaction.folded_turns,
+                    strategy=bundle.compaction.strategy,
+                )
+            )
+        await self._bus.publish(
+            ev.ContextBuilt(
+                session_id=self._bus.session_id,
+                turn=turn.turn_index,
+                message_count=len(bundle.messages),
+                token_estimate=bundle.token_estimate,
+                memory_sources=list(bundle.memory_sources),
+                pruned_count=bundle.pruned_count,
+            )
+        )
+        return bundle
 
     async def _body(self, turn: Turn, text: str) -> None:
         self.history.append(_user_message(text))
@@ -422,17 +576,7 @@ class KernelLoop:
             )
         )
 
-        bundle = self._builder.build(self.history)
-        await self._bus.publish(
-            ev.ContextBuilt(
-                session_id=self._bus.session_id,
-                turn=turn.turn_index,
-                message_count=len(bundle.messages),
-                token_estimate=bundle.token_estimate,
-                memory_sources=list(bundle.memory_sources),
-                pruned_count=bundle.pruned_count,
-            )
-        )
+        bundle = await self._build_context(turn)
 
         #: 本轮的请求消息视图：随模型响应与工具结果增长
         messages: list[Message] = list(bundle.messages)
@@ -446,6 +590,20 @@ class KernelLoop:
         current_limit = self._max_iterations
         while iteration < current_limit:
             iteration += 1
+            # ★ CHANGE-005 裁定 8：**回合内复检水位线**。
+            #
+            # 一个回合里模型请求要跑好几轮：每次工具结果回来又是一轮。
+            # 而压缩原来只在回合开始时看一次 —— 于是"回合开始时还没满"的上下文
+            # 会带着本回合的工具输出一路涨到**超窗口**，厂商直接回 400。
+            # 这是 pi 在 CHANGELOG 0.84.4 修过的同一个 bug
+            # （"compacts between tool execution and the next assistant response
+            #   in the same run"）——两家踩的是同一个坑。
+            #
+            # 为什么放这里而不是 `_model_phase` 内部：增量来自**工具结果**，
+            # 而工具结果是在这个 while 的每轮之间追加的；重试不会新增上下文。
+            if iteration > 1:
+                bundle = await self._build_context(turn)
+                messages = list(bundle.messages)
             try:
                 produced = await self._model_phase(turn, messages, bundle)
             except _ProviderFailure as failure:
@@ -516,32 +674,64 @@ class KernelLoop:
 
                     # 续写已达上限依然没有任何交付物：标记为未完结失败，绝不发 completed
                     turn.status = TurnStatus.FAILED
-                    turn.turn_summary = f"第 {turn.turn_index} 轮模型输出未包含有效正文或工具调用"
+                    turn.turn_summary = interrupted_summary(text, "本轮无有效输出")
                     await self._emit_turn_finished(turn, "error")
                     return
 
                 # 场景 2：正常结束（有正文交付物、或已执行过工具、或非思考模型的普通停机）
                 turn.status = TurnStatus.DONE
-                summary = produced.turn_summary
                 clean_msg = produced.assistant_message
 
                 # 只有非空正文或工具执行后才提取/生成摘要；纯空输出绝不伪造假摘要
                 if has_text or turn.tool_call_count > 0:
-                    if not summary:
-                        clean_msg, summary = _extract_and_strip_turn_summary(clean_msg)
-                    else:
-                        clean_msg, _ = _extract_and_strip_turn_summary(clean_msg)
+                    # ★ D135：摘要 = **位置契约**（最终答复的最后一行）。
+                    #
+                    #   L1 末尾行（`model_last_line`）—— **期望路径**，零成本
+                    #   L2 再调一次模型补写（`model_fallback`）—— 用户裁定 Q-D
+                    #   L3 本地自动生成（`deterministic`）—— 最后一道，绝不失败
+                    #
+                    #   ⚠️ 正文**只被读**，从不被改 —— "吞正文"这个故障类别已从机制上消失。
+                    verdict = extract_trailing_summary(clean_msg.text)
+                    summary = verdict.summary
+                    source = "model_last_line" if summary else None
+                    # 三层兜底的**链路诊断**（D135-4）：只记 L1 不够 ——
+                    # 必须能区分"模型不配合" / "我们拒得太严" / "补写失败"。
+                    chain: list[str] = [verdict.reason]
 
-                    if summary:
-                        turn.turn_summary = summary
-                    else:
-                        turn.turn_summary = _fallback_turn_summary(clean_msg, turn)
+                    if (
+                        not summary
+                        and self._model_summary_fallback
+                        and self._worth_a_model_summary(turn, clean_msg)
+                    ):
+                        # ★ 成本闸门：两字回答不值得再发一次请求（见 `_worth_a_model_summary`）
+                        summary, l2_outcome = await self._summarize_turn_via_model(turn)
+                        chain.append(l2_outcome)
+                        if summary:
+                            source = "model_fallback"
+                    elif not summary:
+                        chain.append("l2_skipped")
+
+                    if not summary:
+                        summary = deterministic_summary(
+                            clean_msg,
+                            tool_call_count=turn.tool_call_count,
+                            turn_index=turn.turn_index,
+                        )
+                        source = "deterministic"
+                        chain.append("l3")
+
+                    turn.turn_summary = summary
+                    turn.summary_source = source
+                    turn.summary_reason = " → ".join(chain)
                 else:
                     turn.turn_summary = None
 
                 meta_kwargs = clean_msg.meta.model_dump() if clean_msg.meta else {}
                 if turn.turn_summary:
                     meta_kwargs["turn_summary"] = turn.turn_summary
+                    # ★ 用户裁定 Q-D：来源要**落进历史消息的 meta**，
+                    #   这样历史里任何一条消息都能自证“摘要是不是模型写的”。
+                    meta_kwargs["summary_source"] = turn.summary_source
                 clean_msg = Message(
                     role=clean_msg.role,
                     blocks=clean_msg.blocks,
@@ -579,7 +769,7 @@ class KernelLoop:
         )
         turn.status = TurnStatus.FAILED
         if not turn.turn_summary:
-            turn.turn_summary = f"超过最大迭代限制 ({iteration} 轮)"
+            turn.turn_summary = interrupted_summary(text, f"超过最大迭代限制（{iteration} 轮）")
         await self._emit_turn_finished(turn, "error")
 
     async def _request_continuation(self, turn: Turn, iteration: int) -> bool:
@@ -673,7 +863,6 @@ class KernelLoop:
         """读一个完整的模型流，把增量即时翻译成总线事件并累积进 ``acc``。"""
         usage: ev.Usage | None = None
         stop_reason = "unknown"
-        summary_filter = StreamSummaryFilter()
 
         async for event in self._provider.stream(request):
             if isinstance(event, DeltaEvent):
@@ -697,19 +886,19 @@ class KernelLoop:
                         )
                     )
                 else:
-                    for clean_chunk in summary_filter.feed(event.text):
-                        if not clean_chunk:
-                            continue
-                        acc.text.append(clean_chunk)
-                        await self._bus.publish(
-                            ev.ModelDelta(
-                                session_id=self._bus.session_id,
-                                turn=turn.turn_index,
-                                kind=event.kind,
-                                delta=clean_chunk,
-                                request_index=request_index,
-                            )
+                    # ⚠️ D135：这里**不再有"流式摘要过滤"** —— 摘要改成位置契约之后，
+                    # 正文里不会再有需要拦截的标记；把增量原样交给界面与持久化，
+                    # 也就从机制上不可能"吞掉文字"。
+                    acc.text.append(event.text)
+                    await self._bus.publish(
+                        ev.ModelDelta(
+                            session_id=self._bus.session_id,
+                            turn=turn.turn_index,
+                            kind=event.kind,
+                            delta=event.text,
+                            request_index=request_index,
                         )
+                    )
             elif isinstance(event, ToolCallEvent):
                 acc.tool_calls.append(event)
                 # 适配层给的是**装配完成**的调用（不是参数片段），所以这里只有"一次性"的
@@ -730,22 +919,6 @@ class KernelLoop:
             elif isinstance(event, ProviderErrorEvent):
                 raise _ProviderFailure(event, acc=acc)
             # ProviderEvent 是封闭联合；新增类型时这里会静默忽略——见 base.py 的 __all__
-
-        for remaining_chunk in summary_filter.flush():
-            if remaining_chunk:
-                acc.text.append(remaining_chunk)
-                await self._bus.publish(
-                    ev.ModelDelta(
-                        session_id=self._bus.session_id,
-                        turn=turn.turn_index,
-                        kind="text",
-                        delta=remaining_chunk,
-                        request_index=request_index,
-                    )
-                )
-
-        if summary_filter.summary:
-            acc.turn_summary = summary_filter.summary
 
         return acc.outcome(stop_reason=stop_reason, usage=usage)
 
@@ -839,6 +1012,9 @@ class KernelLoop:
         self, turn: Turn, outcome: _ModelOutcome, watch: Stopwatch
     ) -> None:
         usage = outcome.usage if outcome.usage is not None else _ZERO_USAGE
+        # ★ CHANGE-005：记下**本次请求真实喂进去的上下文大小**，供下一次组装用。
+        #   注意存的是 `outcome.usage`（**未上报就是 None**），不是上面那个补过 0 的 `usage`。
+        self._last_request_usage = outcome.usage
         cost: float | None = None
         if outcome.usage is not None and self._model and self._cost_estimator is not None:
             cost = self._cost_estimator(usage, self._model)
@@ -865,6 +1041,90 @@ class KernelLoop:
     # 收尾
     # ------------------------------------------------------------------ #
 
+    def _turn_messages(self, turn: Turn) -> list[Message]:
+        """取**本轮**的消息切片（给摘要器用）。
+
+        怎么定位"本轮"：从**最后一个真正的用户输入**开始 —— 工具结果在我们这里是
+        ``role="tool"`` 的独立消息，所以 ``role=="user"`` 就是用户本人说的话。
+        这样不需要额外记录"本轮起点"状态，也就不会与将来的改动失配。
+        """
+        for index in range(len(turn.history) - 1, -1, -1):
+            if turn.history[index].role == "user":
+                return list(turn.history[index:])
+        return []
+
+    async def _summarize_turn_via_model(self, turn: Turn) -> tuple[str | None, str]:
+        """**第 2 层兜底**（D135 第二步 / 用户裁定 Q-D）：末尾行不合规时，**再问一次模型**。
+
+        上下文只用**本轮对话**（用户输入 + 本轮回答 + 工具结果），并做有界截断，
+        避免"为了补一句摘要反而付一大笔 token"。
+
+        三条硬约束（都不是可选项）：
+
+        1. **不写回历史** —— 这次请求是**旁路产物**。哪怕只把它追加进 ``self.history``，
+           改动也会落在下一轮请求的前缀上，KV cache 直接失效（D114 用摘要折叠本来就为了保 cache）。
+        2. **不上屏** —— 不发布 ``ModelRequestStarted`` / ``ModelDelta``：
+           用户看到的对话流必须与"模型真正回答的内容"一一对应，否则会凭空多出一段。
+        3. **失败就降级** —— 任何异常 / 超时 / 空结果都返回 ``None``，交给第 3 层本地生成。
+           ⚠️ 摘要是一条"锦上添花"的旁路，**绝不能因为它把回合搞成失败**。
+        """
+        messages = self._turn_messages(turn)
+        transcript = render_turn_transcript(messages) if messages else ""
+        if not transcript.strip():
+            return None, "l2_no_input"
+
+        request = ChatRequest(
+            model=self._model,
+            system=SUMMARY_SYSTEM_PROMPT,
+            messages=[_user_message(transcript)],
+            tools=[],  # ← 这一层只要一句话，不给工具
+            temperature=0.2,
+            max_tokens=200,  # ← 一句摘要足够；也防它写成长文
+            thinking=None,  # ← 不需要思考
+        )
+
+        chunks: list[str] = []
+        usage: ev.Usage | None = None
+        try:
+            async with asyncio.timeout(SUMMARY_TIMEOUT_S):
+                async for event in self._provider.stream(request):
+                    if isinstance(event, DeltaEvent):
+                        if event.kind != "reasoning" and event.text:
+                            chunks.append(event.text)
+                    elif isinstance(event, UsageEvent):
+                        usage = event.usage
+                    elif isinstance(event, StopEvent):
+                        break
+                    elif isinstance(event, ProviderErrorEvent):
+                        # ★ D135-4：适配层把厂商错误包成**事件**而不是异常（见 `providers/base.py`）——
+                        # 不处理它，`async for` 就只是"结束了"，于是**被误诊成"空响应/被校验拒"**。
+                        # （这条正是加了链路诊断之后才显形的：诊断说 `l2_rejected`，真相是厂商报错。）
+                        return None, f"l2_error:{event.category}"
+        except Exception as exc:  # noqa: BLE001 - 兜底路径：任何失败都降级，绝不外抛
+            # ⚠️ 只 `logger.warning` 是不够的：本项目的日志**没有落到文件**
+            #（`~/.logox/logs/logox.log` 实测仍是 0 字节），所以失败原因必须**跟事件一起落盘**。
+            logger.warning("摘要补写失败，降级到本地生成：%s", exc)
+            return None, f"l2_error:{type(exc).__name__}"
+
+        # 成败都要记账：这次调用**真的花了钱**，不记就等于让费用统计说谎
+        turn.add_usage(usage if usage is not None else _ZERO_USAGE)
+
+        # ⚠️ 补写结果**必须过同一套校验**（用户裁定 Q-A/Q-B）：
+        # 模型对"写一句摘要"的执行力并不比"写在最后一行"更好 —— 它会带解释、写多行、写成标题。
+        summary = normalize_model_summary("\n".join(chunks))
+        return (summary, "l2_ok") if summary else (None, "l2_rejected")
+
+    def _worth_a_model_summary(self, turn: Turn, message: Message) -> bool:
+        """**值不值得**为这一轮再发一次请求补写摘要？（成本闸门）
+
+        两字回答（"ok" / "完成"）本地兜底就够，为它再花一次请求是纯浪费；
+        而"真干了活"的轮次 —— **调过工具**，或正文本身就够长 —— 才值得。
+        阈值是 `SUMMARY_MODEL_FALLBACK_MIN_CHARS`（200 可见字符）。
+        """
+        if turn.tool_call_count > 0:
+            return True
+        return len(message.text.strip()) >= SUMMARY_MODEL_FALLBACK_MIN_CHARS
+
     async def _emit_turn_finished(self, turn: Turn, reason: str) -> None:
         await self._bus.publish(
             ev.TurnFinished(
@@ -876,6 +1136,8 @@ class KernelLoop:
                 usage=turn.usage_total,
                 reason=reason,  # type: ignore[arg-type]
                 turn_summary=turn.turn_summary,
+                summary_source=turn.summary_source,
+                summary_reason=turn.summary_reason,
             )
         )
 
@@ -921,100 +1183,14 @@ class KernelLoop:
 # 小助手
 # --------------------------------------------------------------------------- #
 
-class StreamSummaryFilter:
-    """流式 Token 增量中的 <turn_summary> 标签拦截过滤器。
-
-    解决痛点：大模型在最后一轮末尾输出 <turn_summary>...</turn_summary> 时，
-    若不加拦截直接作为 ModelDelta 广播，终端 TUI 时间线会把 XML 标签实时打印在屏幕上。
-
-    本过滤器在 ModelDelta 发布前执行实时透明截获：
-    1. 遇到可能是 <turn_summary> 的前缀时微量缓冲；
-    2. 一旦进入标签，丢弃 <turn_summary> 及其前置换行，后续内容存入 summary_buffer；
-    3. 遇到 </turn_summary> 时闭合标签，将提取出的纯摘要存入 self.summary；
-    4. 若未匹配为标签（如普通代码中的 <stdio.h>），原样吐出缓冲内容，零丢字、零延迟。
-    """
-
-    def __init__(self) -> None:
-        self.summary: str | None = None
-        self._buffer: str = ""
-        self._in_tag = False
-        self._summary_buffer: str = ""
-
-    def feed(self, chunk: str) -> list[str]:
-        if self._in_tag:
-            self._summary_buffer += chunk
-            close_idx = self._summary_buffer.lower().find("</turn_summary>")
-            if close_idx != -1:
-                self._in_tag = False
-                self.summary = (self.summary or "") + self._summary_buffer[:close_idx].strip()
-                remaining = self._summary_buffer[close_idx + len("</turn_summary>"):]
-                self._summary_buffer = ""
-                if remaining:
-                    return self.feed(remaining)
-                return []
-            return []
-
-        combined = self._buffer + chunk
-        self._buffer = ""
-
-        lower_combined = combined.lower()
-        idx = lower_combined.find("<turn_summary>")
-        if idx != -1:
-            text_before = combined[:idx].rstrip("\r\n")
-            emits = [text_before] if text_before else []
-            self._in_tag = True
-            after_tag = combined[idx + len("<turn_summary>"):]
-            close_idx = after_tag.lower().find("</turn_summary>")
-            if close_idx != -1:
-                self._in_tag = False
-                self.summary = after_tag[:close_idx].strip()
-                remaining = after_tag[close_idx + len("</turn_summary>"):]
-                if remaining:
-                    emits.extend(self.feed(remaining))
-            else:
-                self._summary_buffer += after_tag
-            return emits
-
-        max_prefix_len = min(len(combined), len("<turn_summary>") - 1)
-        match_len = 0
-        for k in range(max_prefix_len, 0, -1):
-            suffix = combined[-k:]
-            if "<turn_summary>".startswith(suffix.lower()):
-                match_len = k
-                break
-
-        if match_len > 0:
-            p_idx = len(combined) - match_len
-            while p_idx > 0 and combined[p_idx - 1] in "\r\n":
-                p_idx -= 1
-            emit_text = combined[:p_idx]
-            self._buffer = combined[p_idx:]
-            return [emit_text] if emit_text else []
-
-        nl_len = 0
-        while nl_len < len(combined) and combined[-(nl_len + 1)] in "\r\n" and nl_len < 4:
-            nl_len += 1
-        if nl_len > 0:
-            emit_text = combined[:-nl_len]
-            self._buffer = combined[-nl_len:]
-            return [emit_text] if emit_text else []
-
-        return [combined] if combined else []
-
-    def flush(self) -> list[str]:
-        emits = []
-        if self._in_tag:
-            if self._summary_buffer:
-                self.summary = (self.summary or "") + self._summary_buffer.strip()
-                self._summary_buffer = ""
-            self._in_tag = False
-        elif self._buffer:
-            emits.append(self._buffer)
-            self._buffer = ""
-        return emits
-
-
 _ZERO_USAGE = ev.Usage(input_tokens=0, output_tokens=0)
+
+#: 第 2 层兜底（模型补写摘要）的超时（秒）。
+#:
+#: 为什么必须有超时：这一层是「本来就没拿到摘要」时的补救，**绝不能拖住回合收尾** ——
+#: 用户已经看到回答结束，界面却还停在「正在生成」是不可接受的。
+#: 20s 足够一次短请求（输入 ≤12k 字符、max_tokens=200）；超时即降级到本地生成。
+SUMMARY_TIMEOUT_S = 20.0
 
 
 class _ModelProduced(BaseModel):
@@ -1024,7 +1200,6 @@ class _ModelProduced(BaseModel):
 
     assistant_message: Message
     tool_calls: list[ToolCallEvent] = Field(default_factory=list)
-    turn_summary: str | None = None
     stop_reason: str = "unknown"
 
     @classmethod
@@ -1041,53 +1216,12 @@ class _ModelProduced(BaseModel):
         if not blocks:
             blocks.append(TextBlock(text=""))
         meta = MessageMeta()
-        if outcome.turn_summary:
-            meta = MessageMeta(turn_summary=outcome.turn_summary)
         return cls(
             assistant_message=Message(role="assistant", blocks=blocks, meta=meta),
             tool_calls=list(outcome.tool_calls),
-            turn_summary=outcome.turn_summary,
             stop_reason=outcome.stop_reason,
         )
 
 
 def _user_message(text: str) -> Message:
     return Message(role="user", blocks=[TextBlock(text=text)])
-
-
-_TURN_SUMMARY_PATTERN = re.compile(r"<turn_summary.*?>(.*?)(?:</turn_summary>|$)", re.DOTALL | re.IGNORECASE)
-
-
-def _extract_and_strip_turn_summary(message: Message) -> tuple[Message, str | None]:
-    """从 assistant 消息中提取 <turn_summary> 标签并从文本块中剥离，确保终端与历史干净。"""
-    summary: str | None = None
-    new_blocks = []
-    modified = False
-
-    for block in message.blocks:
-        if isinstance(block, TextBlock) and "<turn_summary" in block.text.lower():
-            match = _TURN_SUMMARY_PATTERN.search(block.text)
-            if match:
-                summary = match.group(1).strip()
-                cleaned_text = _TURN_SUMMARY_PATTERN.sub("", block.text).rstrip()
-                new_blocks.append(TextBlock(text=cleaned_text))
-                modified = True
-                continue
-        new_blocks.append(block)
-
-    if modified:
-        return Message(role=message.role, blocks=new_blocks, meta=message.meta), summary
-    return message, summary
-
-
-def _fallback_turn_summary(message: Message, turn: Turn) -> str:
-    """当大模型未显式输出 <turn_summary> 标签时的确定性安全兜底。"""
-    for block in message.blocks:
-        if isinstance(block, TextBlock) and block.text.strip():
-            first_line = block.text.strip().splitlines()[0].strip()
-            first_line = first_line.lstrip("#*-> ").strip()
-            if first_line:
-                return (first_line[:37] + "...") if len(first_line) > 40 else first_line
-    if turn.tool_call_count > 0:
-        return f"执行了 {turn.tool_call_count} 次工具操作并完成"
-    return f"完成第 {turn.turn_index} 轮交互"

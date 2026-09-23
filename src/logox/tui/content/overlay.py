@@ -44,6 +44,7 @@ __all__ = [
     "MAX_VISIBLE",
     "Choice",
     "PickerState",
+    "frame_box",
     "render_confirm",
     "render_picker",
     "render_prompt_form",
@@ -83,12 +84,18 @@ class PickerState:
     footer: str = ""
     #: 用户已输入的过滤串（空 = 不过滤）
     query: str = ""
+    #: 可见窗口最多几行（``None`` = 用模块默认 ``MAX_VISIBLE``）；D175 为补全而加
+    window_size: int | None = None
     #: 全集（过滤前的原始列表）。为空时 `choices` 就是全集。
     all_choices: list[Choice] = field(default_factory=list)
     #: 是否允许使用快捷键删除选项（如 /resume 弹窗）
     allow_delete: bool = False
     #: 是否正处于二次确认删除态
     confirming_delete: bool = False
+    #: 自定义删除确认提示模板（空则使用默认回收站提示）
+    delete_prompt: str = ""
+    #: 顶部只读展示行（如环境路径、沙箱信息、运行模式，不参与光标导航与筛选）
+    header_lines: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.all_choices:
@@ -149,13 +156,18 @@ class PickerState:
 
     @property
     def visible_window(self) -> tuple[int, int]:
-        """``(起点, 终点)``——选项过多时保持当前项在窗口内。"""
+        """``(起点, 终点)``——选项过多时保持当前项在窗口内。
+
+        ``window_size`` 可配（D175）：picker 默认 12 行，而 `/` 补全按 Pi 的口径用 5 行。
+        窗口大小只影响"显示几行"，与"能选到哪"无关。
+        """
+        size = self.window_size or MAX_VISIBLE
         total = len(self.choices)
-        if total <= MAX_VISIBLE:
+        if total <= size:
             return 0, total
-        half = MAX_VISIBLE // 2
-        start = max(0, min(self.index - half, total - MAX_VISIBLE))
-        return start, start + MAX_VISIBLE
+        half = size // 2
+        start = max(0, min(self.index - half, total - size))
+        return start, start + size
 
 
 # --------------------------------------------------------------------------- #
@@ -163,7 +175,17 @@ class PickerState:
 # --------------------------------------------------------------------------- #
 
 
-def _frame(title: str, body: list[str], footer: str, palette: ThemePalette, width: int) -> Text:
+def frame_box(
+    title: str,
+    body: list[str],
+    footer: str,
+    palette: ThemePalette,
+    width: int,
+    *,
+    #: ``{body 行号: 样式}``：给该行**整行**加样式（含左右竖线），如 ``"bold accent"``。
+    #: 逐行应用且不含换行符 ⇒ 不会溢出到下一行。D171：picker / 补全 / 确认框共用。
+    highlights: dict[int, str] | None = None,
+) -> Text:
     """给内容套一个圆角框（宽度按 cell 精算，绝不超过 ``width``）。
 
     **浮层为什么用边框而不是底色**：D81 撤销了全部背景色（"差一点才看得见"的设计
@@ -177,13 +199,29 @@ def _frame(title: str, body: list[str], footer: str, palette: ThemePalette, widt
     inner = max(10, width - 2)  # 左右边框各占 1 cell
     out = Text()
     head = clip(f"─ {title} " if title else "─", inner)
-    out.append("╭" + head + "─" * max(0, inner - cell_len(head)) + "╮\n", style=palette.border_strong)
-    for line in body:
-        out.append("│", style=palette.border_strong)
-        out.append(pad_right(clip(line, inner), inner), style=palette.text_primary)
-        out.append("│\n", style=palette.border_strong)
+    # ★ D171：边框用输入框的专属 token（input_border），不再用 border_strong。
+    #   用户要求「提示框的颜色用和输入框一样的颜色」—— 同一屏里两套边框色看着不协调。
+    border_style = str(getattr(palette, "input_border", "") or palette.border_strong)
+    out.append("╭" + head + "─" * max(0, inner - cell_len(head)) + "╮\n", style=border_style)
+    for index, line in enumerate(body):
+        # ★ D171：选中行强调 —— 样式由调用方给（picker / 补全 / 确认框统一传 `bold accent`）。
+        #   **逐行应用、不含换行符**：于是「高亮溢出到下一个选项」在机制上不可能发生。
+        #   （旧实现是在整块 Text 上按累加偏移 stylize，偏移算错一行 ⇒ 高亮落到下一项，
+        #   用户实测报障；那段代码已删除。）
+        row_style = (highlights or {}).get(index, "")
+        left_style = row_style or border_style
+        content_style = row_style or palette.text_primary
+        out.append("│", style=left_style)
+        out.append(pad_right(clip(line, inner), inner), style=content_style)
+        out.append("│\n", style=left_style)
     tail = clip(f"─ {footer} " if footer else "─", inner)
-    out.append("╰" + tail + "─" * max(0, inner - cell_len(tail)) + "╯", style=palette.border_subtle)
+    # ★ D170：下框线与上框线用**同一个**颜色。
+    #   以前尾巴用 `border_subtle`（更暗），于是每个提示框的下边框都比其它三边深一档 ——
+    #   用户实测报障（`/rewind`、`/resume`、`/` 补全全部中招）。边框是一体的，色调就该一致。
+    # ★ D171 修正：页脚也必须用**同一个** border_style ——
+    #   否则又回到「下框线比其它三边深一档」的老问题（用户最初报的就是这个，
+    #   本探针在改完头/身后当场抓到它又回来了）。
+    out.append("╰" + tail + "─" * max(0, inner - cell_len(tail)) + "╯", style=border_style)
     return out
 
 
@@ -202,15 +240,22 @@ def render_picker(
     lines: list[str] = []
     rows: list[tuple[str, str]] = []
 
+    if state.header_lines:
+        for h_line in state.header_lines:
+            lines.append(pad_right(clip(h_line, inner), inner))
+        lines.append("  " + "─" * max(0, inner - 4))
+
     if state.query:
         # 过滤中：把输入显式画出来（否则用户不知道自己按的键去哪了）
         lines.append(f"  筛选：{state.query}▏")
     if not state.choices:
         lines.append("  （没有匹配的项）" if state.query else "  （没有可选项）")
 
+    selected_line_idx: int | None = None
     for position in range(start, end):
         choice = state.choices[position]
-        marker = "→" if position == state.index else " "
+        # ★ D175：指针字形统一为 ❯（用户反馈 → 太丑；项目里 prompt 浮层也已在用 ❯）
+        marker = "❯" if position == state.index else " "
         # 序号按**可见位置**给；若选项标签已经自带 [序号]，则不重复添加数字前缀
         if numeric and not choice.label.strip().startswith("[") and position < 9:
             label = f"{position + 1:>2}  {choice.label}"
@@ -231,6 +276,8 @@ def render_picker(
                 label = clip(label, avail_label, ellipsis="…")
             text = f" {marker} {label}"
         lines.append(text)
+        if position == state.index and not choice.disabled:
+            selected_line_idx = len(lines) - 1
         rows.append((len(lines) - 1, choice.value))
 
     if end < len(state.choices):
@@ -238,26 +285,28 @@ def render_picker(
 
     if state.confirming_delete:
         choice = state.current
-        target_name = choice.label if choice else "当前会话"
+        target_name = choice.label if choice else "当前项"
         lines.append("")
-        lines.append(f"  ⚠️  确定将「{target_name}」移入回收站 (.trash)？")
+        prompt_tmpl = getattr(state, "delete_prompt", "") or "确定将「{target_name}」移入回收站 (.trash)？"
+        lines.append(f"  ⚠️  {prompt_tmpl.format(target_name=target_name)}")
         lines.append("      y / Enter 确认 · n / Esc 取消")
         footer_text = "y/Enter 确认 · n/Esc 取消"
     else:
         footer_text = state.footer
 
-    text = _frame(state.title, lines, footer_text, palette, width)
+    highlights: dict[int, str] = {}
+    if selected_line_idx is not None and 0 <= state.index < len(state.choices):
+        highlights[selected_line_idx] = f"bold {palette.accent}"
 
-    # 高亮：把当前项那一行重新上色（Rich Text 的逐行样式）
-    if state.choices:
-        # 有筛选行时整体下移一行
-        offset_rows = 1 if state.query else 0
-        highlight_row = state.index - start + offset_rows
-        plain_rows = text.plain.split("\n")
-        if 0 <= highlight_row < len(plain_rows):
-            offset = sum(len(line) + 1 for line in plain_rows[: highlight_row + 1])
-            span = text.plain[offset : offset + inner + 2]
-            text.stylize(f"bold {palette.accent}", offset, offset + len(span))
+    text = frame_box(
+        state.title,
+        lines,
+        footer_text,
+        palette,
+        width,
+        # ★ D171：选中行强调（用户裁定「提示框统一这样设计」：`bold accent`，无底色）。
+        highlights=highlights,
+    )
     return text, rows
 
 
@@ -289,7 +338,7 @@ def render_prompt_form(
     if error:
         lines.append("")
         lines.append(f"  ⚠ {error}")
-    text = _frame(title, [line for line in lines], footer, palette, width)
+    text = frame_box(title, [line for line in lines], footer, palette, width)
     if error:
         # 错误行标红：位置 = 它所在那一行
         plain = text.plain
@@ -314,4 +363,13 @@ def render_confirm(
     if detail:
         lines += ["", f"  {detail}"]
     lines += ["", f"  [1] {yes}        [2] {no}"]
-    return _frame(title, lines, "Enter 确认 · Esc 取消", palette, width)
+    # ★ D171：焦点项高亮（与 picker/补全同一套：selected_bg 底色 + 保留 bold accent 的强调）
+    focus_row = len(lines) - 1
+    return frame_box(
+        title,
+        lines,
+        "Enter 确认 · Esc 取消",
+        palette,
+        width,
+        highlights={focus_row: f"bold {palette.accent}"},
+    )

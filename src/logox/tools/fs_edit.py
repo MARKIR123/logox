@@ -30,7 +30,9 @@ from pydantic import Field
 from logox.errors import ErrorCategory
 from logox.kernel.events import ChangeStat
 from logox.tools.base import DisplayHint, ToolArgs, ToolContext, ToolResult, ToolSpec
-from logox.tui.content.cards import parse_unified_diff
+# ★ D140 / F-50：解析函数住在**中立模块**，不再从界面层拿 ——
+#   工具层反向依赖界面层会让「没有界面也能用工具」（headless）这条能力失效。
+from logox.difftext import parse_unified_diff
 
 __all__ = ["EditArgs", "EditTool", "build"]
 

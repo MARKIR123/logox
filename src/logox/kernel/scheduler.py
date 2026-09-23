@@ -136,6 +136,24 @@ def plan_batch(calls: Sequence[ToolCallEvent], registry: ToolRegistry) -> BatchP
     return BatchPlan(concurrent=True, order=order, group=0, reason=f"{len(calls)} 个只读调用，可并发")
 
 
+def _to_tool_display(hint: object | None) -> ev.ToolDisplay | None:
+    """`tools.base.DisplayHint` → `ev.ToolDisplay`（跨层转换，D139）。
+
+    为什么要有这一步：`kernel/events.py` 必须**不依赖 `logox.tools`** ——
+    它是界面层唯一被允许 import 的模块，一旦它反向依赖工具层，
+    "界面可以被替换掉"（D3）这条就不成立了。
+    转换本身很薄（``kind`` + ``payload``），但**位置**很重要：跨层转换只允许发生在
+    内核的边界上，而不是散落在界面里（界面不该知道工具层的存在）。
+    """
+    if hint is None:
+        return None
+    kind = getattr(hint, "kind", None)
+    payload = getattr(hint, "payload", None)
+    if not isinstance(kind, str) or not isinstance(payload, dict):
+        return None
+    return ev.ToolDisplay(kind=kind, payload=dict(payload))
+
+
 class Scheduler:
     """按 :class:`BatchPlan` 执行一批工具调用。"""
 
@@ -387,6 +405,8 @@ class Scheduler:
             content=result.content,
             error_kind=error_kind,
             change_stat=result.change_stat,
+            # ★ D139：把工具的展示提示带过界（工具层类型 → 内核侧纯数据）。
+            display=_to_tool_display(result.display),
         )
         return ToolResultBlock(id=call.call_id, ok=result.ok, content=result.content)
 
@@ -401,6 +421,7 @@ class Scheduler:
         content: str = "",
         error_kind: str | None,
         change_stat: ev.ChangeStat | None = None,
+        display: ev.ToolDisplay | None = None,
     ) -> None:
         await self._bus.publish(
             ev.ToolCallFinished(
@@ -413,6 +434,7 @@ class Scheduler:
                 content=content,
                 error_kind=error_kind,
                 change_stat=change_stat,
+                display=display,
             )
         )
 
@@ -471,7 +493,6 @@ class Scheduler:
                 logger.warning("记录检查点快照失败：%s", exc)
 
         return result
-
 
 
 class _Denied(BaseModel):

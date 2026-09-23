@@ -51,7 +51,19 @@ class Component(Protocol):
     """一个可以渲染成"若干行文本"的东西。"""
 
     def render(self, width: int) -> list[Text]:
-        """产出这一帧的全部行。**每行宽度必须 <= width**（见模块 docstring）。"""
+        """产出这一帧的全部行。**每行宽度必须 <= width**（见模块 docstring）。
+
+        ⚠️ 返回值里已经交出去过的 :class:`Text` **不得再原地修改**（D126）：
+        渲染器为了跳过重复的序列化，会按"行对象身份"复用上一帧已经转好的 ANSI 字节
+        （见 `render/screen.py` 的 `_serialize_rows`）。
+
+        为什么这样规定而不是"渲染器自己复制一份"：复制是每帧 O(全部行)，
+        而这条约定是**组件本来就应该遵守的**——它只在"想复用"时需要遵守：
+        想复用就先缓存自己的输出，要改就产出新对象（时间线的前缀
+        `TimelineComponent` 就是这么做的）。
+
+        症状对照：违反它不会报错，只会「屏幕上停在旧内容」。
+        """
         ...
 
     def handle_input(self, key: Key) -> bool:

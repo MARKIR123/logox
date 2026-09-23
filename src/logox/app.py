@@ -40,11 +40,12 @@ from typing import Any, NamedTuple
 
 from logox.config.schema import LogoxConfig, ProviderConfig, ThemeFile
 from logox.context import HierarchicalContextBuilder
+from logox.kernel import events as ev
 from logox.kernel.bus import EventBus
 from logox.kernel.loop import KernelLoop
 from logox.kernel.registry import ToolRegistry
-from logox.paths import CONFIG_DIRNAME, LogoxPaths
-from logox.tui.content.permission import PermissionAsk, PermissionChoice
+from logox.paths import LogoxPaths
+from logox.permission_types import PermissionAsk, PermissionChoice
 from logox.tui.metrics import MetricsReducer
 from logox.tui.theme import DEFAULT_THEME, load_theme
 
@@ -124,6 +125,99 @@ class Runtime:
     plugin_manager: Any | None = None
     command_manager: Any | None = None
     skill_manager: Any | None = None
+
+    def window_for(self, model: str) -> int | None:
+        """查某个模型的上下文窗口（查不到返回 None）。**不发网络请求。**"""
+        if self.registry is None:
+            return None
+        try:
+            for info in self.registry.list_models(self.provider_name):
+                if info.id == model:
+                    return getattr(info, "context_window", None)
+        except Exception as exc:  # noqa: BLE001 - 查不到不是错误，只是少了优化
+            logger.debug("查询模型窗口失败（沿用当前窗口）：%s", exc)
+        return None
+
+    async def apply_compact(self) -> Any | None:
+        """手动压缩一次（`/compact`，D161）。返回 `CompactionReport`（没压出东西则 None）。
+
+        为什么放在装配根：压缩在 `context/`（L4）里做，而**事件总线属于 L3** ——
+        界面不该直接把事件塞进总线。装配根是唯一同时认识两侧的地方，所以由它
+        ①调 builder ②发 `CompactionStarted`/`CompactionFinished` ③更新状态栏。
+        界面只调这一个方法，与 `apply_model()` 同一形状。
+
+        手动压缩**不依赖模型**（本项目压缩是本地纯计算：拼每轮 `turn_summary`），
+        所以它不需要任何 API 调用即可生效 —— 这正是"我们不依赖模型去压缩"的落地。
+        """
+        builder = self.context_builder
+        if builder is None or not hasattr(builder, "force_compact"):
+            return None
+
+        kernel = self.kernel
+        history = list(getattr(kernel, "history", []) or [])
+        last_usage = getattr(kernel, "_last_request_usage", None)
+
+        # 先发"即将压缩"（钩子 `pre_compact` 在这里触发）——与自动路径保持一致
+        plan = getattr(builder, "plan", None)
+        if callable(plan):
+            # force=True：手动压缩有意跳过水位线，判据换成"有没有可做的活"
+            planned = plan(history, last_usage=last_usage, force=True)
+            if planned is not None:
+                await self.bus.publish(
+                    ev.CompactionStarted(
+                        session_id=self.bus.session_id,
+                        turn=0,
+                        strategy="manual",
+                        tokens_before=planned.tokens_before,
+                        message_count_before=planned.message_count_before,
+                    )
+                )
+
+        bundle = builder.force_compact(history, last_usage=last_usage)
+        report = getattr(bundle, "compaction", None)
+        if report is None:
+            return None
+
+        await self.bus.publish(
+            ev.CompactionFinished(
+                session_id=self.bus.session_id,
+                turn=0,
+                tokens_after=report.tokens_after,
+                message_count_after=report.message_count_after,
+                degraded=report.degraded,
+                tokens_before=report.tokens_before,
+                pruned_count=report.pruned_count,
+                folded_turns=report.folded_turns,
+                strategy="manual",
+            )
+        )
+        metrics = getattr(self.reducer, "metrics", None)
+        if metrics is not None:
+            metrics.context_tokens = report.tokens_after
+        return report
+
+    def apply_model(self, model: str) -> int | None:
+        """切换模型：内核 + 上下文计量（窗口/κ 桶）+ 状态栏**一起**更新（D159）。
+
+        为什么要收成一个方法：`/model` 之前只调 `kernel.set_model()`，于是
+        上下文构建器仍在用旧模型的窗口与 κ 桶 —— 换到窗口更小的模型后压缩永不触发，
+        而请求会撞上厂商的 400。界面不该知道"窗口从哪查、要改几个对象"，
+        这些是**装配知识**，属于装配根。
+        """
+        setter = getattr(self.kernel, "set_model", None)
+        if callable(setter):
+            setter(model)
+        self.model = model
+
+        window = self.window_for(model)
+        builder = self.context_builder
+        if builder is not None and hasattr(builder, "set_model"):
+            builder.set_model(model_key=f"{self.provider_name}/{model}", window_capacity=window)
+        if window is not None:
+            metrics = getattr(self.reducer, "metrics", None)
+            if metrics is not None:
+                metrics.context_window = window
+        return window
 
     def list_mcp_servers(self) -> list[Any]:
         if self.mcp_manager is None:
@@ -319,7 +413,16 @@ class Runtime:
 
         count = 0
         if timeline is not None:
-            count = replay_into_timeline(records, timeline)
+            # ★ D138：注入摘要函数 —— 回放时卡片上的参数摘要**不该是原始字典 dump**。
+            #   为什么让装配根注入而不是 store 直接 import：分层红线（store 不依赖 tui）。
+            from logox.tui.format import format_args, summarize_args
+
+            count = replay_into_timeline(
+                records,
+                timeline,
+                summarize=summarize_args,
+                format_args=format_args,
+            )
 
         if self.kernel is not None and hasattr(self.kernel, "history"):
             self.kernel.history.clear()
@@ -396,6 +499,64 @@ class Runtime:
         if self.persistence_writer and hasattr(self.persistence_writer, "log_file"):
             return Path(self.persistence_writer.log_file).resolve()
         return None
+
+    @property
+    def permission_mode(self) -> str:
+        """当前项目的权限模式（D130：default / creative）。"""
+        if self.permission_decider is not None and hasattr(self.permission_decider, "mode"):
+            return str(self.permission_decider.mode)
+        if self.state_store is not None and hasattr(self.state_store, "read"):
+            try:
+                return str(self.state_store.read().permissions.mode)
+            except Exception:
+                pass
+        return "default"
+
+    def set_permission_mode(self, mode: str) -> None:
+        """切换权限模式并同步更新决策器、状态仓与度量模型。"""
+        if self.permission_decider is not None and hasattr(self.permission_decider, "set_mode"):
+            self.permission_decider.set_mode(mode)
+        elif self.state_store is not None and hasattr(self.state_store, "set_permission_mode"):
+            self.state_store.set_permission_mode(mode)
+        if self.reducer is not None and hasattr(self.reducer, "metrics"):
+            self.reducer.metrics.permission_mode = mode
+
+    def estimate_cost(self, usage: Any, model: str | None = None) -> float | None:
+        """估算用量费用（美元）。装配根统一提供，避免界面直接 import providers（T41）。"""
+        from logox.providers.pricing import estimate_cost_usd
+
+        return estimate_cost_usd(usage, model or self.model)
+
+    def get_permission_snapshot(self) -> dict[str, Any]:
+        """获取权限规则与物理沙箱快照（D132）。"""
+        if self.permission_decider is not None and hasattr(self.permission_decider, "get_rules_snapshot"):
+            return self.permission_decider.get_rules_snapshot()
+        root = Path(self.cwd or ".").resolve()
+        perms = (
+            self.state_store.read().permissions
+            if self.state_store is not None and hasattr(self.state_store, "read")
+            else None
+        )
+        return {
+            "workspace_root": root,
+            "mode": getattr(perms, "mode", "default") if perms else "default",
+            "project_rules": [],
+            "session_rules": [],
+            "sensitive_items": [".git/", ".env", ".logox/config.toml", ".logox/permissions.toml"],
+        }
+
+    def revoke_permission_rule(self, scope: str, kind: str, rule_str: str) -> bool:
+        """撤销指定作用域与类型的权限规则（D132）。"""
+        if self.permission_decider is not None and hasattr(self.permission_decider, "engine"):
+            engine = self.permission_decider.engine
+            from logox.permissions.models import Decision, RuleScope
+
+            target_scope = RuleScope.SESSION if scope == "session" else RuleScope.PROJECT
+            target_dec = Decision.ALLOW if kind == "allow" else Decision.DENY
+            return engine.revoke_by_str(rule_str, scope=target_scope, decision=target_dec)
+        if scope == "project" and self.state_store is not None and hasattr(self.state_store, "revoke_permission"):
+            return self.state_store.revoke_permission(kind, rule_str)
+        return False
 
     def list_checkpoints(self) -> list[Any]:
         """提取当前会话的所有代码修改轮次检查点，按轮次倒序排列（最近的排最前）。"""
@@ -491,7 +652,14 @@ class Runtime:
                 buffer.clear()
             elif hasattr(buffer, "blocks"):
                 buffer.blocks.clear()
-            replay_into_timeline(simulated_records, timeline)
+            from logox.tui.format import format_args, summarize_args
+
+            replay_into_timeline(
+                simulated_records,
+                timeline,
+                summarize=summarize_args,
+                format_args=format_args,
+            )
 
         return result
 
@@ -614,15 +782,38 @@ def build_runtime(
         sys.stderr.write("⚠ LOGOX_ALLOW_UNSAFE_TOOLS=1：权限检查已关闭，仅限开发调试。\n")
 
     # ---- ④ 主题（失败**不退出**，回退默认并记一条警告） ----
+    #
+    # ★ D152-c：主题只从**内置目录 + 用户目录 `~/.logox/themes`** 解析。
+    #   项目级 `.logox/themes/` 已被**刻意移除**（用户裁定："不要有什么项目级配置覆盖了"）——
+    #   主题是"用户对界面的偏好"，不是"项目对代码的规范"。
     warnings: list[str] = []
     theme_name = config.ui.theme or DEFAULT_THEME
     try:
-        theme = load_theme(theme_name)
+        theme = load_theme(theme_name, paths.themes)
     except Exception as exc:  # ThemeError 等
         # UI-SPEC §8.2：加载失败回退 logox-dark 并在界面上提示，**不阻断启动**（P-5）
-        theme = load_theme(DEFAULT_THEME)
+        theme = load_theme(DEFAULT_THEME, paths.themes)
         warnings.append(f"主题 {theme_name!r} 加载失败（{exc}）；已回退 {DEFAULT_THEME}")
         logger.warning("主题 %r 加载失败，已回退 %s：%s", theme_name, DEFAULT_THEME, exc)
+
+    # ★ D152-b：对比度**体检**（不阻断，但必须说出来）。
+    #
+    # 为什么要有这一步：`validate_contrast` 此前只被 `tools/gen_themes.py` 使用 ——
+    # 也就是**只保护内置主题**。而自定义主题走的是同一条加载路径却完全不做体检，
+    # 于是"用户自己配了一个看不见的输入框框线"会**静默生效**，
+    # 然后再来报一次和这次一模一样的障。
+    #
+    # 为什么是**警告**而不是拒绝：自定义主题是用户的自由 ——
+    # 他可能故意要一条很淡的框线。拒绝加载会把"我想要的风格"判成"错误"。
+    # 所以口径与既有的 `model_notice` 一致：**说清楚，但不擅自改**。
+    try:
+        from logox.config.theme import validate_contrast
+
+        for problem in validate_contrast(theme):
+            warnings.append(f"主题 {theme.name!r} 对比度不达标：{problem}")
+            logger.warning("主题 %s 对比度不达标：%s", theme.name, problem)
+    except Exception as exc:  # pragma: no cover - 体检本身不该拖垮启动
+        logger.debug("主题对比度体检跳过：%s", exc)
 
     # 模型名可疑（②b）的提示要让它出现在界面上，而不是只进日志——
     # "设置界面看着正常、请求一直失败"正是这一步想消灭的症状。
@@ -684,9 +875,10 @@ def build_runtime(
     permission_decider.state_store = state_store
     if state_store is not None:
         try:
-            # 载入"持久允许"：不载入的话那个按钮在重启后就失效了，
-            # 而用户以为自己记住过——那是一个会撒谎的按钮。
-            permission_decider.seed_persisted(state_store.read().permissions.allow)
+            # 载入"持久允许"与权限运行模式 (D130)
+            perms = state_store.read().permissions
+            permission_decider.seed_persisted(perms.allow, mode=perms.mode)
+            reducer.metrics.permission_mode = perms.mode
         except Exception as exc:  # pragma: no cover - 状态文件损坏
             logger.warning("读取持久权限规则失败：%s", exc)
 
@@ -700,6 +892,12 @@ def build_runtime(
     except Exception as exc:  # pragma: no cover
         logger.warning("技能包管理器初始化失败：%s", exc)
 
+    # ★ D157：`[context]` 配置**真的传进去**。
+    #   此前这 6 个字段一个都没接线 —— 用户在 config.toml 里怎么写都不生效
+    #   （`compact_threshold` / `reasoning_in_context` / `max_tool_result_chars` 三个
+    #   与实现不符的字段已在同一次改动里删除）。
+    #   注意：所有默认值都与代码默认一致 ⇒ **接线本身不改变默认行为**。
+    ctx_config = getattr(getattr(bundle, "config", None), "context", None)
     context_builder = HierarchicalContextBuilder(
         system=_system_prompt(cwd, tools),
         cwd=cwd,
@@ -707,6 +905,17 @@ def build_runtime(
         window_capacity=context_window,
         transcript_writer=persistence_writer,
         skill_manager=skill_manager,
+        reserve_tokens=getattr(ctx_config, "reserve_tokens", 32_768),
+        low_watermark_ratio=getattr(ctx_config, "low_watermark_ratio", 0.50),
+        # 配置里 0 = 不封顶（哨兵值）⇒ 转成 None 交给 Compactor
+        max_budget_tokens=getattr(ctx_config, "max_budget_tokens", 0) or None,
+        keep_recent_turns=getattr(ctx_config, "keep_recent_turns", 2),
+        keep_recent_tool_results=getattr(ctx_config, "keep_recent_tool_results", 2),
+        rehydrate_files=getattr(ctx_config, "rehydrate_files", 5),
+        rehydrate_max_chars=getattr(ctx_config, "rehydrate_max_chars", 2000),
+        project_memory_enabled=getattr(ctx_config, "project_memory_enabled", True),
+        # ★ D158：κ 按 (provider, model) 分桶 —— 不同分词器的偏差不能互相污染
+        model_key=f"{provider_name}/{model}",
     )
 
     # ---- ⑥d 快照对象池 (D102) ----
@@ -799,7 +1008,15 @@ def build_runtime(
             replay_session(session_path, kernel_loop=kernel, timeline=None)
 
             def session_replayer(timeline: Any) -> None:
-                replay_session(session_path, kernel_loop=None, timeline=timeline)
+                from logox.tui.format import format_args, summarize_args
+
+                replay_session(
+                    session_path,
+                    kernel_loop=None,
+                    timeline=timeline,
+                    summarize=summarize_args,
+                    format_args=format_args,
+                )
 
             if kernel.history:
                 user_turns = sum(1 for m in kernel.history if m.role == "user")
@@ -889,12 +1106,13 @@ class UiPermissionDecider:
     让用户清楚自己允许的范围有多大。
     """
 
-    def __init__(self, *, cwd: Any = None, engine: Any = None) -> None:
+    def __init__(self, *, cwd: Any = None, engine: Any = None, state_store: Any = None) -> None:
         self.cwd = str(cwd or "")
+        self._state_store = state_store
         from logox.permissions.engine import PermissionEngine
 
         self.engine: PermissionEngine = engine or PermissionEngine(
-            self.cwd, state_store=self.state_store
+            self.cwd, state_store=self._state_store
         )
         #: 由界面在构造时注册（`InlineApp.__init__`）。没有它 → 回落到"问不了"
         self.prompter: Any = None
@@ -911,19 +1129,43 @@ class UiPermissionDecider:
     # 记忆
     # ------------------------------------------------------------------ #
 
-    def seed_persisted(self, rules: Any) -> None:
-        """载入 ``state.toml`` 里的持久允许规则。
+    def seed_persisted(self, rules: Any, mode: Any = None) -> None:
+        """载入 ``state.toml`` 里的持久允许规则与权限运行模式。
 
         **必须在启动时调用**：不载入的话，"持久允许"在重启后就失效了——
         那是一个**会撒谎的按钮**（用户以为记住了，下次又问一遍）。
         """
         raw_list = list(rules or [])
         self._project_allow = {str(rule) for rule in raw_list}
-        self.engine.load_persisted(allow_rules=[str(r) for r in raw_list])
+        self.engine.load_persisted(
+            allow_rules=[str(r) for r in raw_list],
+            mode=str(mode) if mode else None,
+        )
+
+    @property
+    def mode(self) -> str:
+        return self.engine.mode.value
+
+    def set_mode(self, mode: str) -> None:
+        self.engine.set_mode(mode)
 
     @property
     def allowed_tools(self) -> set[str]:
         return self._session_allow | self._project_allow
+
+    def get_rules_snapshot(self) -> dict[str, Any]:
+        """获取权限与沙箱快照（D132）。"""
+        return self.engine.get_rules_snapshot()
+
+    def revoke_rule(self, rule: Any) -> bool:
+        """撤销一条规则并同步旧的 _session_allow / _project_allow 缓存。"""
+        res = self.engine.revoke_rule(rule)
+        rule_str = getattr(rule, "tool_name", "")
+        if rule_str in self._session_allow:
+            self._session_allow.discard(rule_str)
+        if rule_str in self._project_allow:
+            self._project_allow.discard(rule_str)
+        return res
 
     def _remember_key(self, call: Any, tool: Any) -> str:
         """记住"什么"：目前是**工具名**（规则引擎落地后换成 rule_id）。"""
@@ -1037,14 +1279,15 @@ class UiPermissionDecider:
     ) -> None:
         from logox.permissions.models import Decision, PermissionRule, RuleScope
 
-        self.history.append((ask.tool, choice.value))
+        choice_val = choice.value if hasattr(choice, "value") else str(choice)
+        self.history.append((ask.tool, choice_val))
         pat = evaluation.suggested_rule.pattern if (evaluation and evaluation.suggested_rule) else "*"
 
-        if choice is PermissionChoice.SESSION:
+        if choice in (PermissionChoice.SESSION, "session"):
             rule_obj = PermissionRule(key, pattern=pat, decision=Decision.ALLOW, scope=RuleScope.SESSION)
             self.engine.learn_rule(rule_obj)
             self._session_allow.add(rule_obj.to_str())
-        elif choice is PermissionChoice.PROJECT:
+        elif choice in (PermissionChoice.PROJECT, "project"):
             rule_obj = PermissionRule(key, pattern=pat, decision=Decision.ALLOW, scope=RuleScope.PROJECT)
             self.engine.learn_rule(rule_obj)
             self._project_allow.add(rule_obj.to_str())
@@ -1055,8 +1298,16 @@ class UiPermissionDecider:
                     logger.warning("权限规则未能写入 state.toml：%s", exc)
         del turn
 
-    #: 由装配根注入（"持久允许"要写它）
-    state_store: Any = None
+    @property
+    def state_store(self) -> Any:
+        """由装配根注入（'持久允许'要写它）。"""
+        return getattr(self, "_state_store", None)
+
+    @state_store.setter
+    def state_store(self, store: Any) -> None:
+        self._state_store = store
+        if hasattr(self, "engine") and self.engine is not None:
+            self.engine.state_store = store
 
 
 def _format_args(args: Any) -> str:
@@ -1232,6 +1483,15 @@ def prepare_runtime(
     _, newly_created = ensure_project_initialized(cwd)
 
     resolved_paths = paths or LogoxPaths.default()
+    # ★ D152-c：创建 Logox 自己的目录（含 `~/.logox/themes`）。
+    #
+    # 为什么在这里调用：`LogoxPaths.ensure_dirs()` 的 docstring 写的就是这个职责，
+    # 但它**此前从未被任何地方调用**（死代码）—— 于是 `~/.logox/themes` 根本不存在，
+    # 而用户要放自定义主题就必需它存在。方向是安全的：`mkdir(exist_ok=True)` 幂等，
+    # 失败也不该阻断启动（用户可能只是想跑一下）。
+    with contextlib.suppress(OSError):
+        resolved_paths.ensure_dirs()
+
     env_file = resolve_env_file(cwd, resolved_paths)
 
     # ★ D120：凭据分层加载机制（全局共享为主，项目私有覆盖为辅）

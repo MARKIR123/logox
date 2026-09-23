@@ -36,6 +36,9 @@ class TurnCheckpoint:
     user_prompt: str = ""
     created_at: float = 0.0
     turn_summary: str = ""
+    #: 摘要来源（D135 第二步 / 用户裁定 Q-D）。``model_last_line`` / ``model_tag``
+    #: 是模型自己写的；``model_fallback`` / ``deterministic`` 是我们兜底的 —— 列表要标出来。
+    summary_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,8 @@ class CheckpointTracker:
         all_turns: set[int] = set()
         user_prompts: dict[int, str] = {}
         turn_summaries: dict[int, str] = {}
+        #: turn -> 摘要来源（D135 第二步 / 用户裁定 Q-D）：列表要能标出「兜底摘要」
+        summary_sources: dict[int, str] = {}
         # turn -> dict[path, FileSnapshot]
         turn_snapshots: dict[int, dict[str, FileSnapshot]] = {}
         turn_timestamps: dict[int, float] = {}
@@ -97,6 +102,8 @@ class CheckpointTracker:
             # 记录回合语义摘要
             if record.get("turn_summary"):
                 turn_summaries[turn] = str(record["turn_summary"]).strip()
+                if record.get("summary_source"):
+                    summary_sources[turn] = str(record["summary_source"]).strip()
             elif event_type == "turn_finished" and record.get("content"):
                 turn_summaries[turn] = str(record.get("content")).strip()
 
@@ -147,6 +154,7 @@ class CheckpointTracker:
                     user_prompt=prompt_text,
                     created_at=turn_timestamps.get(t, 0.0),
                     turn_summary=summary_text,
+                    summary_source=summary_sources.get(t, ""),
                 )
             )
         return checkpoints

@@ -30,14 +30,32 @@ class KeyBinding:
 
 KEYMAP: tuple[KeyBinding, ...] = (
     # -- 输入 ----------------------------------------------------------- #
-    KeyBinding("Enter", "发送", "输入"),
-    KeyBinding("Alt+Enter / Ctrl+J", "换行（Ctrl+J 是通用备选键）", "输入"),
+    KeyBinding("Enter", "发送（候选列表开着时：先补全再发送）", "输入"),
+    KeyBinding("Tab", "接受 `/` 补全（列表开着时）", "输入"),
+    # ⚠️ 键位列宽有上限（`KEY_COLUMN = 22`，由 test_keymap 的
+    # `test_keys_do_not_exceed_the_render_column` 强制），所以 `Shift+Enter` 单独占一行。
+    KeyBinding(
+        "Shift+Enter",
+        "换行（需终端支持修饰位；Windows Terminal 上它与 Enter 同字节）",
+        "输入",
+    ),
+    # 这两条之所以放在一起，是因为它们在字符层**是同一样东西** —— 都发 LF
+    # （Windows Terminal 上 Ctrl+Enter = LF；Ctrl+J 在所有终端上都是 LF），
+    # 而且都**不需要任何终端协议**。`Alt+Enter` 已按 D129 从表里去掉（在不必列出）。
+    KeyBinding("Ctrl+Enter / Ctrl+J", "换行（发送 LF，不依赖终端）", "输入"),
+    # ★ D131 / 参考实现 Pi：终端分不出 `Shift+Enter` 时的**纯文本退路**。
+    # 不写进这张表的话，用户在 Windows Terminal 上就**根本无从知道**怎么换行
+    # —— 而那正是本项目"帮助里不许写按了没反应的键"的同一条纪律的反面：
+    # 能用的路必须写出来。
+    KeyBinding("\\ + Enter", "行尾打反斜杠再回车 = 换行（分不出 Shift+Enter 的终端的退路）", "输入"),
     KeyBinding("← → ↑ ↓ Home End", "移动光标（空输入时 ↑↓ 翻历史）", "输入"),
     KeyBinding("Ctrl+W / Alt+退格", "删掉前一个词", "输入"),
     KeyBinding("Ctrl+U / Ctrl+K", "删到行首 / 行尾", "输入"),
     KeyBinding("Ctrl+A / Ctrl+E", "跳到行首 / 行尾", "输入"),
     KeyBinding("粘贴", "一次粘贴 = 一次插入（不会逐条发出去）", "输入"),
     # -- 会话 ----------------------------------------------------------- #
+    KeyBinding("Ctrl+O", "展开/折叠**工具卡与 diff**（全局）", "会话"),
+    KeyBinding("Ctrl+T", "展开/折叠**思考链**（全局，与 Ctrl+O 互不影响）", "会话"),
     KeyBinding("Esc", "关掉浮层（有筛选时先清筛选）", "会话"),
     KeyBinding("Ctrl+C", "生成中中断；空闲时**按两下**退出", "会话"),
     KeyBinding("Ctrl+D", "退出", "会话"),

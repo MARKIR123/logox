@@ -108,6 +108,10 @@ def usage_from_openai(raw: Mapping[str, Any] | None) -> Usage | None:
         output_tokens=output_tokens,
         cached_input_tokens=cached,
         reasoning_tokens=reasoning,
+        # ★ 与 Anthropic **相反**：这里的 ``prompt_tokens`` **本身就是总量**
+        #   （命中缓存的部分含在里面），所以直接照抄，不做任何加法。
+        #   两个适配器各填各的，下游（如上下文压缩的触发判据）就不用猜口径了。
+        context_tokens=input_tokens,
     )
 
 

@@ -171,8 +171,10 @@ def load(
     effective_state = state if state is not None else _read_state_quietly(paths, cwd, issues)
     if effective_state is not None:
         state_source = ConfigSource(path=paths.state, scope="state")
-        _apply_state_overlay(merged, origin, effective_state, state_source)
-        sources.append(state_source)
+        # ⚠️ 只有**真的提供了值**才登记来源（F-21）：空的 state.toml 不是"一个配置来源"，
+        #    把它列进去会让"无配置 → 只有 defaults"这类断言无端失败。
+        if _apply_state_overlay(merged, origin, effective_state, state_source):
+            sources.append(state_source)
 
     # ⑤ 环境变量
     env_overrides = _env_overrides(env)
@@ -346,14 +348,20 @@ def _apply_state_overlay(
     origin: dict[str, ConfigSource],
     state: StateFile,
     source: ConfigSource,
-) -> None:
-    """把「上次使用」映射到配置字段（**只覆盖 state 拥有的键**，D44 §5.1 步骤 ④）。"""
+) -> bool:
+    """把「上次使用」映射到配置字段（**只覆盖 state 拥有的键**，D44 §5.1 步骤 ④）。
+
+    返回**是否真的应用了任何键** —— 调用方据此决定要不要把它登记进"来源列表"。
+    F-21 的教训：一个**什么值都没有**的 `state.toml` 会让来源列表里多出一条 `state`，
+    于是"无任何配置 → 只有 defaults"这类断言会莫名其妙地失败。
+    """
     pairs = (
         (("provider", "name"), state.last.provider),
         (("provider", "model"), state.last.model),
         (("provider", "thinking_effort"), state.last.effort),
         (("ui", "theme"), state.last.theme),
     )
+    applied = False
     for path, value in pairs:
         if value is None:
             continue
@@ -366,6 +374,8 @@ def _apply_state_overlay(
             node = child
         node[path[-1]] = value
         origin[".".join(path)] = source
+        applied = True
+    return applied
 
 
 def _env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
@@ -673,9 +683,21 @@ def _semantic_checks(
 
 
 def _available_themes(paths: LogoxPaths, cwd: Path) -> set[str]:
-    user_themes = paths.themes
-    project_themes = [
-        project.root / ".logox" / "themes" for project in discover_project_chain(cwd)
-    ]
-    discovered = discover_themes([*project_themes, user_themes])
-    return set(BUILTIN_THEMES) | set(discovered)
+    """可用主题 = **内置 + 用户目录**。
+
+    ★ D152-c（用户裁定）：**刻意不再读项目级 ``.logox/themes/``**。
+
+    为什么删掉项目级来源
+    -------------------
+    用户原话："主题配色统一放在 ``~/.logox/themes/`` 中，不要有什么项目级配置覆盖了"。
+    这条口径是对的：**主题是"用户对界面的偏好"，不是"项目对代码的规范"**。
+    项目级主题天然做不到"整机一套配色"——换个项目界面就变；
+    而"这个项目的规矩"另有归属（``LOGOX.md`` / ``.logox/state.toml`` 的权限规则）。
+
+    它顺带修掉了一个**双事实来源**（与 D150 修的 ``content``/``turn_summary`` 同类）：
+    这里曾把项目级主题算作"可用"，于是 ``ui.theme = "my"`` 能**通过校验**，
+    而真正加载时（`load_theme` 只搜内置目录）**失败** —— 校验与运行时各持一份事实。
+
+    注意 ``cwd`` 参数保留在签名里（调用方与契约不变），但**不再被使用**。
+    """
+    return set(BUILTIN_THEMES) | set(discover_themes([paths.themes]))

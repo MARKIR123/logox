@@ -165,6 +165,61 @@ class PermissionEngine:
                 except Exception as exc:
                     logger.warning("规则写入 state.toml 失败：%s", exc)
 
+    def revoke_rule(self, rule: PermissionRule) -> bool:
+        """撤销/移除一条既有规则（D132）。支持 Session 与 Project。"""
+        removed = False
+        if rule.scope == RuleScope.SESSION:
+            to_remove = [
+                r
+                for r in self.session_rules
+                if r.tool_name == rule.tool_name
+                and r.pattern == rule.pattern
+                and r.decision == rule.decision
+            ]
+            for r in to_remove:
+                self.session_rules.remove(r)
+                removed = True
+        elif rule.scope == RuleScope.PROJECT:
+            to_remove = [
+                r
+                for r in self.project_rules
+                if r.tool_name == rule.tool_name
+                and r.pattern == rule.pattern
+                and r.decision == rule.decision
+            ]
+            for r in to_remove:
+                self.project_rules.remove(r)
+                removed = True
+            if self.state_store is not None and hasattr(self.state_store, "revoke_permission"):
+                kind = "allow" if rule.decision == Decision.ALLOW else "deny"
+                try:
+                    self.state_store.revoke_permission(kind, rule.to_str())
+                except Exception as exc:
+                    logger.warning("从 state.toml 撤销规则失败：%s", exc)
+
+        return removed
+
+    def revoke_by_str(
+        self,
+        rule_str: str,
+        *,
+        scope: RuleScope = RuleScope.PROJECT,
+        decision: Decision = Decision.ALLOW,
+    ) -> bool:
+        """根据序列化字符串与作用域撤销规则。"""
+        rule = PermissionRule.from_str(rule_str, scope=scope, decision=decision)
+        return self.revoke_rule(rule)
+
+    def get_rules_snapshot(self) -> Dict[str, Any]:
+        """获取当前权限与物理沙箱配置快照（D132）。"""
+        return {
+            "workspace_root": self.workspace_root,
+            "mode": self.mode,
+            "project_rules": list(self.project_rules),
+            "session_rules": list(self.session_rules),
+            "sensitive_items": [".git/", ".env", ".logox/config.toml", ".logox/permissions.toml"],
+        }
+
     # ------------------------------------------------------------------ #
     # 匹配算法 (Rule Matching)
     # ------------------------------------------------------------------ #

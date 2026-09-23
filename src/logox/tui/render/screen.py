@@ -101,6 +101,17 @@ class Screen:
         self.root = Container()
         #: 每帧已渲染的行 —— **带 ANSI 样式的字符串**（不是纯文本，见 `text_to_ansi`）
         self._lines: list[str] = []
+        #: ``self._lines`` 每一行对应的**源行对象**（与它同一下标、同生同死）。
+        #:
+        #: 用来跳过多余的序列化：组件如果返回的是**同一个** `Text` 对象（时间线的前缀
+        #: 就是这么做的，见 `render/app.py` 的 `TimelineComponent`），它的 ANSI 字节
+        #: 一定与上一帧逐字节相同，没必要再算一遍。
+        #:
+        #: ⚠️ 这条优化依赖一个**组件契约**：`render()` 返回的 `Text` 一经交出，
+        #: 组件**不得再原地修改**（要改就返回新对象）。原地改的话我们会发出旧字节，
+        #: 而症状是"屏幕上还是旧内容"——所以 ``ansi_hits`` 这个计数器是给测试用的，
+        #: 它让"到底复用了几行"变成可断言的事实，而不是一个假设。
+        self._serialized_rows: list[Text] = []
         #: 上一帧的行（**比较的基准**）
         self._previous: list[str] = []
         self._previous_width = 0
@@ -114,8 +125,16 @@ class Screen:
         #: 重绘请求（节流用）
         self._render_requested = False
         self._last_render_at = 0.0
-        #: 被节流挡下的那次重绘有没有排进待办（见 :meth:`request_render`）
-        self._deferred_pending = False
+        #: **是否已经有一帧排在调度器里**（D133）
+        #:
+        #: 这是"按住一个键不会卡"的关键：一场输入里可能有几十个按键，
+        #: 每个按键都调一次 `request_render`，但它们**合并成同一帧**。
+        #: （Pi 的做法完全相同：`renderRequested` 去重 + `process.nextTick`。）
+        self._frame_pending = False
+        #: 这一帧是否要求**跳过 16ms 节流**（`force=True` 提升的优先级）
+        self._force_requested = False
+        #: 已排队的那一帧当时是用多少延迟排的（用来判断“能不能再提前”）
+        self._pending_delay_s = 0.0
         self._defer_handle: Any = None
         #: "稍后再画一次"的调度器，由装配根注入（``loop.call_later``）。
         #: 签名 ``(delay_seconds, callback) -> handle``。为 ``None`` 时立刻重绘。
@@ -141,8 +160,15 @@ class Screen:
         #: "输入框里没有光标"——以为程序卡住了。显示真光标还有个好处：
         #: 它是终端原生的，会自然闪烁，而且中文输入法的候选窗会跟着它走。
         self.show_hardware_cursor = True
-        #: 统计（测试与 /debug 用）
-        self.stats = {"frames": 0, "full_redraws": 0, "skipped": 0}
+        #: 统计（测试与 /debug 用）。``ansi_hits`` / ``ansi_misses`` 是 D126 的度量：
+        #: 每帧重新序列化的行数应当只与**变化量**成正比，而不是与会话长度成正比。
+        self.stats = {
+            "frames": 0,
+            "full_redraws": 0,
+            "skipped": 0,
+            "ansi_hits": 0,
+            "ansi_misses": 0,
+        }
 
     # ------------------------------------------------------------------ #
     # 组件与焦点
@@ -222,8 +248,14 @@ class Screen:
         if not consumed and target is not self.root:
             consumed = self.root.handle_input(key)
         if consumed:
-            # ★ 动静分流：用户的击键交互是最高优先级的本地操作，必须立刻重绘（force=True），
-            # 杜绝被 16ms 渲染节流推迟到延迟队列，实现与原生编辑器（Vim/VS Code）完全一致的 0 延迟体验。
+            # ★ 动静分流（D123）+ **合并成一帧**（D133）：
+            #
+            # * `force=True` 的作用是"**把这一帧的延迟压到 0**"（不被 16ms 节流推到下一格）；
+            # * 而**渲染本身**仍由 `request_render` 排到事件循环的下一轮 —— 于是
+            #   "读线程一次交上来一个批次（最多 32 个按键）"只会画**一帧**。
+            #
+            # ⚠️ 这里**不能**改成"就在这一层画"：以前就是那样，后果是 32 个按键画 32 帧、
+            # 而且全在读线程上做 I/O，把控制台输入缓冲拖爆（用户："松开 a 还在继续打"）。
             self.request_render(force=True)
 
     def start(self) -> None:
@@ -273,56 +305,88 @@ class Screen:
     # ------------------------------------------------------------------ #
 
     def request_render(self, *, force: bool = False) -> None:
-        """请求一次重绘。
+        """请求一帧重绘。
 
-        ``force=True`` 跳过节流（用于"必须立刻看到"的场景：显示浮层、退出前清屏）。
+        ★ D133（参考实现 Pi）：**不在调用栈里同步渲染，且同一轮里的多次请求合并成一帧。**
 
-        ⚠️ **节流只能"推迟"，不能"丢掉"**——这是实测踩出来的一个用户可见缺陷：
+        为什么这是本轮最重要的一条：读线程一次会交上来**一个批次**（最多 32 条按键记录），
+        而每个按键都会走到这里。以前 `force=True` 是**同步 `render_now()`**，于是：
 
-            输入"你" → 屏幕上出现 你
-            16ms 内输入"好" → 请求被节流**丢弃**，屏幕上还是只有 你
-            再输入"吗" → 屏幕上突然出现 你好吗
+        ===================== ====================================================
+        一个批次 32 个按键     旧：**32 次**全帧计算 + 32 次终端写+flush
+                             新：**1 次**
+        ===================== ====================================================
 
-        根因不是按键丢了（编辑器里三个字都在），而是**没人负责补画那一帧**：
-        被挡下的请求就这样永远消失了，直到下一次"够慢"的事件到来才顺手补上。
-        症状是"打快一点就会吞字"，而终端里的用户一定会打快。
+        而写终端要 flush（Windows 上很贵）。读线程被渲染阻塞 → 控制台的输入缓冲
+        越积越多 → 用户松开 `a` 之后**还会继续打一会儿**、退格**多删几个**；
+        中文输入法提交“如果”时被拆成两帧，看着就是一个字一个字蹦。
 
-        所以这里改成：被节流时**记一个待办**并安排一次延迟重绘（`on_defer` 由装配根
-        注入事件循环的定时器）。没有调度器时（测试、或没跑起来的应用）**立刻画**——
-        "宁可多画一帧，也不能静默丢帧"。
+        Pi 的 `requestRender` 正是这个形状：`renderRequested` 去重 + `process.nextTick`
+        把真正的绘制推到下一轮（**连 `force` 也不例外**）。
 
-        ⚠️ 本方法**不检查 ``_running``**：它在测试里被直接调用（没有 ``start()``），
-        若在这里拦一道，测试就必须先假装启动终端才能验证渲染——那会让"渲染策略"
-        这种纯逻辑依赖终端状态。真正的停止由 :meth:`stop` 负责。
+        ⚠️ **节流只能"推迟"，不能"丢掉"**：被推迟的那一帧一定会在后面的时间片兑现
+        （这条是从"打字快会吞字"那个缺陷里换来的，别改回去）。
+
+        ``force=True`` 的语义：**跳过 16ms 节流**（浮层、退出前清屏这类"必须尽快看到"的
+        场景）—— 但仍然是"排到下一轮"，不是"现在就在这一层调用栈里画"。
+
+        ⚠️ 没有调度器时（测试、或还没 `run()` 的应用）**立刻画**：保留旧语义、
+        也让"渲染策略"这种纯逻辑不依赖终端状态。
         """
         self._render_requested = True
+
+        if self.on_defer is None:
+            # 没有调度器 → 立刻画（测试与未启动的应用走这条）
+            self._render_requested = False
+            self.render_now()
+            return
+
+        if force:
+            self._force_requested = True
+            if self._frame_pending:
+                if self._pending_delay_s <= 0.0:
+                    # ★ 已经是最快那一档 → **直接合并**（一个输入批次里每个按键都 force，
+                    #   如果每次都快排一遍，32 个按键就会排 32 帧 —— 那就白改了）。
+                    return
+                # 排队中的那一帧不够快（带着一个节流延迟）→ 取消它、用 0 延迟重排。
+                # 仍然是**一帧**：被取消的那个不会再跑。
+                self._cancel_deferred()
+                self._force_requested = True  # ⚠️ 必须在 cancel 之后：它会清掉这个标记
+        elif self._frame_pending:
+            return  # ★ 合并：这一轮里不管请求多少次，都只画一帧
+
         now = time.monotonic() * 1000.0
         elapsed = now - self._last_render_at
         if force or elapsed >= self.min_interval_ms:
-            self._cancel_deferred()
-            self.render_now()
-            return
+            delay_s = 0.0
+        else:
+            delay_s = max(0.0, (self.min_interval_ms - elapsed) / 1000.0)
 
-        if self._deferred_pending:
-            return  # 已经排好了一次，不重复排队
-        delay_s = max(0.0, (self.min_interval_ms - elapsed) / 1000.0)
-        if self.on_defer is None:
-            self.render_now()
-            return
-        self._deferred_pending = True
-        self._defer_handle = self.on_defer(delay_s, self._render_deferred)
+        self._frame_pending = True
+        self._pending_delay_s = delay_s
+        self._defer_handle = self.on_defer(delay_s, self._run_pending_frame)
 
-    def _render_deferred(self) -> None:
-        """补画那次被节流挡下的帧。"""
-        self._deferred_pending = False
+    def _run_pending_frame(self) -> None:
+        """兑现已排队的那一帧（定时器到点时调用）。
+
+        ⚠️ 这里**不再重新检查节流窗口**：`on_defer(delay, …)` 的契约就是"到点叫我"，
+        叫了就该画。再检查一遍的后果是——用假调度器（测试）时回调会被无限顺延，
+        一帧都画不出来。
+        """
+        self._frame_pending = False
         self._defer_handle = None
+        self._pending_delay_s = 0.0
+        self._render_requested = False
+        self._force_requested = False
         self.render_now()
 
     def _cancel_deferred(self) -> None:
-        """撤销待办的延迟重绘（已经画过一帧时它就没意义了）。"""
+        """撤销排队中的那一帧（已经画过一帧时它就没意义了）。"""
         handle = self._defer_handle
         self._defer_handle = None
-        self._deferred_pending = False
+        self._frame_pending = False
+        self._pending_delay_s = 0.0
+        self._force_requested = False
         if handle is not None:
             cancel = getattr(handle, "cancel", None)
             if callable(cancel):
@@ -367,8 +431,14 @@ class Screen:
         # ③ 行 → 带 ANSI 的字符串。
         #    ⚠️ 这一步以前是直接取 `line.plain`，于是**主题的 53 个颜色全部失效**：
         #    界面上全是一个颜色的字，但宽度断言照样通过，所以没有任何报错。
-        new_lines = [text_to_ansi(line) for line in raw]
+        #
+        #    ⚠️ 另一个坑是"每帧重算全部行"（D126）—— 序列化要做的是"把 spans 展开成
+        #    逐字符样式再渲染"，代价与**总字符数**成正比。会话一长，敲一个字就要
+        #    重算几千行的字节（实测 2000 行 ≈ 33ms），而这几千行里变了的通常只有 1 行。
+        #    所以这里按**对象身份**复用：同一行对象 → 字节一定一样。
+        new_lines = self._serialize_rows(raw)
         self._lines = new_lines
+        self._serialized_rows = raw
         self.stats["frames"] += 1
 
         prev_viewport_top = self._previous_viewport_top
@@ -423,6 +493,30 @@ class Screen:
         )
         self._previous = new_lines
         self._previous_width, self._previous_height = width, height
+
+    def _serialize_rows(self, rows: list[Text]) -> list[str]:
+        """把行对象序列化成 ANSI 字节，**按身份复用上一帧的结果**（D126）。
+
+        为什么按下标 + 身份、而不是用字典按内容做键：时间线是**只追加**的，
+        所以"第 i 行还是上一帧那个对象"几乎是恒真的，一次 `is` 比对就够；
+        而按内容做键要为每一行算哈希（几千行 × 上百字符）——反而更贵。
+
+        下标错位（内容缩水、宽度变化）时全部当作未命中，只是慢一帧，不会错。
+        """
+        previous_rows = self._serialized_rows
+        previous_lines = self._lines
+        limit = min(len(previous_rows), len(previous_lines))
+        out: list[str] = []
+        hits = 0
+        for index, row in enumerate(rows):
+            if index < limit and previous_rows[index] is row:
+                out.append(previous_lines[index])
+                hits += 1
+            else:
+                out.append(text_to_ansi(row))
+        self.stats["ansi_hits"] += hits
+        self.stats["ansi_misses"] += len(rows) - hits
+        return out
 
     # -- 内部：三种写帧策略 ---------------------------------------------- #
 

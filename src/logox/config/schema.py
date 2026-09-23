@@ -138,14 +138,49 @@ class ProviderInstanceConfig(BaseModel):
 
 
 class ContextConfig(BaseModel):
+    """``[context]``：上下文装配与压缩的旋钮。
+
+    ⚠️ **D157 大改（订正与代码的脱节）**：
+    此前这里的 6 个字段**一个都没接进 `HierarchicalContextBuilder`** ——
+    也就是"用户写了配置也不生效"。本次一并处理：失效的删掉、能用的接线、
+    代码里已有但配置缺失的补齐。**接线后默认行为不变**（所有默认值与代码一致）。
+
+    删掉的三个（都是"与实现不符的旋钮"，留着比没有更糟）：
+    * ``compact_threshold`` —— 压缩判据早已改成 ``窗口 − reserve``（CHANGE-005）；
+      旧写法 ``窗口 × 0.75`` 在 1M 窗口下会把触发点压到 8%。
+    * ``reasoning_in_context`` —— 内核**一律**在发往模型前剥离思考链（D114 源头阻断），
+      这不是一个可选项；留着会让人以为"打开它就能让模型看到思考过程"。
+    * ``max_tool_result_chars`` —— 实际阈值是"150 字符以下不动"，
+      与"单个工具结果回灌上限 8000"是两回事。将来若要暴露归档阈值，按新语义重新加。
+    """
+
     model_config = _STRICT
 
-    compact_threshold: float = Field(default=0.75, ge=0.1, le=0.95)
-    keep_recent_turns: int = Field(default=6, ge=1)
-    tool_result_keep_turns: int = Field(default=3, ge=0)
-    max_tool_result_chars: int = Field(default=8000, ge=256)
+    # ---- 压缩水位线（判据 = `窗口 − reserve`）-------------------------------- #
+    #: 给"回答 + 估算误差"预留的 token（默认 32,768 = 默认 max_tokens 16,384 的两倍）。
+    reserve_tokens: int = Field(default=32_768, ge=0)
+    #: 低水位比例：修剪后降到这个比例以下就算完成（避免反复压缩，D-水位线）
+    low_watermark_ratio: float = Field(default=0.50, ge=0.0, le=1.0)
+    #: 成本闸门（可选）：只能**压低**水位线，不能抬高。
+    #: ``0`` = 不封顶（哨兵值，与 `session.store_dir = ""` 同风格 ——
+    #: TOML 无法表达 `None`，而漂移测试 T-30 要求每个字段都在 `defaults.toml` 里出现）
+    max_budget_tokens: int = Field(default=0, ge=0)
+
+    # ---- 保留窗口 ------------------------------------------------------------ #
+    #: 保留多少个**完整轮次**（对话层）
+    keep_recent_turns: int = Field(default=2, ge=1)
+    #: 全局保留最近多少**条工具结果**（工具层）
+    keep_recent_tool_results: int = Field(default=2, ge=0)
+
+    # ---- 折叠后的文件再水化（D-裁定 4）-------------------------------------- #
+    #: 折叠后重新读回最近 N 个碰过的文件（0 = 关闭）
+    rehydrate_files: int = Field(default=5, ge=0)
+    #: 每个文件最多读回多少字符
+    rehydrate_max_chars: int = Field(default=2000, ge=0)
+
+    # ---- 项目记忆 ------------------------------------------------------------ #
+    #: 是否读取项目 `LOGOX.md` 长期记忆（关掉则完全不读，也不注入 system）
     project_memory_enabled: bool = True
-    reasoning_in_context: bool = False
 
 
 class ShellConfig(BaseModel):
@@ -295,6 +330,7 @@ class UiConfig(BaseModel):
 
     theme: str = "logox-dark"
     layout: Literal["auto", "dual", "single"] = "auto"
+    fullscreen: bool = False
     sidebar_width: int = Field(default=32, ge=24, le=48)
     diff_context_lines: int = Field(default=3, ge=0, le=10)
     stream_fps: int = Field(default=10, ge=5, le=30)
@@ -303,6 +339,7 @@ class UiConfig(BaseModel):
     animations: bool = True
     status_items: StatusItems = Field(default_factory=StatusItems)
     timing_fields: TimingFields = Field(default_factory=TimingFields)
+
 
 
 class SessionConfig(BaseModel):
@@ -459,6 +496,16 @@ PALETTE_TOKENS = (
     "info",
     "border_subtle",
     "border_strong",
+    # -- 输入框专属（D152-a）--
+    # 为什么必须**专有**而不是借 border_subtle / text_primary：
+    # 输入框是这个界面里唯一的聚焦输入面，而 border_subtle 是给"弱分隔"用的
+    # （它对 bg_base 只有 1.30:1，实测被用户报"看不清"），且它同时被帮助分隔线、
+    # 工具卡竖线、浮层底边共用 —— 借它意味着"改输入框 = 四处一起变"，谈不上微调。
+    # 三个 token 正好对应输入框**全部**可上色的元素（框线 / 正文 / 键位提示），
+    # 刻意不加 `input_bg`：D81 明确"不使用背景色"，那是需要单独裁定的事。
+    "input_border",
+    "input_text",
+    "input_hint",
     "diff_add_fg",
     "diff_add_bg",
     "diff_del_fg",
@@ -579,6 +626,34 @@ class ThemePalette(BaseModel):
     info: str = Field(pattern=_HEX_COLOR)
     border_subtle: str = Field(pattern=_HEX_COLOR)
     border_strong: str = Field(pattern=_HEX_COLOR)
+    # -- D152-a：输入框专属（**必需**，不给默认值）--
+    # 不给默认值是有意的：主题作者必须**显式决定**输入框长什么样。
+    # 给个默认值的话，一份漏掉这三项的旧主题会**静默继承**某个可能不可见的颜色 ——
+    # 而"输入框看不清"正是本轮要根治的症状，不能靠默认值把它藏回来。
+    input_border: str = Field(pattern=_HEX_COLOR)
+    input_text: str = Field(pattern=_HEX_COLOR)
+    input_hint: str = Field(pattern=_HEX_COLOR)
+
+    # -- ★ D161：思考与工具输出的专属 token 也升为**必需** --
+    #
+    # 为什么（这是一条推导，不是随手改契约）：
+    # 它们**刚被接通**（此前没有任何代码读取，见 D161），而接通后要过对比度校验。
+    # 而校验与默认值**天然冲突**：
+    #   `tool_output_fg` 要求**正文级 4.5**。对任意一个默认值，若它要在深色底（#1e1e2e）
+    #   上达到 4.5，亮度必须 ≥0.272；若要在浅色底（#eff1f5）上达到 4.5，亮度必须 ≤0.155 ——
+    #   **两个区间不相交**。也就是说"一个默认值适配所有底色"在数学上不成立。
+    #   （次要级 3.0 的区间是 [0.165, 0.258]，还相交；正文级不行。）
+    # ⟹ 既然**必须**显式声明才能达标，那就别让默认值假装能用 ——
+    #   否则一份只写 21 个 token 的主题会带着 6 个"可能看不见"的值静默通过。
+    #
+    # 附带收益：契约更自洽 —— **被校验的 token 一律必需**（21 个基础色 + input_* + 这 6 个 = 27）。
+    # 代价：手写最小主题要写 27 个 token；但复制内置主题（57 个全有）则零成本。
+    tool_output_fg: str = Field(pattern=_HEX_COLOR)
+    thinking_text: str = Field(pattern=_HEX_COLOR)
+    thinking_off: str = Field(pattern=_HEX_COLOR)
+    thinking_low: str = Field(pattern=_HEX_COLOR)
+    thinking_medium: str = Field(pattern=_HEX_COLOR)
+    thinking_high: str = Field(pattern=_HEX_COLOR)
     diff_add_fg: str = Field(pattern=_HEX_COLOR)
     diff_add_bg: str = Field(pattern=_HEX_COLOR)
     diff_del_fg: str = Field(pattern=_HEX_COLOR)
@@ -596,13 +671,7 @@ class ThemePalette(BaseModel):
     tool_success_bg: str = Field(default=_PI_ALIGNED_DEFAULTS["tool_success_bg"], pattern=_HEX_COLOR)
     tool_error_bg: str = Field(default=_PI_ALIGNED_DEFAULTS["tool_error_bg"], pattern=_HEX_COLOR)
     tool_title_fg: str = Field(default=_PI_ALIGNED_DEFAULTS["tool_title_fg"], pattern=_HEX_COLOR)
-    tool_output_fg: str = Field(default=_PI_ALIGNED_DEFAULTS["tool_output_fg"], pattern=_HEX_COLOR)
     selected_bg: str = Field(default=_PI_ALIGNED_DEFAULTS["selected_bg"], pattern=_HEX_COLOR)
-    thinking_text: str = Field(default=_PI_ALIGNED_DEFAULTS["thinking_text"], pattern=_HEX_COLOR)
-    thinking_off: str = Field(default=_PI_ALIGNED_DEFAULTS["thinking_off"], pattern=_HEX_COLOR)
-    thinking_low: str = Field(default=_PI_ALIGNED_DEFAULTS["thinking_low"], pattern=_HEX_COLOR)
-    thinking_medium: str = Field(default=_PI_ALIGNED_DEFAULTS["thinking_medium"], pattern=_HEX_COLOR)
-    thinking_high: str = Field(default=_PI_ALIGNED_DEFAULTS["thinking_high"], pattern=_HEX_COLOR)
     md_heading: str = Field(default=_PI_ALIGNED_DEFAULTS["md_heading"], pattern=_HEX_COLOR)
     md_link: str = Field(default=_PI_ALIGNED_DEFAULTS["md_link"], pattern=_HEX_COLOR)
     md_link_url: str = Field(default=_PI_ALIGNED_DEFAULTS["md_link_url"], pattern=_HEX_COLOR)

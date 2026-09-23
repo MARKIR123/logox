@@ -54,7 +54,7 @@ from logox.tui.content.overlay import (
     render_picker,
     render_prompt_form,
 )
-from logox.tui.content.permission import PermissionAsk, PermissionChoice
+from logox.permission_types import PermissionAsk, PermissionChoice
 from logox.tui.format import clip
 from logox.tui.render.ansi import (
     slice_styled,
@@ -197,6 +197,7 @@ class PickerComponent(_Overlay):
             ((key.ctrl and key.name == "d") or key.name == "delete")
             and getattr(self.state, "allow_delete", False)
             and self.state.current is not None
+            and not getattr(self.state.current, "disabled", False)
         ):
             self.state.confirming_delete = True
             return True
@@ -536,7 +537,7 @@ class PermissionComponent(_Overlay):
     * ``Esc`` 等同于拒绝；
     * 工具非只读时顶部加警示条（``danger`` 色）。
 
-    四个选项与 :class:`~logox.tui.content.permission.PermissionChoice` 一一对应。
+    四个选项与 :class:`~logox.permission_types.PermissionChoice` 一一对应。
     ``allow_session`` / ``allow_project`` 为假时对应选项**不出现在屏幕上**——
     画一个按了没用的按钮比不画更糟（用户会以为"我允许了"）。
     """
@@ -875,6 +876,6 @@ def render_frame_only(
     :func:`logox.tui.content.overlay.render_picker` 等函数自己负责内容与边框的配合；
     权限弹窗的内容是**逐行拼出来**的（有段间距与滚动提示），所以它只借用边框。
     """
-    from logox.tui.content.overlay import _frame
+    from logox.tui.content.overlay import frame_box
 
-    return _frame(title, body, footer, palette, width)
+    return frame_box(title, body, footer, palette, width)

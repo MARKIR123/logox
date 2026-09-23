@@ -1,5 +1,14 @@
 """权限询问的**界面侧数据**（Textual-free / 内核-free）。
 
+（D140 补记）**物理位置**：``logox/permission_types.py``，即项目根下的**中立叶子模块**，
+与 ``logox/errors.py`` / ``logox/paths.py`` / ``logox/difftext.py`` 同级。
+它自己**零项目内依赖**（只 import 标准库），所以工具层、权限层、界面层都能引用它，
+而没有哪一层的依赖方向被反转。
+
+⚠️ 此前它住在 ``tui/content/permission.py`` —— 与下面这段"不属于任何一层"的说法自相矛盾，
+后果是 ``permissions/decider.py`` 必须 **反向依赖界面层**（`import logox.tools.*` /
+权限裁决在无界面进程里就不再独立）。这是被 ``test_kernel_port.py::T44`` 抓出来的第二处同类问题。
+
 为什么单独一个模块
 ================
 

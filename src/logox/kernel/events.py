@@ -77,8 +77,16 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 class Event(BaseModel):
     """全部事件的基类。
 
-    ``frozen=True`` 是硬要求：订阅者**不得**篡改事件对象，否则「同一事件被
-    下游改过」这类耦合会极难排查（E-16）。
+    ``frozen=True`` 是硬要求，但**它是浅冻结**，边界要说清楚：
+
+    * 保证的：顶层字段**不可重新赋值**（``event.turn = 3`` 会报错）。
+    * **不保证的**：嵌套容器仍然可变（``event.args["x"] = 1``、
+      ``message.blocks.append(...)`` 都不会报错）。订阅者**必须自觉不修改**它们。
+
+    为什么不深冻结：``bus._enqueue`` 把 ``(subscription, event)`` 直接入队、**不拷贝**，
+    而 K2 明确要求"日志与重绘绝不能拖慢 Agent 循环"——每事件一次深拷贝与它相悖。
+    真要强保证就得在 ``publish`` 里拷贝，那是拿主链路性能换一条约定，不值。
+
     ``extra="forbid"`` 保证事件构造时的拼写错误当场暴露。
     """
 
@@ -101,6 +109,17 @@ class Usage(BaseModel):
     output_tokens: int = Field(ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
+    #: 本次请求**喂进去的上下文总量**（含命中缓存的部分），由**适配器**填。
+    #:
+    #: 为什么必须要一个独立字段：**厂商口径不同** ——
+    #: Anthropic 的 `input_tokens` **不包含**缓存读/写（三块并列）；
+    #: OpenAI 兼容的 `prompt_tokens` **本身就是总量**（缓存命中含在里面）。
+    #: 所以 `input_tokens ± cached_input_tokens` 这种反推**两个厂商中必有一个算错**，
+    #: 而只有适配器知道自己那家的口径（D9）——那就不该让下游去猜。
+    #:
+    #: 用途：上下文压缩的**触发判据**（CHANGE-005 裁定 1）。
+    #: 未上报 → ``None``（**不伪造 0**：0 会被读成"上下文是空的"）。
+    context_tokens: int | None = Field(default=None, ge=0)
 
     @property
     def cache_hit_ratio(self) -> float | None:
@@ -238,6 +257,12 @@ class TurnFinished(Event):
     reason: Literal["completed", "cancelled", "error"] = "completed"
     #: 本轮回合语义摘要（由模型终态产出或内核自动生成），供 UI/持久化/上下文压缩/回滚复用
     turn_summary: str | None = None
+    #: 摘要的来源（D135 第二步 / 用户裁定 Q-D）。界面与列表靠它区分
+    #: "模型自己写的" / "再调一次模型补写的" / "本地自动生成的"。
+    summary_source: str | None = None
+    #: 三层兜底的**链路诊断**（D135-4）：例如 ``too_long → l2_rejected``。
+    #: 没有它就说不清"为什么这轮摘要是自动生成的"（模型不配合？我们拒得太严？补写失败？）。
+    summary_reason: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +305,27 @@ class ToolCallStarted(Event):
     concurrent_group: int | None = None  # D27：并发组编号；串行时为 None
 
 
+class ToolDisplay(BaseModel):
+    """界面渲染提示的**内核侧表示**（D139）。
+
+    为什么需要它：工具层（`logox.tools.base.DisplayHint`）已经知道"我这次的结果该怎么展示" ——
+    例如 `fs_edit` 会附上一段真正的 diff。但内核**不能直接把工具层的类型放进事件里**：
+    `kernel/events.py` 是界面层唯一被允许 import 的模块（分层红线 R1），
+    它必须**自洽**——所以这里定义等价的纯数据结构，由调度器负责转换。
+
+    ``kind`` 的取值与 `tools.base.DisplayHint.kind` 一致（``text`` / ``diff`` / ``lines`` /
+    ``table`` / ``error``）。界面只认 ``kind``，怎么画是界面的事（D3：界面可被替换）。
+    """
+
+    model_config = _FROZEN
+
+    kind: Literal["text", "diff", "lines", "table", "error"] = "text"
+    #: 纯数据。``diff`` 时为 ``{"path":…, "hunks":[…], "stat":…}``；
+    #: ``text`` 时为 ``{"text":…}``。**刻意不自建类层次**：内容随工具而变，
+    #: 强行建模只会得到一堆永远用不上的字段。
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class ToolCallFinished(Event):
     type: Literal["tool_call_finished"] = "tool_call_finished"
 
@@ -290,6 +336,8 @@ class ToolCallFinished(Event):
     content: str = ""
     error_kind: str | None = None
     change_stat: ChangeStat | None = None
+    #: ★ D139：界面渲染提示。**展示用**，不参与回灌模型（`content` 才是给模型的）。
+    display: ToolDisplay | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -311,6 +359,15 @@ class CompactionFinished(Event):
     tokens_after: int = Field(ge=0)
     message_count_after: int = Field(ge=0)
     degraded: bool = False  # 摘要失败 → 降级为纯裁剪
+    # ---- ★ D156：为"可观测性"补的字段（新增**可选**字段不升版本，ARCHITECTURE §6.2）----
+    #: 压缩前的上下文规模（此前只有 after，事后无法算出"压掉多少"）
+    tokens_before: int = Field(default=0, ge=0)
+    #: 被归档/掏空的工具结果条数
+    pruned_count: int = Field(default=0, ge=0)
+    #: 本次折叠掉的轮数（0 = 只做了工具修剪）
+    folded_turns: int = Field(default=0, ge=0)
+    #: ``"prune"`` / ``"prune+fold"``
+    strategy: str = ""
 
 
 class CheckpointCreated(Event):

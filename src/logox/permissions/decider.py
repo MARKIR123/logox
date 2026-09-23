@@ -28,7 +28,7 @@ from logox.permissions.models import (
     RiskLevel,
     RuleScope,
 )
-from logox.tui.content.permission import PermissionAsk, PermissionChoice
+from logox.permission_types import PermissionAsk, PermissionChoice
 
 logger = logging.getLogger(__name__)
 

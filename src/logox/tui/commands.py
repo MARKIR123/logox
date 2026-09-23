@@ -57,6 +57,10 @@ AVAILABLE_COMMANDS: dict[str, str] = {
     "skills": "查看与阅读大模型专业技能包（Skills）",
     "commands": "查看已配置的 L1 提示词模板命令",
     "exit": "退出 Logox",
+    "compact": "立即压缩上下文（本地重算，不调模型）",
+    "mode": "切换权限模式（/mode default|creative）",
+    "summary": "查看当前会话演进脉络与用量大盘",
+    "permissions": "查看与管理权限规则及物理沙箱（弹窗）",
 }
 
 #: 已列入路线图、但**还没有实现**的能力 → 说明。
@@ -64,9 +68,7 @@ AVAILABLE_COMMANDS: dict[str, str] = {
 #: 保留它们是为了让用户能区分"这个功能没做"与"我打错字了"。
 PLANNED_COMMANDS: dict[str, str] = {
     "files": "本次会话读写的文件清单（M5）",
-    "permissions": "生效的权限规则（M5 规则引擎）",
     "memory": "项目记忆（M7）",
-    "compact": "压缩上下文（M7）",
 }
 
 #: 别名 → 规范命令名。
@@ -81,6 +83,8 @@ ALIASES: dict[str, str] = {
     "continue": "resume",
     "skill": "skills",
     "cmd": "commands",
+    "permission": "permissions",
+    "perm": "permissions",
 }
 
 CommandState = Literal["ready", "planned", "unknown"]

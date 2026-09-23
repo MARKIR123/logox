@@ -453,8 +453,86 @@ class Win32Terminal:
         return
 
 
+#: Win32 ``dwControlKeyState`` 的修饰位（``wincon.h``）。
+#:
+#: ⚠️ 为什么必须读它：控制台把**修饰键状态放在这里**，而 ``UnicodeChar`` 只给
+#: "不带修饰时那个字符"。于是 ``Ctrl+Enter`` 与 ``Enter`` 拿到的**都是** ``\r`` ——
+#: 在 Windows 上"Ctrl+Enter 换行"曾经**必然退化成提交**（用户实测：消息发出去了）。
+#: 注意左右各一位（左右 Alt / 左右 Ctrl 是四个不同的位），少读一半就是"按住左边那个有效、
+#: 按住右边那个没反应"。
+WIN32_SHIFT_PRESSED = 0x0010
+WIN32_ALT_PRESSED = 0x0002 | 0x0001
+WIN32_CTRL_PRESSED = 0x0008 | 0x0004
+
+
+def _is_shift_pressed_native() -> bool:
+    """探查物理键盘 Shift 键是否正处于按下状态。
+
+    借鉴参考实现 Pi（`isNativeModifierPressed("shift")`）：
+    Windows Terminal (ConPTY) 在传输 Shift+Enter 时会剥离修饰位，把 `dwControlKeyState` 置零并只发送 `\r`。
+    当收到 `\r` 的瞬间通过 Win32 `GetAsyncKeyState(VK_SHIFT)` 异步探查物理按键状态，
+    若用户正按住 Shift，则将其升级为 `Shift+Enter`。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        # 0x10 == VK_SHIFT。最高位 (0x8000) 置 1 表示按键当前处于按压状态
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
+    except Exception:
+        return False
+
+
+def _encode_modified_key(char: str, state: int, *, shift_override: bool | None = None) -> str:
+    """带修饰的按键 → xterm ``modifyOtherKeys`` 形式（``CSI 27;<修饰>;<码点>~``）。
+
+    只对**字符本身无法表达修饰**的少数几个键补编码：
+
+    ================= ============================== ==========================
+    按下               控制台给的字符                  不补编码的后果
+    ================= ============================== ==========================
+    ``Ctrl+Enter``    ``\r``（与 Enter 完全相同）     退化成**提交**
+    ``Shift+Enter``   ``\r``（同上）                  退化成**提交**
+    ``Alt+Enter``     ``\r`` 或 ``ESC`` + ``\r``     退化成**提交**（视终端而定）
+    ================= ============================== ==========================
+
+    ⚠️ ``\n`` **不在这里补编码**：D128 已把"单独的 LF"定成**换行**（``keys.py``
+    把 LF 解析成"带修饰的 Enter"），于是 ``Ctrl+J`` / ``ConPTY 上的 Ctrl+Enter``
+    在字符层保持原样就能得到正确行为 —— 少一条规则就少一处能改动的地方。
+
+    补出来的形式是 ``keys.py`` **正式支持**的形态之一（``CSI 27;mod;code~``），
+    所以解析层一个字都不用改 —— 与 Kitty / modifyOtherKeys 两条路复用同一段代码。
+
+    ⚠️ **不要**给所有带修饰的键都补编码：开了 VT 输入之后，方向键等功能键本来就是
+    控制台**已经翻译好**的 ``CSI`` 序列（``ESC`` ``[`` ``1`` ``;`` ``2`` ``A`` 六条字符记录），
+    而那六条记录上**同样带着修饰位** —— 逐个补编码会把 ``Shift+↑`` 变成一串垃圾字符。
+    这也是为什么这里只认 ``\r`` / ``\n`` 这两个"控制台不会翻译、只会原样给"的字符。
+    """
+    shift = bool(state & WIN32_SHIFT_PRESSED) or (
+        char == "\r" and (shift_override if shift_override is not None else _is_shift_pressed_native())
+    )
+    ctrl = bool(state & WIN32_CTRL_PRESSED)
+    alt = bool(state & WIN32_ALT_PRESSED)
+
+    if char != "\r" or not (ctrl or shift or alt):
+        return char
+    code = 0x0D  # Enter
+
+    # xterm / Kitty 的修饰编号是**从 1 开始**的位掩码：1=Shift，2=Alt，4=Ctrl
+    # （``raw - 1`` 才是真实位）。这里反过来合成，规则必须与 `keys.py` 的
+    # `_decode_modifiers` 严格一致 —— 两边差 1 就会把 Shift 判成 Alt。
+    modifier = 1 + (1 if shift else 0) + (2 if alt else 0) + (4 if ctrl else 0)
+    return f"\x1b[27;{modifier};{code}~"
+
+
 def decode_input_records(
-    records: Any, count: int, key_event: int, resize_event: int
+    records: Any,
+    count: int,
+    key_event: int,
+    resize_event: int,
+    *,
+    shift_override: bool | None = None,
 ) -> tuple[str, bool]:
     """把一批 ``INPUT_RECORD`` 解成 ``(字符, 是否发生了窗口尺寸变化)``。
 
@@ -462,6 +540,10 @@ def decode_input_records(
     依赖三个字段的偏移（``bKeyDown`` / ``UnicodeChar`` / ``EventType``），
     而 ctypes 的结构体对齐一旦算错，症状是"按键变成乱码"或"按什么都没反应"——
     在真终端上极难定位，而在测试里只要构造几条记录就能验证。
+
+    ``dwControlKeyState`` 这一维（D127）：不读它的话，**任何依赖修饰位的按键在
+    Windows 上都不成立**，而症状是"按了变成另一个动作"（Ctrl+Enter 变成了发送），
+    比"没反应"更难联想到成因。
     """
     chars: list[str] = []
     resized = False
@@ -478,7 +560,8 @@ def decode_input_records(
         code = key.UnicodeChar
         if code == 0:
             continue  # 功能键的"虚拟键码"记录里没有字符，交给 VT 序列那条路
-        chars.append(chr(code))
+        state = int(getattr(key, "dwControlKeyState", 0) or 0)
+        chars.append(_encode_modified_key(chr(code), state, shift_override=shift_override))
     return "".join(chars), resized
 
 

@@ -21,7 +21,6 @@ Logox 是一个在终端里运行的 AI 编码 Agent：读你的代码、改你�
 - **能回退**：零 Git 依赖的检查点，任意轮次可时空回滚。
 - **可扩展**：MCP 接入、生命周期钩子、插件、技能包。
 - **多厂商**：OpenAI 兼容端点（DeepSeek / Ollama / LM Studio / OpenRouter）+ Anthropic。
-- **好装**：纯 Python，7 个运行时依赖，无编译步骤。
 
 ## 快速开始
 
@@ -31,12 +30,26 @@ Logox 是一个在终端里运行的 AI 编码 Agent：读你的代码、改你�
 git clone https://github.com/<你的账号>/Logox.git   # ← 换成你的仓库地址
 Set-Location Logox
 
-uv sync          # 按 uv.lock 建 .venv 并装好 7 个运行时依赖
-.\install.cmd    # 生成 ~/.logox/bin 包装脚本，并把该目录写进用户 PATH
+uv sync                         # 建 .venv 并装好运行时依赖
+uv tool install --editable .    # ★ 推荐：装成全局工具，任意目录敲 logox 都能用
 ```
 
 装完后**在任意目录**打开终端敲 `logox`，那个目录就成为独立工作区。
-不想装全局入口也行，在仓库根目录直接 `.\logox`。
+
+> **两种入口，跑的都是同一个 `logox.cli:main`**，按需选一个：
+>
+> | 场景 | 命令 | 说明 |
+> |---|---|---|
+> | 日常使用（推荐） | `logox` | `uv tool install --editable .` 装出来的全局入口；`--editable` ⇒ 源码改动即时生效 |
+> | 任何环境兜底 | `python -m logox` | 只需 `PYTHONPATH=src`，不需要任何安装 |
+>
+> `uv tool install` 把可执行文件放到 `uv tool dir --bin`（Windows 上是
+> `%USERPROFILE%\.local\bin`）。若它**不在 `PATH` 上**，跑一次 `uv tool update-shell` ——
+> 这是唯一需要碰 PATH 的地方，而且由 uv 负责，不需要任何自定义脚本。
+>
+> ⚠️ **如果 `PATH` 上还有别的 `logox`**（例如你以前用旧安装器生成的 `~/.logox/bin/logox.cmd`，
+> 或某个仓库的 `.venv\Scripts`），先出现的那个会**遮蔽** uv 装的那个。
+> 用 `where logox`（Windows）/ `which -a logox`（Unix）确认命中谁；旧的手写包装器可以直接删掉。
 
 ### 用一下
 
@@ -52,8 +65,10 @@ logox            # 进主屏界面（真实内核）
 #      /rewind  时空回滚（查看全轮次意图并回退）
 #      /help    完整键位与命令表（F1 同）
 
-# ② 【不需要 API Key】体验模式：隔离的临时工作区 + 真实内核，只有模型响应是预置脚本
-& ".venv\Scripts\python.exe" tools\first_run.py
+# ② 【不需要 API Key】体验模式：真实内核，只有模型响应是预置脚本（建议先建个空目录再跑）
+mkdir demo; Set-Location demo
+$env:LOGOX_SCRIPTED_PROVIDER = "1"   # 与真实 logox 只差这一行；删掉它即回到真实模型
+logox                                # 或 python -m logox
 #    启动后键入任意一句话按 Enter：能看到流式输出、工具卡片 ✓、状态栏 tok/s 与 cache。
 #    试 /help · /debug · /effort high · /theme logox-light · 生成中按 Esc。
 
@@ -73,7 +88,7 @@ logox --chat
 
 ```powershell
 uv add <包名>                  # 加依赖（同时更新 uv.lock）
-uv run ruff check src tools    # 静态检查
+uv run ruff check src          # 静态检查
 uv run python -m logox         # 用锁定的环境跑
 ```
 

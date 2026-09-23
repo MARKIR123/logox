@@ -80,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="交互式选择并恢复当前项目的历史会话",
     )
     parser.add_argument(
+        "-f",
+        "--fullscreen",
+        action="store_true",
+        help="开启全屏备用屏模式（消息独立滚动，输入框固定停靠在底部；D179）",
+    )
+    parser.add_argument(
         "--cwd",
         default=None,
         metavar="路径",
@@ -88,7 +94,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+def _force_utf8_stdio() -> None:
+    """把 stdio 切成 UTF-8（Windows 上 locale 常常是 cp936/GBK）。
+
+    为什么必须在**代码里**做，而不是靠启动脚本设环境变量：
+
+    * 界面层用 ``sys.stdout.write()`` 写**文本**（框线、``✓``、``▎``、``⏺`` 这类字形），
+      而 cp936 里没有这些码位 ⇒ ``UnicodeEncodeError``；
+    * 真正会炸的场景是 **stdout 被重定向**（管道 / 写文件 / 被别的进程读）——
+      那时 CPython 用 locale 编码包装文本流；控制台直连走 console I/O，不受影响
+      （这也解释了为什么"在终端里好好的，一重定向就崩"）；
+    * ``uv tool install``（本项目的推荐入口）生成的 ``logox.exe`` **不设任何环境变量**
+      —— 依赖环境的修法在那条路径上直接失效。
+
+    代价：三行、微秒级，且只碰 ``sys.stdout/stderr`` 的编码器，**不 import 任何重模块**，
+    因此不影响 D28 的 300ms 预算（由 T43 的 ``--version`` 探针守着）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # 非常规流（已被替换 / 不是 TextIOWrapper）
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover - 流已关闭或不可重配置
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    # ★ D154：先修 stdio 编码（重定向到管道/文件时 Windows 默认 cp936 会炸字形）。
+    #   必须在任何输出之前；且它不 import 重模块，故不影响 `--version` 快路径。
+    _force_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -251,18 +287,27 @@ def _run(args: argparse.Namespace) -> int:
     resume_file = _resolve_session(args, cwd, paths)
 
     if args.chat:
-        return _run_chat(cwd, bundle, resume_file=resume_file)
+        return _run_chat(cwd, paths, bundle, resume_file=resume_file)
 
-    # `logox`（无参数）就是进**新界面**——它是唯一的界面（D85：删掉了旧的全屏实现）。
-    return _run_tui(cwd, paths, bundle, resume_file=resume_file)
+    fullscreen = bool(
+        getattr(args, "fullscreen", False)
+        or getattr(getattr(bundle.config, "ui", None), "fullscreen", False)
+    )
+    return _run_tui(cwd, paths, bundle, resume_file=resume_file, fullscreen=fullscreen)
 
 
-def _run_tui(cwd: Path, paths: Any, bundle: Any, resume_file: Path | None = None) -> int:
-    """启动界面（`src/logox/tui/render/`：自研渲染器、无侧栏、走主屏）。
+def _run_tui(
+    cwd: Path,
+    paths: Any,
+    bundle: Any,
+    resume_file: Path | None = None,
+    fullscreen: bool = False,
+) -> int:
+    """启动界面（`src/logox/tui/render/`：自研渲染器、无侧栏）。
 
-    这是**唯一的界面入口**。历史上有过第二条路（Textual 全屏 + 侧栏面板），
-    已经在 D85 删掉——理由是它带来的东西（常驻侧栏）正是用户明确不要的，
-    而代价是"两套渲染、两套测试、两份文档"。
+    支持双模并存架构（D179）：
+    - 默认模式：主屏流式自然滚动（`run_inline`）；
+    - 全屏模式：备用屏视口独立滚动与底端停靠（`run_fullscreen`）。
     """
     from logox.app import (
         EXIT_CONFIG_ERROR,
@@ -280,8 +325,6 @@ def _run_tui(cwd: Path, paths: Any, bundle: Any, resume_file: Path | None = None
         sys.stderr.write(render_startup_error(outcome) + "\n")
         return outcome.exit_code or EXIT_CONFIG_ERROR
 
-    from logox.tui.render.app import run_inline
-
     for warning in outcome.warnings:
         sys.stderr.write(f"⚠ {warning}\n")
 
@@ -293,9 +336,18 @@ def _run_tui(cwd: Path, paths: Any, bundle: Any, resume_file: Path | None = None
     old_handlers = list(root_logger.handlers)
     root_logger.handlers = [file_handler]
     try:
-        return run_inline(outcome, session_start=build_session_start(outcome))
+        session_start = build_session_start(outcome)
+        if fullscreen:
+            from logox.tui.render.fullscreen import run_fullscreen
+
+            return run_fullscreen(outcome, session_start=session_start)
+
+        from logox.tui.render.app import run_inline
+
+        return run_inline(outcome, session_start=session_start)
     finally:
         root_logger.handlers = old_handlers
+
 
 
 def _chat_sigint_action(kernel: Any) -> bool:
@@ -309,7 +361,12 @@ def _chat_sigint_action(kernel: Any) -> bool:
     return bool(kernel is not None and kernel.cancel())
 
 
-def _run_chat(cwd: Path, bundle: Any, resume_file: Path | None = None) -> int:
+def _run_chat(
+    cwd: Path,
+    paths: Any,
+    bundle: Any,
+    resume_file: Path | None = None,
+) -> int:
     """最小文本模式（M3 / D53）：让"能读文件并回答"可以真的手工跑一遍。
 
     **stdout 只承载助手的正文**，其余一切（思考过程、工具调用、错误、重试）都走
@@ -331,7 +388,7 @@ def _run_chat(cwd: Path, bundle: Any, resume_file: Path | None = None) -> int:
     previous = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, on_sigint)
     try:
-        return int(asyncio.run(_chat_main(cwd, bundle, state, resume_file=resume_file)))
+        return int(asyncio.run(_chat_main(cwd, paths, bundle, state, resume_file=resume_file)))
     except KeyboardInterrupt:
         sys.stderr.write("\n")
         return EXIT_OK
@@ -341,6 +398,7 @@ def _run_chat(cwd: Path, bundle: Any, resume_file: Path | None = None) -> int:
 
 async def _chat_main(
     cwd: Path,
+    paths: Any,
     bundle: Any,
     state: dict[str, Any],
     resume_file: Path | None = None,
@@ -349,6 +407,7 @@ async def _chat_main(
 
     from logox.config.schema import ProviderConfig
     from logox.context import HierarchicalContextBuilder
+    from logox.context.storage import SessionTranscriptWriter
     from logox.errors import LogoxError
     from logox.kernel.bus import EventBus
     from logox.kernel.loop import KernelLoop
@@ -407,7 +466,14 @@ async def _chat_main(
             system=_system_prompt(cwd, tools),
             cwd=cwd,
             session_id=bus.session_id,
-            window_capacity=provider_config.max_tokens or 128_000,
+            window_capacity=_context_window_of(provider),
+            # ★ D153：chat 模式的会话日志落 **用户目录**（与 TUI 同族），
+            #   而不是像以前那样因为没传 writer 而落到 cwd 的 `.logox/runs/chat-<pid>/`。
+            transcript_writer=SessionTranscriptWriter(
+                base_dir=paths.sessions, session_id=bus.session_id
+            ),
+            # ★ D157：`[context]` 配置同样接线（两条装配路径不能漂移 —— F-07 的教训）
+            **_context_params(bundle),
         ),
         model=model,
         temperature=provider_config.temperature,
@@ -532,6 +598,43 @@ class _ChatRenderer:  # noqa: D101 - 内部类型，模块文档已说明其职�
         if turn.status.value != "done":
             sys.stderr.write(f"[回合结束] {turn.status.value}\n")
             sys.stderr.flush()
+
+
+
+def _context_params(bundle: Any) -> dict[str, Any]:
+    """把 ``[context]`` 配置展开成 `HierarchicalContextBuilder` 的关键字参数（D157）。
+
+    为什么抽出来：装配有**两条路径**（TUI 的 `app.py` 与 `--chat` 的 `cli.py`），
+    F-07 已经因为"两套装配各写一遍"漂移过一次。这里让 chat 路径复用同一份映射，
+    宁可多一个函数也不要第二个真相。
+    """
+    config = getattr(getattr(bundle, "config", None), "context", None)
+    return {
+        "reserve_tokens": getattr(config, "reserve_tokens", 32_768),
+        "low_watermark_ratio": getattr(config, "low_watermark_ratio", 0.50),
+        # 配置里 0 = 不封顶（哨兵值）⇒ 转成 None 交给 Compactor
+        "max_budget_tokens": getattr(config, "max_budget_tokens", 0) or None,
+        "keep_recent_turns": getattr(config, "keep_recent_turns", 2),
+        "keep_recent_tool_results": getattr(config, "keep_recent_tool_results", 2),
+        "rehydrate_files": getattr(config, "rehydrate_files", 5),
+        "rehydrate_max_chars": getattr(config, "rehydrate_max_chars", 2000),
+        "project_memory_enabled": getattr(config, "project_memory_enabled", True),
+    }
+
+
+def _context_window_of(provider: Any) -> int:
+    """取模型的**上下文窗口**容量。
+
+    ⚠️ 这里**不能**用 ``provider_config.max_tokens`` —— 那是**单次输出**上限，
+    与上下文窗口是两件事。早先的写法把两者混为一谈：D118 把默认 ``max_tokens``
+    提到 16384 之后，高水位变成 ``min(16384*0.75, 80000) = 12288``
+    —— **一万两千 token 就开始压缩**，而模型可能支持 1M 上下文。
+
+    它只在 ``--chat`` 这条装配路径上存在（TUI 路径 ``app.py`` 用的是真实的
+    ``provider.context_window``）；这正是 F-07「两套装配」漂移的后果。
+    单独抽成函数是为了能直接测（见 ``tests/unit/test_cli.py``）。
+    """
+    return int(getattr(provider, "context_window", None) or 128_000)
 
 
 def _system_prompt(cwd: Path, tools: Any) -> str:

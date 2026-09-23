@@ -238,7 +238,7 @@ def ensure_project_initialized(cwd: Path) -> tuple[ProjectPaths, bool]:
             "# Logox workspace ignore (D119)\n"
             ".env\n"
             "state.toml\n"
-            "runs/\n"
+            # D153：不再有 `runs/`（运行产物早已搬到 ~/.logox/sessions 与 blobs）
             "*.log\n"
         )
         gitignore_path.write_text(gitignore_content, encoding="utf-8")

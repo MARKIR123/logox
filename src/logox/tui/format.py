@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 
@@ -26,6 +27,7 @@ __all__ = [
     "diff_badge",
     "format_bytes",
     "format_clock",
+    "format_args",
     "format_cost",
     "format_duration",
     "format_ratio",
@@ -269,6 +271,17 @@ def _wrap_single_line(line: str, width: int, *, indent: str = "") -> list[str]:
         # 太窄：连悬挂缩进都放不下 → 保住"不超宽"这条硬不变量，放弃标记对齐
         return _wrap_pieces(line.lstrip(_INDENT_CHARS), width)
 
+    # ★ CHANGE-052：**无缩进、无标记**时走一次性折行，而不是"切首行 + 折剩余"。
+    #
+    #   ⚠️ 为什么（实测）：两段式会让首行走 `take=1` 单独切 —— 而**末行均衡**需要看到
+    #   "全部行"才能重分最后两行。于是同一段文本：
+    #     `_wrap_pieces(全文, w)`            → 54 + 34   ✓ 已均衡
+    #     两段式（首行 take=1 切在 74 格）    → 74 + 14   ✗ 末行又孤了
+    #   而 `marker` / `prefix` / `fill` 三者皆空时，两段式**没有任何存在理由**
+    #   （它存在只是为了"列表标记与悬挂缩进对齐"）。
+    if not marker and not prefix and not fill:
+        return _wrap_pieces(body, width)
+
     head_budget = max(1, first_budget - marker_width)
     head = _wrap_pieces(body, head_budget, take=1)
     out = [prefix + marker + (head[0] if head else "")]
@@ -354,6 +367,7 @@ def _wrap_pieces(text: str, budget: int, *, take: int | None = None) -> list[str
             break
         hard = _scan_hard(text, spans, start, budget)
         end = _scan_preferred(text, spans, start, hard)
+        end = _kinsoku_shori(text, start, end)
         piece = text[start:end].strip()
         if piece:
             lines.append(piece)
@@ -402,11 +416,95 @@ def _scan_hard(text: str, spans: list[tuple[int, int, bool]], start: int, budget
     return max(end, start + 1) if end <= start else end
 
 
+#: 「单词字符」：**英文标识符与数字**。硬断落在它中间会把一个词切成两半。
+#:
+#: ⚠️ 为什么需要这个概念（CHANGE-052 实测）：折行器的断点集只有**标点与空格**，
+#: 于是当一行里"最后一个优先断点"离预算边界很远时，硬断会落在**单词内部** ——
+#: 实测摘要把 `docstring` 切成 `docstrin` + `g`，把 `turn_lines_of` 切成
+#: `turn_lines_of`（整个词被推到下一行则更糟）。中文没有这个问题（逐字可断），
+#: 但**本项目正文里到处是英文标识符**（文件名、函数名、命令），所以它必须修。
+_WORD_CHAR = re.compile(r"[0-9A-Za-z_]")
+
+#: 「token 字符」：ASCII 词字符 **加上路径/标识符里常见的连接符**。
+#:
+#: ★ 为什么比 `_WORD_CHAR` 宽（CHANGE-052 实测）：只保护"纯词字符"会漏掉
+#: ``/status``、``a/b.py``、``kw-arg`` 这类**夹着符号的标识符** ——
+#: 实测摘要里 `` `/status` `` 被折成 `` `/ `` + `` status` ``，
+#: 读起来像"反引号和斜杠掉在上一行末尾"，比切开单词更糟。
+#:
+#: ⚠️ 刻意**不含**：空白（那是天然断点）、CJK（中文逐字可断）、
+#: 以及 `**`、`（`、`—` 等排版符号（它们前后本来就可以断）。
+_TOKEN_CHAR = re.compile(r"[0-9A-Za-z_/.\-*]")
+
+
+def _is_token_char(text: str, idx: int) -> bool:
+    """是否属于不可切分的词法单元字符（字母数字、路径符号、通配符、反引号，以及数字千分位逗号）。"""
+    if idx < 0 or idx >= len(text):
+        return False
+    c = text[idx]
+    if _TOKEN_CHAR.match(c) or c == "`":
+        return True
+    # 数字内部的千分位逗号算作 token 字符
+    if c == "," and idx > 0 and idx < len(text) - 1 and text[idx - 1].isdigit() and text[idx + 1].isdigit():
+        return True
+    return False
+
+
+def _inside_word(text: str, index: int) -> bool:
+    """``index`` 这个断点是不是落在**标识符内部**？
+
+    判据：断点两侧**都是 token 字符**（词字符、路径连接符或数字千分位）。
+    于是 ``docstrin|g``、``/|status``、``a/|b.py``、``1,|048``、``*|.md`` 都算"内部"，
+    而 ``的|契``（CJK）、``，|删``（标点+中文）、`` |foo``（空格后）都不算。
+    """
+    return (
+        0 < index < len(text)
+        and _is_token_char(text, index - 1)
+        and _is_token_char(text, index)
+    )
+
+
+def _is_protected_punct(text: str, index: int) -> bool:
+    """判定处于 ``index`` 处的标点是否属于词法单元内部（如千分位数字、扩展名）。
+
+    ★ 为什么需要它（CHANGE-053 / D177）：
+    旧版折行器一律在 `,` 和 `.` 处断开，导致 `1,048,576` 被腰斩成 `1,048,` 和 `576`，
+    `*.md` 被腰斩成 `*.` 和 `md`。
+    """
+    char = text[index]
+    # ① 千分位数字逗号：两侧为连续数字（如 1,048,576）
+    if char == ",":
+        if 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit():
+            return True
+    # ② 小数点、文件名与扩展名点号
+    elif char == ".":
+        # 后接字母、数字、下划线、连字符（*.md, test.py, .smoke, v1.2）
+        if index + 1 < len(text) and (text[index + 1].isalnum() or text[index + 1] in "_-"):
+            return True
+        # 前接通配符或标识符且后接非空白（如 *.md）
+        if index > 0 and (text[index - 1].isalnum() or text[index - 1] in "*_-"):
+            if index + 1 < len(text) and not text[index + 1].isspace():
+                return True
+    # ③ 时间与命名空间冒号
+    elif char == ":":
+        if 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit():
+            return True
+        if (index > 0 and text[index - 1] == ":") or (index + 1 < len(text) and text[index + 1] == ":"):
+            return True
+    return False
+
+
 def _scan_preferred(text: str, spans: list[tuple[int, int, bool]], start: int, hard: int) -> int:
     """在 ``(start, hard]`` 里找**更好的断点**；找不到就返回 ``hard``。
 
     更好的断点 = 标点之后，或空格处。只往回看一小段：为了一个远处的标点
     把整行掏空反而更难看。
+
+    ★ 保护 1（CHANGE-053）：**排除受保护标点**。千分位数字逗号（``1,048,576``）、
+    浮点小数点与文件扩展名点号（``3.14``、``*.md``、``.smoke``）不得断开。
+
+    ★ 保护 2（CHANGE-052）：**别把标识符切成两半**。
+    若硬断落点恰在标识符内部，就回退到它的开头。回退时连反引号与千分位数字一起吞。
     """
     if hard - start < 4:
         return hard
@@ -414,14 +512,55 @@ def _scan_preferred(text: str, spans: list[tuple[int, int, bool]], start: int, h
     for index in range(hard - 1, floor - 1, -1):
         char = text[index]
         if char in _BREAK_AFTER:
-            return index + 1  # 标点留在本行尾部
+            if not _is_protected_punct(text, index):
+                return index + 1  # 标点留在本行尾部
         if char.isspace():
             return index  # 空白丢掉
+    # 没找到优先断点 ⇒ 准备硬断，但**先看看会不会切开标识符**
+    if _inside_word(text, hard):
+        word_start = hard
+        # ⚠️ 回退时连反引号与千分位数字一起吞
+        while word_start > start + 1 and _is_token_char(text, word_start - 1):
+            word_start -= 1
+        if word_start > start + 1:
+            return word_start  # 退到标识符开头；下一行从整个标识符开始
     return hard
 
 
 #: 断行**优先落在这些字符之后**（中文标点与句读）——把句子断在标点处才读得顺
 _BREAK_AFTER = "，。！？；：、）】》」』,.!?;:)]}\"'"
+
+#: 避头规则：行首绝对不得单独出现的标点（句末标点、闭合括号、逗号分号等）
+_NO_LINE_START = "，。！？；：、）】》」』,.!?;:)]}\"'"
+
+
+def _kinsoku_shori(text: str, start: int, end: int) -> int:
+    """避头尾法则（Kinsoku Shori）：确保行首不得出现句末标点或闭合括号。
+
+    若 ``end`` 处切断将导致下一行首字符为禁用标点（如逗号、句号、右括号），
+    则将切点 ``end`` 向前回退，使得标点连同前序文字一同移入下一行。
+    """
+    if end >= len(text):
+        return end
+    next_char_idx = end
+    while next_char_idx < len(text) and text[next_char_idx].isspace():
+        next_char_idx += 1
+    # 避开行首禁止标点（排除以 . 开头的隐藏文件名如 .smoke，点号后紧接字母数字不算孤立标点）
+    if next_char_idx < len(text) and text[next_char_idx] in _NO_LINE_START:
+        if text[next_char_idx] == "." and next_char_idx + 1 < len(text) and text[next_char_idx + 1].isalnum():
+            return end  # .smoke 这类隐藏文件/路径允许开篇
+        retreat = end
+        # 1. 先退掉当前行尾已经吃进去的连续标点（如 '）' 已吃但 '；' 在下一行）
+        while retreat > start and text[retreat - 1] in _NO_LINE_START:
+            retreat -= 1
+        # 2. 再退掉至少一个正文字符或单词（若为英文单词或行内代码，退到词首）
+        if retreat > start:
+            retreat -= 1
+            while retreat > start + 1 and _is_token_char(text, retreat - 1):
+                retreat -= 1
+        if retreat > start:
+            return retreat
+    return end
 
 
 def _prefer_break(line: str) -> tuple[str, str]:
@@ -646,6 +785,30 @@ def diff_badge(stat: ChangeStat | None) -> str:
 
 #: 参数摘要里优先展示的键（按此顺序取第一个命中的）——它们最能说明"这一步在动什么"
 _SUMMARY_KEYS = ("path", "file", "command", "pattern", "query", "url", "name", "glob")
+
+
+
+def format_args(args: Mapping[str, object] | None) -> str:
+    """把工具入参整理成**展开态可读的多行文本**（UI-SPEC §5.6 第 ① 条）。
+
+    为什么需要它（用户的报障原话："**目前edit还是无法正常显示**"）：
+    折叠行上只有 ``args_summary``（44 字以内的摘要）。对 ``edit`` 来说，
+    真正想看的东西 —— ``old_string`` / ``new_string`` —— 长到必然被截断，
+    于是**展开后也看不到改了什么**。规格里写明了展开态第一项就是「完整参数（JSON 美化，2 空格缩进）」，
+    但这个函数此前**从未被实现**（``render_blocks`` 也没把 ``args_text`` 传给卡片）。
+
+    两个实现细节，各自有理由：
+
+    * ``ensure_ascii=False`` —— 中文路径/中文命令要能直接读，别变成 ``\u4e2d\u6587``。
+    * 值不是 JSON 可序列化时**退回** ``str()``（``default=str``）—— 参数来自模型，
+      格式上不可控，**宁可能看不好看，不能因为一个奇怪的值就渲染不出来**。
+    """
+    if not args:
+        return ""
+    try:
+        return json.dumps(dict(args), ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - 兜底，正常不会走到
+        return str(dict(args))
 
 
 def summarize_args(args: Mapping[str, object] | None, *, width: int = 44) -> str:

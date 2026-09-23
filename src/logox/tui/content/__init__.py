@@ -27,7 +27,12 @@
 
 边界（`tests/unit/test_imports.py` 与 `test_kernel_port.py` 会验）：
 **本包只允许 import 标准库、rich、pydantic 与 ``logox.config`` / ``logox.kernel`` /
-``logox.tui``**。不要在这里 import `textual`、`logox.providers`、`logox.tools`。
+``logox.tui``，以及根下的中立叶子模块**（``logox.errors`` / ``logox.paths`` / ``logox.difftext`` /
+``logox.permission_types``）。不要在这里 import `textual`、`logox.providers`、`logox.tools`。
+
+⚠️ **反过来也成立**（D140 新增 `test_kernel_port.py::T44`）：**下面各层不得 import 本包**。
+纯数据类型（diff 的 hunks、权限问答的数据形状）必须放到根下的中立叶子里 ——
+否则「工具/权限可以在没有界面的进程里独立运行」这条能力就被静默绑死了。
 """
 
 from __future__ import annotations

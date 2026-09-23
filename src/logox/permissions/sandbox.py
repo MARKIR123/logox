@@ -42,8 +42,9 @@ class PathSandbox:
             return RiskLevel.NORMAL, ""
 
         try:
-            # 完整物理路径展开（展开 .. 与软链接）
-            resolved = Path(raw_str).resolve()
+            # 完整物理路径展开（相对路径相对工作区根目录展开，展开 .. 与软链接）
+            p = Path(raw_str)
+            resolved = (self.workspace_root / p).resolve() if not p.is_absolute() else p.resolve()
         except Exception as exc:
             return (
                 RiskLevel.HIGH_CROSS_BOUNDARY,

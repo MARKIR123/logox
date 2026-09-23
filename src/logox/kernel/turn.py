@@ -49,6 +49,8 @@ class Turn:
         "task",
         "tool_call_count",
         "turn_index",
+        "summary_reason",
+        "summary_source",
         "turn_summary",
         "usage_total",
     )
@@ -68,6 +70,10 @@ class Turn:
         self.task: asyncio.Task[None] | None = None
         self._cancelled_at: float | None = None
         self.turn_summary: str | None = None
+        #: 摘要来源（D135 第二步）：model_last_line / model_tag / model_fallback / deterministic
+        self.summary_source: str | None = None
+        #: 末尾行被拒的原因（度量用）：too_long / structural / inside_code_block / …
+        self.summary_reason: str | None = None
 
     # ------------------------------------------------------------------ #
     # 中断
