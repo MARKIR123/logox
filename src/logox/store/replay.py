@@ -10,8 +10,8 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from logox.kernel.messages import (
@@ -94,6 +94,9 @@ def reconstruct_messages(
         line_no = int(raw_line) if isinstance(raw_line, int) else None
 
         # 忽略初始化头与系统内部元数据记录
+        if event_type == "anamnesis_ref":
+            continue
+
         if event_type in ("session_init", "meta", "checkpoint", "session_rewind"):
             continue
 
@@ -209,12 +212,15 @@ def reconstruct_messages(
                 and last_assistant_index is not None
             ):
                 target = messages[last_assistant_index]
+                # 来源与摘要同源落盘 ⇒ 回刻时必须一起带回。
+                # 只带回摘要会把 Q-D 裁定的「来源自证」抹成 None
+                # （实测：磁盘 55 条带来源 → 重建后 0 条）。
+                meta_update: dict[str, Any] = {"turn_summary": summary.strip()}
+                source = record.get("summary_source")
+                if isinstance(source, str) and source:
+                    meta_update["summary_source"] = source
                 messages[last_assistant_index] = target.model_copy(
-                    update={
-                        "meta": target.meta.model_copy(
-                            update={"turn_summary": summary.strip()}
-                        )
-                    }
+                    update={"meta": target.meta.model_copy(update=meta_update)}
                 )
 
     # ★ CHANGE-052：统一盖行号戳 —— 放在最后是为了与上面的"平行表"配合，
@@ -338,6 +344,14 @@ def replay_into_timeline(
         role = record.get("role")
         content = record.get("content", "")
 
+        if event_type == "anamnesis_ref":
+            run_id = record.get("run_id", "")
+            if isinstance(run_id, str) and run_id.isascii() and run_id.isalnum():
+                add_reference = getattr(buffer, "add_anamnesis_reference", None)
+                if callable(add_reference):
+                    add_reference(run_id)
+            continue
+
         if event_type in ("session_init", "meta", "checkpoint", "session_rewind"):
             continue
 
@@ -454,6 +468,7 @@ def replay_session(
     *,
     summarize: Callable[[Any], str] | None = None,
     format_args: Callable[[Any], str] | None = None,
+    context_builder: Any | None = None,
 ) -> tuple[int, int]:
     """统一回放入口：同时恢复内核消息历史与时间线视图。
 
@@ -468,6 +483,10 @@ def replay_session(
     messages = reconstruct_messages(filtered_records, session_dir=session_dir)
     if kernel_loop is not None and hasattr(kernel_loop, "history"):
         kernel_loop.history.extend(messages)
+        if context_builder is not None:
+            context_builder.restore_state(kernel_loop.history, filtered_records)
+        if hasattr(kernel_loop, "_last_request_usage"):
+            kernel_loop._last_request_usage = None
 
     timeline_count = replay_into_timeline(
         filtered_records, timeline, summarize=summarize, format_args=format_args

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 
 from pydantic import Field
@@ -81,6 +83,9 @@ class ReadTool:
     )
 
     async def run(self, args: ToolArgs, ctx: ToolContext) -> ToolResult:
+        return await run_readonly_worker(self._run_sync, args, ctx)
+
+    def _run_sync(self, args: ToolArgs, ctx: ToolContext) -> ToolResult:
         assert isinstance(args, ReadArgs)
         target = _resolve(ctx.cwd, args.path)
 
@@ -97,7 +102,11 @@ class ReadTool:
                 detail="要列出目录内容请用 glob 工具。",
             )
 
+        if ctx.is_cancelled():
+            return ToolResult.failure(ErrorCategory.CANCELLED, "读取操作已被取消")
         raw = target.read_bytes()
+        if ctx.is_cancelled():
+            return ToolResult.failure(ErrorCategory.CANCELLED, "读取操作已被取消")
         if _looks_binary(raw):
             return ToolResult(
                 ok=True,
@@ -233,3 +242,17 @@ def _header(target: Path, encoding: str, args: ReadArgs, total: int, end: int, c
 def build() -> ReadTool:
     """工厂函数——注册表要的是实例，而 L2 不该 import 具体的类名。"""
     return ReadTool()
+
+
+async def run_readonly_worker(worker, args: ToolArgs, ctx: ToolContext) -> ToolResult:
+    """Move filesystem reads off the event loop and signal cancellation to workers."""
+    stop = threading.Event()
+    worker_ctx = ctx.model_copy(update={"is_cancelled": lambda: stop.is_set() or ctx.is_cancelled()})
+    task = asyncio.create_task(asyncio.to_thread(worker, args, worker_ctx))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stop.set()
+        # A blocking OS read cannot be forcibly interrupted; consume its eventual result.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        raise

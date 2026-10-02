@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -43,7 +42,6 @@ from logox.kernel.messages import (
 )
 from logox.kernel.registry import ToolRegistry
 from logox.kernel.scheduler import AllowAllDecider, BlobStoreProtocol, PermissionDecider, Scheduler
-from logox.kernel.turn import Turn, TurnStatus
 from logox.kernel.summary import (
     SUMMARY_MODEL_FALLBACK_MIN_CHARS,
     SUMMARY_SYSTEM_PROMPT,
@@ -53,6 +51,7 @@ from logox.kernel.summary import (
     normalize_model_summary,
     render_turn_transcript,
 )
+from logox.kernel.turn import Turn, TurnStatus
 from logox.providers.base import (
     ChatRequest,
     DeltaEvent,
@@ -214,6 +213,15 @@ class SimpleContextBuilder:
             memory_sources=list(self._memory_sources),
         )
 
+    async def build_async(
+        self,
+        history: list[Message],
+        *,
+        last_usage: ev.Usage | None = None,
+        summarizer: Any | None = None,
+    ) -> ContextBundle:
+        return self.build(history, last_usage=last_usage)
+
 
 # --------------------------------------------------------------------------- #
 # 模型阶段的结果
@@ -288,6 +296,10 @@ class _ProviderFailure(Exception):
 # --------------------------------------------------------------------------- #
 
 
+class _ContextBudgetExceeded(LogoxError):
+    """Mandatory context remains over the request budget after compaction."""
+
+
 class KernelLoop:
     """一次会话的 Agent 循环。**本身无状态**——所有会变的东西都在 :class:`Turn` 里。"""
 
@@ -315,6 +327,7 @@ class KernelLoop:
         jitter: Callable[[], float] | None = None,
         blob_store: BlobStoreProtocol | None = None,
         model_summary_fallback: bool = True,
+        memo_summarizer: Any | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations 必须 ≥ 1")
@@ -324,6 +337,7 @@ class KernelLoop:
         #: 为什么做成开关而不是写死：这是一次**额外计费请求**，
         #: 关心成本的用户、以及大量脚本化测试，都需要能关。
         self._model_summary_fallback = model_summary_fallback
+        self._memo_summarizer = memo_summarizer
         if max_retries < 0:
             raise ValueError("max_retries 不能为负")
 
@@ -359,6 +373,14 @@ class KernelLoop:
         #: 于是压缩永远不触发。
         self._last_request_usage: ev.Usage | None = None
         self._turns: list[Turn] = []
+
+    @property
+    def memo_summarizer(self) -> Any | None:
+        return self._memo_summarizer
+
+    @memo_summarizer.setter
+    def memo_summarizer(self, value: Any | None) -> None:
+        self._memo_summarizer = value
 
     # ------------------------------------------------------------------ #
     # 提交与取消
@@ -496,7 +518,7 @@ class KernelLoop:
                 #   模型接着干活时不知道"用户当时要的东西"还需不需要做。
                 turn.turn_summary = interrupted_summary(text, "本轮被中断")
             await self._emit_turn_finished(turn, "cancelled")
-        except _ProviderFailure:
+        except (_ProviderFailure, _ContextBudgetExceeded):
             # ErrorOccurred 已经在 raise 之前发过了；这里只负责收尾
             turn.status = TurnStatus.FAILED
             self._complete_history(turn)
@@ -533,7 +555,15 @@ class KernelLoop:
                     )
                 )
 
-        bundle = self._builder.build(self.history, last_usage=self._last_request_usage)
+        builder_async = getattr(self._builder, "build_async", None)
+        if callable(builder_async):
+            bundle = await builder_async(
+                self.history,
+                last_usage=self._last_request_usage,
+                summarizer=self._memo_summarizer,
+            )
+        else:
+            bundle = self._builder.build(self.history, last_usage=self._last_request_usage)
         # ★ D156 / F-54：把"压缩发生了"这件事**发到总线上**。
         #   在补上这一处之前，`CompactionStarted`/`CompactionFinished` 全项目没有发布者，
         #   于是时间线提示、`compact_count`、`pre_compact` 钩子、事后查证**四条线全是死的**。
@@ -563,6 +593,16 @@ class KernelLoop:
                 pruned_count=bundle.pruned_count,
             )
         )
+        high = getattr(getattr(self._builder, "compactor", None), "high_watermark", None)
+        archive_blocked = bundle.compaction is not None and bundle.compaction.strategy == "archive-blocked"
+        if archive_blocked or (isinstance(high, int) and high > 0 and bundle.token_estimate >= high):
+            message = (f"压缩后上下文仍为约 {bundle.token_estimate} token，达到当前模型高水位 {high}；"
+                       "本回合已暂停，请切换更大窗口的模型或减少输入。当前轮次与历史可恢复信息已保留。")
+            if archive_blocked:
+                message = "工具结果归档失败，本回合已暂停；原始工具结果仍保留，请检查存储空间或权限后重试。"
+            await self._bus.publish(ev.ErrorOccurred(session_id=self._bus.session_id, turn=turn.turn_index,
+                category=ErrorCategory.BAD_REQUEST.value, message=message, retryable=False))
+            raise _ContextBudgetExceeded(message)
         return bundle
 
     async def _body(self, turn: Turn, text: str) -> None:

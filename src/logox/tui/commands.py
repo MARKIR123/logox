@@ -43,7 +43,7 @@ COMMAND_PREFIX = "/"
 AVAILABLE_COMMANDS: dict[str, str] = {
     "help": "显示帮助与完整键位表",
     "login": "选择供应商并输入 API Key（弹窗）",
-    "model": "切换模型（弹窗选择，或 /model <名字>）",
+    "model": "切换模型（弹窗选择，或 /model <名字>；/model refresh 重抓本地模型清单）",
     "theme": "切换主题（弹窗选择，或 /theme <名字>）",
     "effort": "切换思考档位（/effort off|low|medium|high|auto）",
     "status": "显示当前会话的环境与用量",
@@ -58,8 +58,10 @@ AVAILABLE_COMMANDS: dict[str, str] = {
     "commands": "查看已配置的 L1 提示词模板命令",
     "exit": "退出 Logox",
     "compact": "立即压缩上下文（本地重算，不调模型）",
+    "reload": "重扫记忆/技能/模板命令/主题，并校验配置（不改代码）",
     "mode": "切换权限模式（/mode default|creative）",
     "summary": "查看当前会话演进脉络与用量大盘",
+    "anamnesis": "入梦：/anamnesis [nap|sleep|stop|status|history|report [run_id]|trace [run_id]]",
     "permissions": "查看与管理权限规则及物理沙箱（弹窗）",
 }
 

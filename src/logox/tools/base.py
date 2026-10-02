@@ -171,7 +171,8 @@ class ToolResult(BaseModel):
 
         手机上翻事件日志时，一行摘要比几百行文件内容有用得多。
         """
-        first = self.content.strip().splitlines()[0] if self.content.strip() else ""
+        prefix = self.content.strip()[:81]
+        first = prefix.splitlines()[0] if prefix else ""
         if len(first) > 80:
             first = first[:77] + "…"
         return first

@@ -1,0 +1,3 @@
+{"id":"chatcmpl-4","object":"chat.completion.chunk","created":4,"model":"local-model","choices":[{"index":0,"delta":{"content":"本地模型不报缓存"},"finish_reason":null}]}
+{"id":"chatcmpl-4","object":"chat.completion.chunk","created":4,"model":"local-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+{"id":"chatcmpl-4","object":"chat.completion.chunk","created":4,"model":"local-model","choices":[],"usage":{"prompt_tokens":500,"completion_tokens":40}}

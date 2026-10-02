@@ -67,7 +67,7 @@ theme = "monokai"
 
 [glyphs]
 set = "unicode"
-running = "⏺"
+running = "✻"
 success = "✓"
 error = "✗"
 denied = "⊘"

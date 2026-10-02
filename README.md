@@ -51,6 +51,8 @@ uv tool install --editable .    # ★ 推荐：装成全局工具，任意目录
 > 或某个仓库的 `.venv\Scripts`），先出现的那个会**遮蔽** uv 装的那个。
 > 用 `where logox`（Windows）/ `which -a logox`（Unix）确认命中谁；旧的手写包装器可以直接删掉。
 
+`grep` 工具需要 PATH 中的 [ripgrep](https://github.com/BurntSushi/ripgrep#installation)（`rg`）。先运行 `rg --version` 核对；Windows 可使用 `winget install BurntSushi.ripgrep.MSVC`。LOGOX 不自动下载可执行文件，缺失时会返回安装提示。搜索采用 ripgrep 默认正则与 auto 编码，前后查找、反向引用和旧版 GBK 回退存在兼容变化，见 [工具模块](docs/modules/05_tools.md)。
+
 ### 用一下
 
 ```powershell
@@ -85,6 +87,24 @@ logox --chat
 ---
 
 ## 开发
+
+### Anamnesis 入梦（功能分支）
+
+TUI 打开且前台任务结束后，空闲超过 30 分钟自动回顾；本地时区 00:00—08:00 可只读研究项目。发送消息或 `/anamnesis stop` 暂停当前窗口；编辑未发送的草稿不暂停，关闭 TUI 停止任务。首版不执行实验、修改代码或运行测试。
+
+在 `~/.logox/config.toml` 增加并重启：
+
+```toml
+[anamnesis]
+provider = "ollama"
+model = "" # 填写自己安装的本地模型完整名称；留空不会运行
+```
+
+`/anamnesis nap`、`/anamnesis sleep` 手动开始，`/anamnesis stop` 暂停，`/anamnesis status` 查看状态，`/anamnesis history` 查看当前项目全部运行，`/anamnesis report [run_id]` 查看完整分析与晨报，`/anamnesis trace [run_id]` 查看原始过程。记忆按条采纳：合格项保存，证据不足或旧状态留在候选报告中，不因一条拒绝而整批失败。未形成完整提案时保留进度并停止同批自动重试，可手动 `nap`／`sleep` 或等待真实新资料继续；正常批次交接只更新原卡片和剩余数量，不刷暂停通知。卡片用点击或 `Ctrl+T` 展开：实际返回的思考实时显示，阶段结论、档案差异及读取明细可查；新记录绑定启动会话，resume 恢复原卡片。
+
+只整理当前仍打开的项目，每个任务只读自己项目会话和源码。同项目全部窗口空闲超过 30 分钟、前台结束后才自动入梦；项目按最后提交用户指令从新到旧轮转，最近会话承载，本次归属不迁移。用户／项目档案分别为 `~/.logox/ANAMNESIS.md` 和当前目录 `ANAMNESIS.md`，按证据更新并保存版本；前台背景记忆默认最多占窗口 5%。本地窗口取 `[providers.<name>].context_window` 或 `model_windows` 静态配置，未配置模型或足够窗口会说明原因，不转云端、不探测 `/api/ps`。完整配置、恢复与失败边界见 [入梦模块](docs/modules/09_anamnesis.md)。
+
+### 开发命令
 
 ```powershell
 uv add <包名>                  # 加依赖（同时更新 uv.lock）

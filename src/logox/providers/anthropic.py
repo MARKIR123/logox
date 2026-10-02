@@ -110,6 +110,7 @@ class AnthropicProvider:
         raw_stream: RawStream | None = None,
         price_table: PriceTable | None = None,
         context_window: int | None = None,
+        model_windows: dict[str, int] | None = None,
         models: list[str] | None = None,
     ) -> None:
         self.api_key = api_key
@@ -117,12 +118,25 @@ class AnthropicProvider:
         self._raw_stream = raw_stream
         self.price_table = price_table
         self.context_window = context_window
+        self.model_windows: dict[str, int] = dict(model_windows or {})
         self._models = list(models or [])
         self._client: Any = None
 
     # ------------------------------------------------------------------ #
     # 模型信息
     # ------------------------------------------------------------------ #
+
+    def window_for(self, model_id: str) -> int | None:
+        """查指定模型的上下文窗口。按精确名 -> :latest 规范化 -> context_window 兜底。"""
+        if model_id in self.model_windows:
+            return self.model_windows[model_id]
+        clean_id = model_id.removesuffix(":latest")
+        if clean_id in self.model_windows:
+            return self.model_windows[clean_id]
+        tagged_id = f"{clean_id}:latest"
+        if tagged_id in self.model_windows:
+            return self.model_windows[tagged_id]
+        return self.context_window
 
     def list_models(self) -> list[ModelInfo]:
         return [
@@ -131,7 +145,7 @@ class AnthropicProvider:
                 provider=self.name,
                 # Claude 3.7 起支持扩展思考；保守起见按"支持"处理，由厂商决定是否拒绝
                 supports_thinking=self.supports_thinking(model_id),
-                context_window=self.context_window,
+                context_window=self.window_for(model_id),
                 input_price_per_mtok=(price.input_per_mtok if (price := price_for(model_id, self.price_table)) else None),
                 output_price_per_mtok=(price.output_per_mtok if price else None),
             )

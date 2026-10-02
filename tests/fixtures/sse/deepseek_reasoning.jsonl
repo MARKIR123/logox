@@ -1,0 +1,5 @@
+{"id":"chatcmpl-6","object":"chat.completion.chunk","created":6,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先看 kernel 里的重试实现"},"finish_reason":null}]}
+{"id":"chatcmpl-6","object":"chat.completion.chunk","created":6,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"reasoning_content":"，改成指数退避。"},"finish_reason":null}]}
+{"id":"chatcmpl-6","object":"chat.completion.chunk","created":6,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":"我来改。"},"finish_reason":null}]}
+{"id":"chatcmpl-6","object":"chat.completion.chunk","created":6,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+{"id":"chatcmpl-6","object":"chat.completion.chunk","created":6,"model":"deepseek-reasoner","choices":[],"usage":{"prompt_tokens":4000,"completion_tokens":260,"prompt_cache_hit_tokens":3500,"completion_tokens_details":{"reasoning_tokens":180}}}

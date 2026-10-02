@@ -20,6 +20,7 @@ dist/
 # 唯一会被提交的是 `.env.example`（只有占位符，没有真实值）。
 .env
 .env.tmp
+.env.*
 .logox/.env
 .logox/.env.tmp
 !.env.example
@@ -33,28 +34,33 @@ dist/
 # 仅本机保留、不进版本历史的文件（文件本身留在磁盘上，只是不跟踪）：
 #   AGENTS.md   本机 Agent 协作规范
 #   logox.cmd / install.cmd / logox.ps1   开发期便捷启动器
-#   tools/      开发期辅助脚本（色板生成、提示词同步、参考实现补丁等）
+#   /tools/    开发期辅助脚本；仅色板生成器及固定色板允许纳入测试发布
 # ============================================================================
 AGENTS.md
 logox.cmd
 install.cmd
 logox.ps1
-tools/
+/tools/*
+!/tools/gen_themes.py
+!/tools/vendor/
+/tools/vendor/*
+!/tools/vendor/catppuccin-palette.json
 
 # ============================================================================
-# 只保留「可运行的产品」所需的必要文件。
-#
-# 下面这些**留在本地、不进版本历史**：
-#   docs/    设计文档、决策日志、复盘与面试手册（含个人化的踩坑叙述）
-#   tests/   测试用例与 SSE 回放夹具
-#   scratch/ 临时复现脚本
-#
-# ⚠️ 代价（推翻很便宜）：GitHub 上就看不到测试与设计文档了。
-# 想恢复只需删掉本节对应几行，再 `git add -f <目录>`。
+# 通用模块说明、架构、界面契约与离线测试允许纳入 Git。
+# 私人决策、复盘、审计原始证据和历史材料仍保留本地；这不自动 stage 或发布。
+# tools 忽略仅作用根目录，不能误匹配 src/logox/tools 的新增工具。
 # ============================================================================
-docs/
-tests/
-scratch/
+/docs/*
+!/docs/modules/
+/docs/modules/*
+!/docs/modules/[0-9][0-9]_*.md
+!/docs/modules/README.md
+!/docs/ARCHITECTURE.md
+!/docs/ANAMNESIS-DESIGN.md
+!/docs/ANAMNESIS-VALIDATION.md
+!/docs/UI-SPEC.md
+/scratch/
 
 # 会话产物：.logox/runs/ 下是逐次对话的记录（属隐私数据）。
 # `.logox/.gitignore` 已单独忽略它，这里再钉一道保险。

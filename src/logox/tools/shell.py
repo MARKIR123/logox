@@ -20,6 +20,8 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import contextlib
 import os
 import shutil
 import signal
@@ -164,10 +166,76 @@ def _decode_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+class _BoundedOutput:
+    def __init__(self):
+        self.total = 0
+        self.head = ""
+        self.tail = ""
+        self.trimmed = (0, "", "")
+        self.error_marker = False
+        self._marker_tail = ""
+
+    def append(self, text):
+        probe = self._marker_tail + text
+        self.error_marker |= any(marker in probe for marker in ("+ CategoryInfo", "+ FullyQualifiedErrorId"))
+        self._marker_tail = probe[-32:]
+        trimmed = text.rstrip()
+        if trimmed:
+            self.trimmed = (self.total + len(trimmed), (self.head + trimmed)[:MAX_OUTPUT_CHARS], (self.tail + trimmed)[-MAX_OUTPUT_CHARS:])
+        self.total += len(text)
+        self.head = (self.head + text)[:MAX_OUTPUT_CHARS]
+        self.tail = (self.tail + text)[-MAX_OUTPUT_CHARS:]
+
+    def rstrip(self):
+        other = _BoundedOutput()
+        other.total, other.head, other.tail = self.trimmed
+        return other
+
+    def extend(self, other):
+        self.total += other.total
+        self.head = (self.head + other.head)[:MAX_OUTPUT_CHARS]
+        self.tail = (self.tail + other.tail)[-MAX_OUTPUT_CHARS:]
+
+    def render(self):
+        if self.total <= MAX_OUTPUT_CHARS:
+            return self.head, False
+        removed = self.total - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS
+        return (f"{self.head[:TRUNCATE_HEAD_CHARS]}\n\n[... 已截断 {removed} 字符输出以保护上下文预算 ...]\n\n{self.tail[-TRUNCATE_TAIL_CHARS:]}", True)
+
+
+async def _capture_stream(stream):
+    candidates = [(codecs.getincrementaldecoder(enc)(errors="strict"), _BoundedOutput()) for enc in ("utf-8", "gbk", "latin-1")]
+    while True:
+        raw = await stream.read(65536)
+        kept = []
+        for decoder, output in candidates:
+            try:
+                output.append(decoder.decode(raw, final=not raw))
+                kept.append((decoder, output))
+            except UnicodeDecodeError:
+                pass
+        candidates = kept
+        if not raw:
+            return candidates[0][1]
+
+
+async def _collect_process(process):
+    readers = [asyncio.create_task(_capture_stream(stream)) for stream in (process.stdout, process.stderr)]
+    try:
+        stdout, stderr = await asyncio.gather(*readers)
+        await process.wait()
+        return stdout, stderr
+    finally:
+        for task in readers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+
+
 async def _kill_process_tree(pid: int) -> None:
     """彻底终止进程树。"""
     if sys.platform == "win32":
-        try:
+        with contextlib.suppress(Exception):
             proc = await asyncio.create_subprocess_exec(
                 "taskkill",
                 "/F",
@@ -178,13 +246,9 @@ async def _kill_process_tree(pid: int) -> None:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await proc.wait()
-        except Exception:
-            pass
     else:
-        try:
+        with contextlib.suppress(Exception):
             os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except Exception:
-            pass
 
 
 class ShellArgs(ToolArgs):
@@ -249,20 +313,16 @@ class ShellTool:
             )
 
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
+            stdout, stderr = await asyncio.wait_for(
+                _collect_process(process),
                 timeout=float(args.timeout_seconds),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await _kill_process_tree(process.pid)
-            try:
+            with contextlib.suppress(Exception):
                 process.kill()
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 await process.wait()
-            except Exception:
-                pass
             return ToolResult.failure(
                 ErrorCategory.TOOL_FAILURE,
                 f"命令执行超时（超过 {args.timeout_seconds} 秒）",
@@ -270,36 +330,22 @@ class ShellTool:
             )
         except asyncio.CancelledError:
             await _kill_process_tree(process.pid)
-            try:
+            with contextlib.suppress(Exception):
                 process.kill()
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 await process.wait()
-            except Exception:
-                pass
             raise
 
-        stdout = _decode_bytes(stdout_bytes)
-        stderr = _decode_bytes(stderr_bytes)
-
-        if stdout and stderr:
-            combined = f"{stdout.rstrip()}\n\n[stderr]:\n{stderr}"
-        elif stdout:
-            combined = stdout
+        combined = _BoundedOutput()
+        if stdout.total and stderr.total:
+            combined.extend(stdout.rstrip())
+            combined.append("\n\n[stderr]:\n")
+            combined.extend(stderr)
         else:
-            combined = stderr
-
+            combined.extend(stdout if stdout.total else stderr)
         returncode = process.returncode if process.returncode is not None else 0
-
-        # PowerShell 退出码陷阱防卫：exitcode==0 但 stderr 包含关键错误特征
-        is_pwsh = self.backend.name == "powershell"
-        pwsh_has_error = False
-        if is_pwsh and stderr:
-            if "+ CategoryInfo" in stderr or "+ FullyQualifiedErrorId" in stderr:
-                pwsh_has_error = True
-
-        truncated_output, was_truncated = truncate_output(combined)
+        pwsh_has_error = self.backend.name == "powershell" and stderr.error_marker
+        truncated_output, was_truncated = combined.render()
 
         if returncode == 0 and not pwsh_has_error:
             content = truncated_output if truncated_output.strip() else "(命令执行成功，无输出)"

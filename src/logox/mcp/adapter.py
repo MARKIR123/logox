@@ -57,7 +57,12 @@ def condense_mcp_tool(tool: dict[str, Any] | Any) -> str:
     params = []
     for param_name, prop in properties.items():
         raw_type = prop.get("type", "any") if isinstance(prop, dict) else "any"
-        type_str = type_map.get(raw_type, raw_type)
+        if isinstance(raw_type, list):
+            type_str = " | ".join(type_map.get(item, item) for item in raw_type if isinstance(item, str)) or "any"
+        elif isinstance(raw_type, str):
+            type_str = type_map.get(raw_type, raw_type)
+        else:
+            type_str = "any"
         if param_name in required_set:
             params.append(f"{param_name}: {type_str}")
         else:
@@ -113,7 +118,9 @@ class McpMetaTool(Tool):
             source="mcp",
         )
 
-    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    async def run(self, args: ToolArgs | dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if isinstance(args, ToolArgs):
+            args = args.model_dump()
         server_name = args.get("server", "").strip()
         action = args.get("action", "").strip()
 

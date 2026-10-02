@@ -119,8 +119,12 @@ class TimelineComponent:
     而不是再去比较几万个字符。
     """
 
-    def __init__(self, palette: Any, *, max_height: int = 0) -> None:
+    def __init__(self, palette: Any, *, max_height: int = 0, glyphs: dict[str, str] | None = None) -> None:
         self.palette = palette
+        #: 状态字形（`✓` / `✗` / `✻` …）。**必须由装配处注入**——
+        #: D200 之前这里没有这个字段，于是卡片永远走 `cards.py` 里的字面量 fallback，
+        #: 主题文件里的 `[glyphs]` 写了也不生效（配置存在 ≠ 配置生效）。
+        self.glyphs: dict[str, str] = dict(glyphs or {})
         self.buffer = TimelineBuffer()
         self.max_height = max_height
         self._cache = TimelineRenderCache()
@@ -129,6 +133,7 @@ class TimelineComponent:
         #: 前缀**行**缓存：`_prefix_rows` 对应的源文本（身份比对用）
         self._prefix_rows: list[Text] = []
         self._prefix_rows_key: Text | None = None
+        self._block_rows: dict[int, tuple[Text | list[Text], list[Text]]] = {}
         #: 度量（测试与 /debug 用）：命中次数、作废次数、上一帧耗时
         self.prefix_hits = 0
         self.cache_invalidations = 0
@@ -140,16 +145,18 @@ class TimelineComponent:
         """是否处于活跃生成/工具调用状态。"""
         return self.buffer.active_status is not None
 
-    def ingest(self, event: ev.AnyEvent) -> None:
-        self.buffer.ingest(event)
+    def ingest(self, event: ev.AnyEvent) -> bool:
+        return self.buffer.ingest(event)
 
     def render(self, width: int) -> list[Text]:
-        context = CardContext(palette=self.palette, width=width)
+        context = CardContext(palette=self.palette, width=width, glyphs=self.glyphs)
         blocks: list[Block] = self.buffer.visible_blocks
         if not blocks and not self.buffer.active_status:
             # 空会话且无活跃状态**一行都不出**：`render_blocks([])` 会返回一个空串，
             # 于是启动时输入框上面会多出一条莫名的空行（看着像 bug 而不是留白）。
             self.block_ranges = []
+            self._cache = TimelineRenderCache()
+            self._block_rows.clear()
             return []
 
         # 缓存的有效性判断与重建**全在 `render_cached` 里**（D126）：
@@ -163,6 +170,7 @@ class TimelineComponent:
             # ★ D176：双轨标记的显示开关（`Ctrl+B`）
             show_track=self.buffer.show_track,
             active_status=self.buffer.active_status,
+            segmented=True,
         )
         self.block_ranges = result.block_ranges
         if result.cache_rebuilt:
@@ -185,17 +193,15 @@ class TimelineComponent:
         未命中可折叠卡片则返回 False。
         """
         target_block: Block | None = None
-        target_block_idx: int = -1
-        for b_idx, (s_line, e_line, block) in enumerate(self.block_ranges):
+        for s_line, e_line, block in self.block_ranges:
             if s_line <= line_idx < e_line:
                 target_block = block
-                target_block_idx = b_idx
                 break
 
-        if target_block is None or target_block.kind not in ("tool", "reasoning", "diff"):
+        if target_block is None or target_block.kind not in ("tool", "reasoning", "diff", "anamnesis"):
             return False
 
-        if target_block.kind == "reasoning":
+        if target_block.kind in {"anamnesis", "reasoning"}:
             cur = target_block.expanded if target_block.expanded is not None else self.buffer.expand_reasoning
             target_block.expanded = not cur
         elif target_block.kind == "tool":
@@ -217,18 +223,39 @@ class TimelineComponent:
         return True
 
     def _split_rows(self, result: Any) -> list[Text]:
-        """把 ``RenderResult`` 切成帧要用的行列表，**只切尾部、前缀复用**（D126）。
+        """优先按块复用不可变行，正文和样式都相同时保留旧行身份。
 
-        正确性边界（三条，缺一条就会"内容错位但界面不报错"）：
-
-        1. ``reusable_prefix is None``（缓存刚作废 / 有折叠头部）→ 从头切，
-           并把复用缓存清空；
-        2. 前缀文本与上一帧**不是同一个对象** → 重新切一遍前缀；
-        3. 前缀**没有以换行结尾**时，它的最后一行其实与尾部第一行是同一行
-           —— 这时增量拼接不成立，退回到整体切分。
-           今天造不出这种情况（每个块渲染完都会补 `\n`），但"今天造不出"不等于
-           "永远不会"，而错了的表现是**两行内容被劈成三行**，很难对上号。
+        分块入口避免合并整个历史；完整 Text 入口保留旧前缀兼容路径，
+        当前缀不是完整换行边界时回退到完整切分，避免断行错误。
         """
+        if result.segments is not None:
+            rows: list[Text] = []
+            retained: dict[int, tuple[Text | list[Text], list[Text]]] = {}
+            for block, text in result.segments:
+                if (isinstance(text, list) and not text) or (isinstance(text, Text) and not text.plain):
+                    continue
+                key = id(block) if block is not None else id(text)
+                previous = self._block_rows.get(key)
+                if previous is not None and previous[0] is text:
+                    piece_rows = previous[1]
+                    self.prefix_row_reuses += 1
+                else:
+                    if isinstance(text, list):
+                        piece_rows = list(text)
+                    else:
+                        piece_rows = split_styled_lines(text) if text.plain != "\n" else [Text()]
+                    if previous is not None:
+                        old_rows = previous[1]
+                        for index in range(min(len(old_rows), len(piece_rows))):
+                            if piece_rows[index] == old_rows[index]:
+                                piece_rows[index] = old_rows[index]
+                rows.extend(piece_rows)
+                retained[key] = (text, piece_rows)
+            self._block_rows = retained
+            # 单独一个换行与旧 split_styled_lines 的空文本语义一致。
+            if len(rows) == 1 and not rows[0].plain:
+                return []
+            return rows
         prefix_text = result.reusable_prefix
         if prefix_text is None:
             # 没有可复用的前缀（有折叠头部、或还没攒出前缀）→ 整段重切
@@ -273,10 +300,20 @@ class TimelineComponent:
 
     def invalidate(self) -> None:
         self._cache = TimelineRenderCache()
+        self._block_rows.clear()
         self.cache_invalidations += 1
 
+    def step(self) -> bool:
+        """从平滑器按自适应打字机速率释出一步增量。返回是否有新文本落块。"""
+        committed = False
+        if self.buffer.step_reasoning() is not None:
+            committed = True
+        if self.buffer.step_delta(include_reasoning=False) is not None:
+            committed = True
+        return committed
+
     def flush(self) -> bool:
-        """把缓冲里的**流式增量**落成块。返回是否真的落了东西。
+        """把缓冲里的**流式增量全部**落成块（终态瞬时排空）。返回是否真的落了东西。
 
         ⚠️ 为什么必须有人定期调它（这是实测踩到的一个严重缺陷）：
         `TimelineBuffer.add_delta()` **只把文本放进缓冲**，不产生块也不失效缓存
@@ -313,11 +350,23 @@ class StatusComponent:
         *,
         items: StatusItems | None = None,
         timing_fields: TimingFields | None = None,
+        glyphs: dict[str, str] | None = None,
     ) -> None:
         self.palette = palette
         self.items = items or StatusItems()
         self.timing_fields = timing_fields or TimingFields()
+        #: 状态字形集（D200：由装配处注入，`tool_glyph` 从中取）。
+        self.glyphs: dict[str, str] = dict(glyphs or {})
         self._metrics: Any = None
+
+    @property
+    def tool_glyph(self) -> str:
+        """"运行中"字形（生成中提示与工具项共用）。
+
+        ⚠️ 回退值必须与 :class:`~logox.config.schema.ThemeGlyphs` 的默认一致 ——
+        两条路给出不同图标时，状态栏会与工具卡片不一致，而那时看代码是看不出来的。
+        """
+        return self.glyphs.get("running", "✻")
 
     @property
     def metrics(self) -> Any:
@@ -338,6 +387,7 @@ class StatusComponent:
             items=self.items,
             timing_fields=self.timing_fields,
             width=max(1, width),
+            tool_glyph=self.tool_glyph,
         )
         return [build_status_line(metrics, context)]
 
@@ -454,9 +504,13 @@ class InlineApp:
         except Exception:  # 主题坏了不该让界面起不来（装配根已经警告过一次）
             self.theme = load_theme("logox-dark", self.themes_dir)
         palette = self.theme.palette
+        #: 状态字形集（D200）。**唯一来源**：主题的 `[glyphs]` 段，再按 `ui.icon_set` 降级。
+        #: 装配处算一次、注入两个组件，`/theme` 与 `/reload` 换主题时用同一个方法重算 ——
+        #: 三条路径（启动 / `/theme` / `/reload`）因此不可能给出不同图标。
+        glyphs = self._glyphs_for(self.theme)
 
         self.screen = Screen(self.terminal)
-        self.timeline = TimelineComponent(palette)
+        self.timeline = TimelineComponent(palette, glyphs=glyphs)
         replayer = getattr(runtime, "session_replayer", None)
         if callable(replayer):
             try:
@@ -484,6 +538,7 @@ class InlineApp:
             palette,
             items=getattr(getattr(config, "ui", None), "status_items", None),
             timing_fields=getattr(getattr(config, "ui", None), "timing_fields", None),
+            glyphs=glyphs,
         )
 
         # 度量归约器（把事件压成状态行要的那些数字）。**阻塞投递**：
@@ -550,6 +605,13 @@ class InlineApp:
         # 漏注册的症状是**工具静默被拒绝**，而那时用户只会觉得"这工具坏了"。
         if getattr(runtime, "permission_decider", None) is not None:
             runtime.permission_decider.prompter = self
+        self.anamnesis = getattr(runtime, "anamnesis", None)
+        self._anamnesis_block: Block | None = None
+        self._anamnesis_restore_task: asyncio.Task | None = None
+        self._anamnesis_restore_capture: tuple[str, Any] | None = None
+        if self.anamnesis is not None:
+            self.anamnesis.on_event = self._on_anamnesis
+            self.anamnesis.foreground_busy = lambda: self._busy or self.screen.has_overlay() or bool(self._interactive_running)
 
     # ------------------------------------------------------------------ #
     # 事件 → 界面
@@ -562,17 +624,104 @@ class InlineApp:
         """
         if isinstance(event, ev.TurnFinished):
             self._busy = False
+            if self.anamnesis is not None:
+                self.anamnesis.note_foreground_state(False)
+        elif isinstance(event, ev.UserPromptSubmit):
+            if self.anamnesis is not None:
+                self.anamnesis.note_submission(event.ts)
+                self.anamnesis.note_foreground_state(True)
         elif isinstance(event, (ev.ModelRequestStarted, ev.ToolCallRequested)):
             self._busy = True
         elif isinstance(event, ev.ModelRequestFinished):
             self._busy = False
-        self.timeline.ingest(event)
+        needs_render = self.timeline.ingest(event)
         self._remember_for_debug(event)
-        if isinstance(event, (ev.TurnFinished, ev.ModelRequestFinished, ev.ErrorOccurred)):
+        if isinstance(event, ev.UserPromptSubmit):
+            # 阻塞订阅者在内核构建上下文前兑现回显，只使用已有事件避免重复消息。
+            self.screen.render_now()
+        elif isinstance(event, (ev.TurnFinished, ev.ModelRequestFinished, ev.ErrorOccurred)):
             # 回合结束/请求结束/出错时**立刻**落一次：否则最后几个增量要等下一次
             # 定时 tick 才出现，而如果那之后没有任何事件，它就永远留在缓冲里。
             self.timeline.flush()
+            self.screen.request_render()
+        elif needs_render:
+            self.screen.request_render()
+
+    async def _on_anamnesis(self, event: Any) -> None:
+        from logox.tui.content.anamnesis import AnamesisCard
+
+        if event.session_id and self.anamnesis is not None and event.session_id != self.anamnesis.current_session():
+            return
+        capture = self._anamnesis_restore_capture
+        if capture is not None and (not event.session_id or event.session_id == capture[0]):
+            capture[1].append(event)
+        block = next((b for b in reversed(self.timeline.buffer.blocks)
+                      if b.kind == "anamnesis" and b.card.run_id == event.run_id), None)
+        if block is None:
+            block = Block(kind="anamnesis", card=AnamesisCard(event.run_id))
+            self.timeline.buffer.blocks.append(block)
+        if event.sequence and event.sequence <= block.card.sequence:
+            return
+        previous_phase = block.card.phase
+        block.card.ingest(event)
+        self._anamnesis_block = block
+        if event.kind in {"completed", "failed", "paused"} and previous_phase not in {"completed", "failed", "paused", "interrupted"}:
+            message = {"completed": "✓ 入梦已完成", "failed": "✗ 入梦失败", "paused": "Ⅱ 入梦已暂停"}[event.kind]
+            if event.reason:
+                message += "：" + event.reason[:300]
+            self.timeline.buffer.add_notice(message, token="warning" if event.kind == "failed" else "success")
+        self.timeline.buffer.invalidate()
         self.screen.request_render()
+
+    async def _restore_anamnesis(self) -> None:
+        from logox.tui.content.anamnesis import AnamesisCard
+
+        if self.anamnesis is None:
+            return
+        owner = self.anamnesis.current_session()
+        if not owner:
+            return
+        from collections import deque
+
+        capture: tuple[str, Any] = (owner, deque(maxlen=512))
+        self._anamnesis_restore_capture = capture
+        try:
+            previews = await self.anamnesis.history(owner)
+            if owner != self.anamnesis.current_session():
+                return
+            for preview in previews:
+                block = next((b for b in self.timeline.buffer.blocks
+                              if b.kind == "anamnesis" and b.card.run_id == preview["run_id"]), None)
+                card = AnamesisCard.from_preview(preview, active=self.anamnesis.is_active
+                                                and self.anamnesis.status().run_id == preview["run_id"])
+                for event in capture[1]:
+                    if event.run_id == card.run_id and event.sequence > card.sequence:
+                        card.ingest(event)
+                if block is not None and block.card.sequence > card.sequence:
+                    continue
+                if block is None:
+                    block = self.timeline.buffer.add_anamnesis_reference(card.run_id)
+                block.card = card
+                self._anamnesis_block = block
+            self.timeline.buffer.invalidate()
+            self.screen.request_render()
+        except (ValueError, OSError) as exc:
+            self.notice(f"入梦历史恢复失败：{exc}", token="warning")
+        finally:
+            if self._anamnesis_restore_capture is capture:
+                self._anamnesis_restore_capture = None
+
+    def _schedule_anamnesis_restore(self) -> None:
+        if self.anamnesis is None:
+            return
+        if self._anamnesis_restore_task is not None:
+            self._anamnesis_restore_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._restore_anamnesis())
+        else:
+            self._anamnesis_restore_task = loop.create_task(self._restore_anamnesis())
 
     def _remember_for_debug(self, event: ev.AnyEvent) -> None:
         """留一份事件摘要给 ``/debug`` 看。
@@ -630,6 +779,9 @@ class InlineApp:
             self.screen.request_render(force=True)
             return
         self._busy = True
+        if self.anamnesis is not None:
+            self.anamnesis.note_activity("submit")
+            self.anamnesis.note_foreground_state(True)
         self._spawn(self._start_turn(text))
         self.screen.request_render(force=True)
 
@@ -638,6 +790,8 @@ class InlineApp:
             await self.runtime.kernel.start(text)
         except Exception as exc:  # pragma: no cover - 竞态兜底
             self._busy = False
+            if self.anamnesis is not None:
+                self.anamnesis.note_foreground_state(False)
             self.timeline.buffer.add_notice(f"无法提交：{exc}", token="danger")
             self.screen.request_render(force=True)
 
@@ -712,6 +866,11 @@ class InlineApp:
             self.screen.set_focus(self.editor)
             self.screen.request_render(force=True)
 
+    @property
+    def busy(self) -> bool:
+        """是否正在生成回复（`/reload` 据此拒绝执行，Q3-A）。"""
+        return self._busy
+
     def notice(self, message: str, *, token: str = "text_muted") -> None:
         """在时间线上写一行提示（命令的结果**必须看得见**）。"""
         self.timeline.buffer.add_notice(message, token=token)
@@ -731,6 +890,21 @@ class InlineApp:
         metrics.thinking_effort = self.effort
         self.screen.request_render(force=True)
 
+    def _glyphs_for(self, theme: Any) -> dict[str, str]:
+        """从主题算出血形集（D200）。
+
+        ``glyph_set()`` 本来就写好了 `ui.icon_set` 的 ASCII / Nerd 降级，但**从没被调用过**
+        —— 于是"终端显示不了 unicode 字形"这条退路实际上是死的。这里给它接上唯一的调用方。
+
+        为什么不把 `icon_set` 存成字段：它是**配置**，不是状态；换主题时按当前配置重算是
+        正确的行为，缓存成字段就多了一份可能与配置不一致的事实。
+        """
+        from logox.tui.theme import glyph_set
+
+        config = getattr(self.runtime, "config", None)
+        icon_set = getattr(getattr(config, "ui", None), "icon_set", None)
+        return glyph_set(theme, icon_set=icon_set)
+
     def apply_theme(self, name: str) -> str:
         """换主题。**失败时抛异常**，由命令层解释成一行提示（不崩、不退出）。
 
@@ -742,13 +916,20 @@ class InlineApp:
 
         为什么 hint 要绕一层：它在**内层** ``Editor`` 上（`BoxedEditor` 是装饰器，
         只代理协议方法，不代理这个字段）。
+
+        ⚠️ 还要同步**字形集**（D200）：不同主题可以配不同 `[glyphs]`（例如对比度主题
+        用更粗的箭头）。和颜色同理 —— 漏掉它，图标就停留在旧主题的字形上，
+        而且那时**屏幕上一切正常**，只是与你改的主题文件不符。
         """
         theme = load_theme(name, self.themes_dir)
         self.theme = theme
         palette = theme.palette
         self.timeline.palette = palette
-        self.timeline.invalidate()  # 卡片颜色变了 → 缓存必须作废
+        glyphs = self._glyphs_for(theme)
+        self.timeline.glyphs = glyphs
+        self.timeline.invalidate()  # 卡片颜色与字形都变了 → 缓存必须作废
         self.status.palette = palette
+        self.status.glyphs = glyphs
 
         if hasattr(self.editor, "border_style"):
             self.editor.border_style = str(palette.input_border)
@@ -778,6 +959,7 @@ class InlineApp:
         switcher = getattr(self.runtime, "switch_session", None)
         if callable(switcher):
             count = switcher(file_path, timeline=self.timeline)
+        self._schedule_anamnesis_restore()
         self.screen.request_render(force=True)
         return count
 
@@ -814,6 +996,7 @@ class InlineApp:
         rewinder = getattr(self.runtime, "rewind", None)
         if callable(rewinder):
             res = await rewinder(to_turn, force=force, timeline=self.timeline)
+            await self._restore_anamnesis()
             self.screen.request_render(force=True)
             return res
         return None
@@ -909,6 +1092,10 @@ class InlineApp:
         # 两者都由"谁改数据谁 `request_render`"这条已有的纪律兜住。
 
     def _dispatch(self, key: Key) -> None:
+        if self.anamnesis is not None:
+            editing = key.printable or key.name in {"paste", "backspace", "delete", "enter"}
+            editing = editing or (key.ctrl and key.name in {"u", "k", "w", "y"})
+            self.anamnesis.note_activity("input" if editing else "view")
         if key.ctrl and key.name == "c":
             self._interrupt()
             return
@@ -930,7 +1117,7 @@ class InlineApp:
             self.screen.request_render(force=True)
             return
         if key.ctrl and key.name == "t":
-            # D125：`Ctrl+T` 只切**思考链**。与 `Ctrl+O` **互不影响**（两个正交开关）。
+            # 普通思考与工具开关独立；入梦卡片与普通思考共用 Ctrl+T。
             self.timeline.buffer.toggle_expand_reasoning()
             self.timeline.invalidate()
             self.screen.request_render(force=True)
@@ -963,8 +1150,6 @@ class InlineApp:
 
     def _handle_completion_key(self, key: Key) -> bool:
         """列表开着时消费补全相关按键；返回 True 表示已处理（不再透传）。"""
-        from logox.tui.content import completion as completion_module
-
         state = self._completion
         assert state is not None
         if key.name == "escape":
@@ -1104,9 +1289,28 @@ class InlineApp:
             self._spawn(self.runtime.bus.publish(self.session_start))
         self._stop_event = asyncio.Event()
         self._tickers = self.start_tickers()
+        # ★ D188：**后台**抓一次本地（免鉴权）端点的模型清单。
+        #   为什么放在这里：只有本应用的循环能安全跑异步（理由同上面 SessionStart）；
+        #   为什么用后台：`/model` 弹窗必须保持"零网络、点开即出"（D65 的不变量），
+        #   而本机端点又不值得让启动多等一秒。
+        #   ★ 挂进 `_tickers` 是为了退出时能**取消**它：否则一个还没回来的请求
+        #   会在关闭时留下"Task was destroyed but it is pending"这类噪声。
+        refresher = getattr(self.runtime, "refresh_local_models", None)
+        if callable(refresher):
+            refresh_task = self._spawn(refresher())
+            if refresh_task is not None:
+                self._tickers.append(refresh_task)
         try:
+            if self.anamnesis is not None:
+                await self._restore_anamnesis()
+                await self.anamnesis.start_background()
             await self._stop_event.wait()
         finally:
+            if self.anamnesis is not None:
+                if self._anamnesis_restore_task is not None:
+                    self._anamnesis_restore_task.cancel()
+                    await asyncio.gather(self._anamnesis_restore_task, return_exceptions=True)
+                await self.anamnesis.aclose()
             for ticker in self._tickers:
                 ticker.cancel()
             self._tickers = []
@@ -1131,7 +1335,7 @@ class InlineApp:
         **进入 logox 之前那些输出就再也翻不回来了**。这是用户明确要求的取舍
         （"就像 ClaudeCode Pi agent 的做法一样"）。
         如果哪天想保留进界面之前的输出，把 :data:`CLEAR_ALL` 换成
-        ``"\\x1b[2J\\x1b[H"``（只清屏、不动回滚缓冲）即可——改一个常量。
+        ``CLEAR_VIEWPORT``（原地擦除当前屏、不动回滚缓冲）即可。
 
         为什么放在 ``run()`` 的最开头（而不是并进首帧的同步输出块）：
         清屏必须**早于**任何界面字节，否则"要清的内容"会和新界面同时存在一瞬。
@@ -1185,24 +1389,33 @@ class InlineApp:
         return [self._loop.create_task(self._stream_ticker())]
 
     async def _stream_ticker(self) -> None:
-        """按 ``ui.stream_fps`` 把流式增量合并着落成块（节流是**订阅者的责任**）。
+        """按 ``ui.stream_fps`` 把流式增量通过平滑器微步步进并渲染（D186）。
 
         为什么需要它：内核每收到一个增量就发一条 `ModelDelta`，一回合几百条。
-        逐条重渲染会把时间浪费在"用户根本看不清"的中间态上；
-        全部攒到最后又会让流式效果消失（那正是最初漏掉这一步的症状）。
-        10fps（默认）是"看着在逐字流出、又不浪费"的平衡点。
-
-        间隔**下限 5fps、上限 30fps**：用户把 ``stream_fps`` 调到 1 会看着卡，
-        调到 120 只会白烧 CPU。
+        若每条都逐帧重渲染，一旦超出视口高，每一帧都会触发整屏 ANSI 重绘，
+        瞬间塞爆 Windows ConPTY 管道，导致 Python 底层 sys.stdout.flush() 卡死数秒；
+        平滑器按 30~60 FPS 弹性释出字符，少积压时逐字吐出呈现极佳打字机质感，
+        大突发时自适应提速平滑追平。
         """
         config = getattr(self.runtime, "config", None)
-        fps = int(getattr(getattr(config, "ui", None), "stream_fps", 10) or 10)
-        interval = 1.0 / max(5, min(30, fps))
+        fps = int(getattr(getattr(config, "ui", None), "stream_fps", 30) or 30)
+        interval = 1.0 / max(5, min(60, fps))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + interval
         while self.screen._running:  # noqa: SLF001
-            await asyncio.sleep(interval)
-            committed = self.timeline.flush()
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+            now = loop.time()
+            deadline += interval
+            if deadline <= now:
+                deadline = now + interval
+            committed = self.timeline.step()
             is_active = self.timeline.is_active
-            if committed or is_active:
+            anamnesis_changed = False
+            if self.anamnesis is not None and self.anamnesis.is_active and self._anamnesis_block is not None:
+                anamnesis_changed = self._anamnesis_block.card.tick()
+                if anamnesis_changed:
+                    self.timeline.buffer.invalidate(layout=False)
+            if committed or is_active or anamnesis_changed:
                 self.screen.request_render()
 
     def _report_terminal_warnings(self) -> None:
@@ -1225,6 +1438,8 @@ class InlineApp:
         幂等很关键：`stop()` 会被"用户按 Ctrl+D"、"`/exit`"、"读线程结束"
         三条路调用，而其中第一条是在**读线程**里发生的。
         """
+        if self.anamnesis is not None:
+            self.anamnesis.request_close()
         self.timeline.buffer.clear_active_status()
         for handle in self._unsubscribe:
             self.runtime.bus.unsubscribe(handle)

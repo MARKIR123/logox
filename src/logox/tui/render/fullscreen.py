@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import re
 import sys
 import time
@@ -168,11 +169,9 @@ def extract_clean_selection(
 
 def _emergency_restore() -> None:
     """进程异常终止时的 atexit 原子恢复钩子（防止终端被困在备用屏）。"""
-    try:
+    with contextlib.suppress(Exception):
         sys.stdout.write(FULLSCREEN_CLEANUP)
         sys.stdout.flush()
-    except Exception:
-        pass
 
 
 class FullscreenLayout:
@@ -206,6 +205,7 @@ class FullscreenLayout:
 
         # 视口行缓存与几何快照（O(1) 鼠标交互关键，彻底去除每帧重复 render）
         self._cached_tl_rows: list[Text] = []
+        self._cached_block_ranges: list[tuple[int, int, Any]] = []
         self._cached_width: int = 0
         self._cached_dock_rows: int = 0
         self._cached_viewport_height: int = 0
@@ -227,8 +227,8 @@ class FullscreenLayout:
         """把 1-based 终端屏幕行号映射为全量时间线的行下标 (O(1) 纯数学映射)。"""
         total_tl_rows = len(self._cached_tl_rows)
         if total_tl_rows == 0:
-            self._cached_tl_rows = self.timeline.render(width)
-            self._cached_width = width
+            self._cached_tl_rows = self.timeline.render(max(1, width - 1))
+            self._cached_width = max(1, width - 1)
             total_tl_rows = len(self._cached_tl_rows)
 
         dock_rows = self._cached_dock_rows or self._get_dock_rows_count(width)
@@ -268,8 +268,8 @@ class FullscreenLayout:
         viewport_height = max(1, total_height - dock_rows)
         total_tl_rows = len(self._cached_tl_rows)
         if total_tl_rows == 0:
-            self._cached_tl_rows = self.timeline.render(width)
-            self._cached_width = width
+            self._cached_tl_rows = self.timeline.render(max(1, width - 1))
+            self._cached_width = max(1, width - 1)
             total_tl_rows = len(self._cached_tl_rows)
         return max(0, total_tl_rows - viewport_height)
 
@@ -286,7 +286,7 @@ class FullscreenLayout:
 
         total_tl_rows = len(self._cached_tl_rows)
         if total_tl_rows == 0:
-            content_w = max(20, width - 1)
+            content_w = max(1, width - 1)
             self._cached_tl_rows = self.timeline.render(content_w)
             self._cached_width = content_w
             total_tl_rows = len(self._cached_tl_rows)
@@ -321,7 +321,7 @@ class FullscreenLayout:
         并反解更新 self.scroll_offset = max(0, min(max_offset, new_total_tl_rows - viewport_height - new_start))。
         """
         self._cached_tl_rows = []
-        content_w = max(20, width - 1)
+        content_w = max(1, width - 1)
         all_tl_rows = self.timeline.render(content_w)
         total_tl_rows = len(all_tl_rows)
 
@@ -330,28 +330,28 @@ class FullscreenLayout:
         viewport_height = max(1, total_height - dock_rows)
 
         if total_tl_rows <= viewport_height:
-            all_tl_rows = self.timeline.render(width)
-            total_tl_rows = len(all_tl_rows)
-            content_w = width
+            content_w = max(1, width - 1)
             self.scroll_offset = 0
             self._cached_tl_rows = all_tl_rows
             self._cached_width = content_w
             self._cached_dock_rows = dock_rows
             self._cached_viewport_height = viewport_height
+            self._cached_block_ranges = list(getattr(self.timeline, "block_ranges", []))
             return
 
         self._cached_tl_rows = all_tl_rows
         self._cached_width = content_w
         self._cached_dock_rows = dock_rows
         self._cached_viewport_height = viewport_height
+        self._cached_block_ranges = list(getattr(self.timeline, "block_ranges", []))
 
         max_offset = max(0, total_tl_rows - viewport_height)
 
         if anchor_block is not None and hasattr(self.timeline, "block_ranges"):
             found = False
-            for s_l, e_l, block in self.timeline.block_ranges:
+            for s_l, _e_l, block in self.timeline.block_ranges:
                 if block is anchor_block:
-                    b_height = max(1, e_l - s_l)
+                    b_height = max(1, _e_l - s_l)
                     target_start = s_l + min(intra_offset, b_height - 1)
                     new_offset = total_tl_rows - viewport_height - target_start
                     self.scroll_offset = max(0, min(max_offset, new_offset))
@@ -407,7 +407,7 @@ class FullscreenLayout:
         # 2. 提取对话轮次起点映射（User Turn Start Bookmarks）
         self._turn_mark_rows = {}
         if hasattr(self.timeline, "block_ranges") and N > 1:
-            for s_l, e_l, block in self.timeline.block_ranges:
+            for s_l, _e_l, block in self.timeline.block_ranges:
                 if getattr(block, "kind", "") == "user":
                     y_mark = min(V - 1, max(0, round(s_l * (V - 1) / (N - 1))))
                     if y_mark not in self._turn_mark_rows:
@@ -479,6 +479,7 @@ class FullscreenLayout:
         return result
 
     def render(self, width: int) -> list[Text]:
+        anchor = self._reading_anchor()
         # 1. 检查是否有激活的独占模态浮层（Pi 独占提示框规范）
         has_active_overlay = False
         overlay_rows_count = 0
@@ -502,19 +503,17 @@ class FullscreenLayout:
         if has_active_overlay:
             dock_rows = overlay_rows_count
             viewport_height = max(1, total_height - dock_rows)
-            content_w = max(20, width - 1)
+            content_w = max(1, width - 1)
             all_tl_rows = self.timeline.render(content_w)
             total_tl_rows = len(all_tl_rows)
-            if total_tl_rows <= viewport_height:
-                all_tl_rows = self.timeline.render(width)
-                total_tl_rows = len(all_tl_rows)
-                content_w = width
 
             self._cached_tl_rows = all_tl_rows
             self._cached_width = content_w
             self._cached_dock_rows = dock_rows
             self._cached_viewport_height = viewport_height
 
+            self._keep_reading_anchor(anchor, viewport_height)
+            self._cached_block_ranges = list(getattr(self.timeline, "block_ranges", []))
             max_offset = max(0, total_tl_rows - viewport_height)
             self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
 
@@ -560,14 +559,11 @@ class FullscreenLayout:
         # 4. 计算消息视口物理高度
         viewport_height = max(1, total_height - dock_rows)
 
-        # 5. 渲染全部时间线行：若超出视口高度，自动让出 1 列给滚动条（3.A）
-        content_w = max(20, width - 1)
+        # 5. 渲染全部时间线行（Single-Pass Viewport Render, D186）
+        # 利用上一帧的 _show_scrollbar 状态预判宽度，避免每帧反复二次重绘摧毁 TimelineRenderCache
+        content_w = max(1, width - 1)
         all_tl_rows = self.timeline.render(content_w)
         total_tl_rows = len(all_tl_rows)
-        if total_tl_rows <= viewport_height:
-            all_tl_rows = self.timeline.render(width)
-            total_tl_rows = len(all_tl_rows)
-            content_w = width
 
         # 保存视口几何快照（供鼠标坐标投影与 O(1) 偏移计算）
         self._cached_tl_rows = all_tl_rows
@@ -576,6 +572,8 @@ class FullscreenLayout:
         self._cached_viewport_height = viewport_height
 
         # 6. 边界约束 scroll_offset
+        self._keep_reading_anchor(anchor, viewport_height)
+        self._cached_block_ranges = list(getattr(self.timeline, "block_ranges", []))
         max_offset = max(0, total_tl_rows - viewport_height)
         self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
 
@@ -630,6 +628,31 @@ class FullscreenLayout:
         )
 
         return view_rows + completion_rows + ed_rows + st_rows
+
+    def _reading_anchor(self) -> tuple[Any | None, int, int] | None:
+        if self.scroll_offset <= 0 or not self._cached_tl_rows or self._cached_viewport_height <= 0:
+            return None
+        start = max(0, len(self._cached_tl_rows) - self._cached_viewport_height - self.scroll_offset)
+        ranges = self._cached_block_ranges or getattr(self.timeline, "block_ranges", [])
+        for begin, end, block in ranges:
+            if begin <= start < end:
+                return block, start - begin, start
+        return None, 0, start
+
+    def _keep_reading_anchor(
+        self, anchor: tuple[Any | None, int, int] | None, viewport_height: int,
+    ) -> None:
+        if anchor is None:
+            return
+        block, intra, old_start = anchor
+        start = old_start
+        if block is not None:
+            for begin, end, current in getattr(self.timeline, "block_ranges", []):
+                if current is block:
+                    start = begin + min(intra, max(0, end - begin - 1))
+                    break
+        maximum = max(0, len(self._cached_tl_rows) - viewport_height)
+        self.scroll_offset = max(0, min(maximum, len(self._cached_tl_rows) - viewport_height - start))
 
     def handle_input(self, key: Key) -> bool:
         width = max(1, self.terminal.columns)
@@ -754,7 +777,7 @@ class FullscreenLayout:
             if is_real_drag and self._selection is not None:
                 # 拖拽划选完成：提取纯净文本写入剪贴板
                 s_line, s_col, e_line, e_col = self._selection
-                lines = self._cached_tl_rows or self.timeline.render(width)
+                lines = self._cached_tl_rows or self.timeline.render(max(1, width - 1))
                 clean_text = extract_clean_selection(lines, s_line, s_col, e_line, e_col)
                 if clean_text.strip():
                     copy_to_system_clipboard(clean_text)
@@ -878,10 +901,8 @@ class FullscreenApp(InlineApp):
         """幂等恢复终端至主屏幕。"""
         if not self._restored:
             self._restored = True
-            try:
+            with contextlib.suppress(Exception):
                 self.terminal.write(FULLSCREEN_CLEANUP)
-            except Exception:
-                pass
 
     def _park_cursor(self) -> None:
         """在备用屏模式下停用光标下移（因为备用屏退出后终端自动恢复原位）。"""
@@ -907,10 +928,9 @@ class FullscreenApp(InlineApp):
             return
 
         # 视口滚动快捷键与鼠标交互事件拦截
-        if key.name in ("wheel_up", "wheel_down", "pageup", "pagedown", "mouse_down", "mouse_drag", "mouse_up"):
-            if self.root.handle_input(key):
-                self.screen.request_render(force=True)  # ★ 按下/拖拽/释放/滚轮即时响应（下一 tick 单帧合并，D181）
-                return
+        if key.name in ("wheel_up", "wheel_down", "pageup", "pagedown", "mouse_down", "mouse_drag", "mouse_up") and self.root.handle_input(key):
+            self.screen.request_render(force=True)  # ★ 按下/拖拽/释放/滚轮即时响应（下一 tick 单帧合并，D181）
+            return
 
         super()._dispatch(key)
 

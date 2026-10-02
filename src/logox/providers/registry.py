@@ -6,7 +6,7 @@
 为什么它不 import ``logox.config``
 ---------------------------------
 ``providers/`` 是 L5（最底层），``config/`` 属于装配侧。若在这里 import 配置模型，
-就产生了"适配层反向依赖上层"的结构（ARCHITECTURE §1.2 规则 R1）。因此这里的入参是
+就产生了「适配层反向依赖上层」的结构（ARCHITECTURE §1.2 规则 R1）。因此这里的入参是
 :class:`ProviderSpec`——一个由 L2 装配根从 ``ProviderInstanceConfig`` 翻译过来的、
 **只包含适配器真正需要的那几个字段**的模型。
 
@@ -22,7 +22,7 @@ import os
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from logox.errors import ErrorCategory, MissingApiKeyError, UnknownProviderError
 from logox.providers.anthropic import AnthropicProvider
@@ -43,6 +43,7 @@ __all__ = [
     "ProviderRegistry",
     "ProviderSpec",
     "build_provider",
+    "is_keyless",
     "merge_spec",
     "resolve_api_key",
 ]
@@ -52,8 +53,8 @@ _FROZEN = ConfigDict(frozen=True, extra="forbid")
 #: 不需要鉴权的端点（Ollama / LM Studio）用的占位密钥。
 #:
 #: **为什么必须有它**：官方 SDK 的 ``api_key`` 参数**不能为空**——``AsyncOpenAI(api_key=None)``
-#: 会回退去读 ``OPENAI_API_KEY``，读不到就直接抛错。于是"本地端点不需要密钥"这件事
-#: 会变成"本地端点连不上"，而且报的是 ``auth`` 类错误，指向性极差（实测踩到）。
+#: 会回退去读 ``OPENAI_API_KEY``，读不到就直接抛错。于是「本地端点不需要密钥」这件事
+#: 会变成「本地端点连不上」，而且报的是 ``auth`` 类错误，指向性极差（实测踩到）。
 #: 这里传一个显式占位符：既满足 SDK 的形参要求，又不会让人误以为真的配了密钥。
 NO_AUTH_PLACEHOLDER = "not-needed"
 
@@ -76,16 +77,38 @@ class ProviderSpec(BaseModel):
     models: tuple[str, ...] = ()
     context_window: int | None = None
     #: 首次使用时默认选中的模型（留空 = 取 ``models[0]``）。
-    #: 存在的理由：`models` 只保证"都在这一行"，不保证**第一个就是想要的**——
-    #: 而"默认选哪个"是要按能力挑的（例如必须选多模态那个，见 deepseek 预设）。
+    #: 存在的理由：`models` 只保证「都在这一行」，不保证**第一个就是想要的**——
+    #: 而「默认选哪个」是要按能力挑的（例如必须选多模态那个，见 deepseek 预设）。
     default_model: str = ""
+    model_windows: dict[str, int] = Field(default_factory=dict)
+
+    def window_for(self, model_id: str) -> int | None:
+        """查指定模型的静态上下文窗口。按精确名 -> :latest 规范化 -> context_window 兜底。"""
+        if model_id in self.model_windows:
+            return self.model_windows[model_id]
+        clean_id = model_id.removesuffix(":latest")
+        if clean_id in self.model_windows:
+            return self.model_windows[clean_id]
+        tagged_id = f"{clean_id}:latest"
+        if tagged_id in self.model_windows:
+            return self.model_windows[tagged_id]
+
+        # 若是免密本地端点（如 Ollama / LM Studio）或未限定 models，使用 context_window 兜底
+        if not self.api_key_env or not self.models:
+            return self.context_window
+
+        # 远端云端厂商且声明了限定模型列表时，未知模型返回 None（不为未知模型编造窗口）
+        known = set(self.models)
+        if model_id in known or clean_id in known or tagged_id in known:
+            return self.context_window
+        return None
 
 
 #: 开箱可用的 Provider 预设。
 #:
 #: ``models`` 是**起步建议，不是穷举**——厂商上新速度远快于本项目发版速度，
 #: 因此它只用来让 ``/model`` 在首次启动时有事可展示，用户配置里的 ``models``
-#: 会合并进来。真正的"有哪些模型"应由厂商的 ``/v1/models`` 端点回答（需要联网，
+#: 会合并进来。真正的「有哪些模型」应由厂商的 ``/v1/models`` 端点回答（需要联网，
 #: 见 MODULE_providers 待办）。
 BUILTIN_SPECS: dict[str, ProviderSpec] = {
     "openai-compatible": ProviderSpec(
@@ -104,7 +127,7 @@ BUILTIN_SPECS: dict[str, ProviderSpec] = {
         # 取值依据：**本机真实端点实测**（2026-09，带真密钥打 `https://api.deepseek.com`）。
         #
         # 这些名字曾经是 `deepseek-chat` / `deepseek-reasoner`——那是**已经退役的
-        # 旧名**，而这里的预设表当初只是"让 /model 首次启动时有东西可展示"的占位，
+        # 旧名**，而这里的预设表当初只是「让 /model 首次启动时有东西可展示」的占位，
         # 从来没核对过。用户一眼就看出来了（D67）。
         #
         # 实测结论（**逐个发一张纯色 PNG 让它说颜色**，这比读文档硬）：
@@ -118,7 +141,7 @@ BUILTIN_SPECS: dict[str, ProviderSpec] = {
         # 因此预设表**刻意大于 `/models` 的返回**。
         #
         # ⚠️ 顺序：**先列不会过期的稳定名**。名字里带 `expires-on-<日期>` 的模型
-        # 到期后就会消失（那正是它名字的意思），把它摆在"第一个"等于给预设表埋了一颗
+        # 到期后就会消失（那正是它名字的意思），把它摆在「第一个」等于给预设表埋了一颗
         # 定时炸弹。它的地位由下面的 `default_model` 表达——**默认选它，但列表按稳定性排**。
         models=(
             "deepseek-flash",
@@ -128,7 +151,7 @@ BUILTIN_SPECS: dict[str, ProviderSpec] = {
         # 上下文长度 **1M**（此前写的 65_536 是旧模型的数字）
         context_window=1_048_576,
         #: 默认模型用**多模态**那个：Logox 未来要能贴图（M5+），
-        #: 而默认选中一个看不了图的模型会让"贴图"这条路悄悄断掉。
+        #: 而默认选中一个看不了图的模型会让「贴图」这条路悄悄断掉。
         default_model="deepseek-v4.1-flash-expires-on-0910",
     ),
     "ollama": ProviderSpec(
@@ -136,7 +159,12 @@ BUILTIN_SPECS: dict[str, ProviderSpec] = {
         kind="openai_compat",
         base_url="http://127.0.0.1:11434/v1",
         # 本地端点不需要密钥：留空即可，不要逼用户导出假变量
+        # ⚠️ 这里的清单只是**首启占位**：真实清单以本机 ``/v1/models`` 为准（D188）。
+        #    拉了什么模型是用户的选择，预设表注定过期（比如你拉的是 qwen3.8:27b，
+        #    而下面写的是 qwen3:8b）——所以有缓存时**不再与它合并**。
         models=("qwen3:8b", "llama3.2"),
+        # 安全基线窗口（32K）：本地端点未查到时的默认安全阈值，防止沿用 1M 导致压缩失效
+        context_window=32_768,
     ),
     "lm-studio": ProviderSpec(
         name="lm-studio",
@@ -168,16 +196,30 @@ def merge_spec(base: ProviderSpec, override: ProviderSpec) -> ProviderSpec:
     return ProviderSpec(**data)
 
 
+def is_keyless(spec: ProviderSpec) -> bool:
+    """该端点是否**免鉴权**（本地 Ollama / LM Studio 就是这种）。
+
+    为什么判据只有 ``api_key_env == ""``、**不再新增一个 ``local`` 字段**：
+    两者在语义上完全等价（见 :func:`resolve_api_key` 对 ``None`` 的定义），
+    而同一个意思有两种说法时，两种说法**必然会漂移**（改了一个忘了另一个）。
+
+    它的用处有两个：① ``/model`` 的候选**以端点为准**（免鉴权端点的 ``/v1/models``
+    就是权威全集，不与预设表合并）；② 启动时可以**零成本**抓一次清单
+    （不需要密钥、不等登录）。
+    """
+    return not spec.api_key_env
+
+
 def resolve_api_key(spec: ProviderSpec, environ: Mapping[str, str] | None = None) -> str | None:
     """从环境变量取密钥。
 
     * ``api_key_env`` 为空 → ``None``，表示**该端点不需要密钥**
     * 变量缺失或只有空白 → 抛 :class:`MissingApiKeyError`（**消息里只有变量名**）
 
-    选择"抛"而不是"返回 None 让厂商去 401"：未配密钥是最常见的首次启动问题，
+    选择「抛」而不是「返回 None 让厂商去 401」：未配密钥是最常见的首次启动问题，
     晚一步报错就要多花一轮网络往返，且错误信息来自厂商、指向性差。
 
-    ``None`` 的语义是"无需鉴权"，**不是**"忘了配"——后一种情况上面已经抛了。
+    ``None`` 的语义是「无需鉴权」，**不是**"忘了配"——后一种情况上面已经抛了。
     """
     if not spec.api_key_env:
         return None
@@ -191,7 +233,7 @@ def resolve_api_key(spec: ProviderSpec, environ: Mapping[str, str] | None = None
 class MissingKeyProvider:
     """**还没登录**时的占位适配器：一被调用就返回一条可行动的错误事件。
 
-    它存在的唯一理由是让"首次使用"能走通。没有它的话，`logox` 会在启动期
+    它存在的唯一理由是让「首次使用」能走通。没有它的话，`logox` 会在启动期
     因为缺密钥而拒绝服务，于是**用户根本没有机会执行 `/login`**——
     先有鸡还是先有蛋（实测踩到）。
 
@@ -199,20 +241,28 @@ class MissingKeyProvider:
 
     * ``list_models()`` **照常工作**（读本地预设表），因此 `/model` 在登录前也能列候选；
     * ``stream()`` 不发网络请求，立刻产出一条 ``ProviderErrorEvent(category=AUTH)``，
-      消息里给出**环境变量名**与"运行 /login"这个下一步；
-    * 它**不是**静默失败：混进来的调用一定会在界面上留下一条错误，不会被当成"模型没说话"。
+      消息里给出**环境变量名**与「运行 /login」这个下一步；
+    * 它**不是**静默失败：混进来的调用一定会在界面上留下一条错误，不会被当成「模型没说话」。
     """
 
     def __init__(self, spec: ProviderSpec) -> None:
         self._spec = spec
         self.name = spec.name
-        #: 供界面判断"当前还没登录"（装配根与 `/debug` 用它给提示）
+        #: 供界面判断「当前还没登录」（装配根与 `/debug` 用它给提示）
         self.is_placeholder = True
         self.missing_env = spec.api_key_env
 
+    def window_for(self, model_id: str) -> int | None:
+        return self._spec.window_for(model_id)
+
     def list_models(self) -> list[ModelInfo]:
         return [
-            ModelInfo(id=model_id, provider=self.name, supports_thinking=False, context_window=self._spec.context_window)
+            ModelInfo(
+                id=model_id,
+                provider=self.name,
+                supports_thinking=False,
+                context_window=self.window_for(model_id),
+            )
             for model_id in self._spec.models
         ]
 
@@ -239,7 +289,7 @@ def build_provider(
     raw_stream: RawStream | None = None,
     price_table: PriceTable | None = None,
 ) -> Provider:
-    """按 ``kind`` 构造适配器实例。**这里是唯一知道"有哪些适配器"的地方。**
+    """按 ``kind`` 构造适配器实例。**这里是唯一知道「有哪些适配器」的地方。**
 
     两个适配器的构造签名刻意保持一致，因此这里不需要 if/else 去凑参数
     （只按 ``kind`` 选类）。
@@ -251,6 +301,7 @@ def build_provider(
         raw_stream=raw_stream,
         price_table=price_table,
         context_window=spec.context_window,
+        model_windows=dict(spec.model_windows),
         models=list(spec.models),
     )
 
@@ -289,6 +340,14 @@ class ProviderRegistry:
     def names(self) -> list[str]:
         return sorted(self._specs)
 
+    def keyless_names(self) -> list[str]:
+        """**免鉴权端点**的名字（见 :func:`is_keyless`）。
+
+        排序与 :meth:`names` 一致，因此提示文字与测试断言都是稳定的
+        （否则每次启动刷新顺序不同，日志与用例会飘）。
+        """
+        return sorted(name for name, spec in self._specs.items() if is_keyless(spec))
+
     def spec(self, name: str) -> ProviderSpec:
         try:
             return self._specs[name]
@@ -299,12 +358,19 @@ class ProviderRegistry:
         """该 Provider 的首选模型（供 ``config.provider.model`` 为空时兜底）。
 
         优先用预设里显式声明的 ``default_model``——"列表里的第一个"只是排版顺序，
-        而"默认选哪个"通常是按**能力**挑的（见 deepseek 预设为什么选多模态那个）。
+        而「默认选哪个」通常是按**能力**挑的（见 deepseek 预设为什么选多模态那个）。
         """
         spec = self.spec(name)
         if spec.default_model:
             return spec.default_model
         return spec.models[0] if spec.models else None
+
+    def window_for(self, name: str, model_id: str) -> int | None:
+        """查指定 Provider 下指定模型的静态上下文窗口。纯同步无网络。"""
+        try:
+            return self.spec(name).window_for(model_id)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------ #
     # 实例化与列举
@@ -320,7 +386,7 @@ class ProviderRegistry:
     ) -> Provider:
         """构造适配器。``api_key`` 显式传入时不读环境变量（测试用）。
 
-        :param allow_missing_key: **缺密钥时不要抛异常**，改成一个"占位适配器"——
+        :param allow_missing_key: **缺密钥时不要抛异常**，改成一个「占位适配器」——
             它一被调用就返回一条**可行动**的错误事件（"请运行 /login"）。
             这是首次使用能走通的前提：没有它，`logox` 会在启动期就拒绝服务，
             **用户根本没机会执行 `/login`**（实测踩到的先有鸡还是先有蛋）。

@@ -107,7 +107,7 @@ def render_tool_summary(
     """折叠态的**单行摘要**（D13 核心：一行说清"做了什么、成没成、多久"）。"""
     glyph = {
         "pending": glyphs.get("pending", "·"),
-        "running": glyphs.get("running", "⏺"),
+        "running": glyphs.get("running", "✻"),
         "ok": glyphs.get("success", "✓"),
         "error": glyphs.get("error", "✗"),
         "denied": glyphs.get("denied", "⊘"),
@@ -158,7 +158,7 @@ def render_tool_card(
     展开后一个字都不写 —— 用户展开完就找不到收回的路，合理地以为"关不掉、没这个快捷键"。
 
     状态用**符号 + 前景色**表达，**不用底色**（D81，用户裁定）。
-    运行中 / 成功 / 失败各有一个字形（``⏺``/``✓``/``✗``）与颜色，
+    运行中 / 成功 / 失败各有一个字形（``✻``/``✓``/``✗``）与颜色，
     扫一眼就知道哪些还在跑；展开的内容用**缩进**挂在摘要下。
 
     ⚠️ **为什么放弃底色**（D80 曾经做过，已撤销）：那些底色与正文背景的对比度

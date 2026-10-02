@@ -505,7 +505,14 @@ def _scan_preferred(text: str, spans: list[tuple[int, int, bool]], start: int, h
 
     ★ 保护 2（CHANGE-052）：**别把标识符切成两半**。
     若硬断落点恰在标识符内部，就回退到它的开头。回退时连反引号与千分位数字一起吞。
+    ★ 保护 3（2026-09-29）：**剩余内容整体放得下时，不做"更漂亮"的断行**。
+    否则会凭空造出孤字行：``…需重启 logox 生效`` 被切成 ``…需重启 logox`` + ``生效``
+    （实测：前一行只用了 54/100 格，却把 4 格的中文推到了下一行）。
+    这正是用户反复报的"摘要有莫名其妙的换行"里**最后一个还没修掉的根因**。
     """
+    if hard >= len(text):
+        # 从 start 到全文末尾都在预算内 ⇒ 一次吃完就是最优，没有"更好的断点"可言。
+        return hard
     if hard - start < 4:
         return hard
     floor = max(start + 1, hard - max(8, (hard - start) // 4))

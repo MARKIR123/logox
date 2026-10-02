@@ -421,7 +421,13 @@ async def _chat_main(
 
     # ---- 装配 Provider ----
     overrides = {
-        name: ProviderSpec(name=name, **instance.model_dump(include={"kind", "base_url", "api_key_env", "models"}, exclude_unset=True))
+        name: ProviderSpec(
+            name=name,
+            **instance.model_dump(
+                include={"kind", "base_url", "api_key_env", "models", "context_window", "model_windows"},
+                exclude_unset=True,
+            ),
+        )
         for name, instance in config.providers.items()
     }
     registry = ProviderRegistry.with_builtins(overrides)

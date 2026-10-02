@@ -236,6 +236,8 @@ class Provider(Protocol):
 
     def stream(self, request: ChatRequest) -> AsyncIterator[ProviderEvent]: ...
 
+    def window_for(self, model_id: str) -> int | None: ...
+
 
 # --------------------------------------------------------------------------- #
 # 工具调用装配
@@ -249,13 +251,22 @@ class ToolCallBuffer:
     因此必须在这里拼完再交给上层。装配失败的调用**绝不半成品外泄**（E-2）。
     """
 
-    __slots__ = ("arguments", "call_id", "index", "name")
+    __slots__ = ("_fragments", "call_id", "index", "name")
 
     def __init__(self, index: int, *, call_id: str = "", name: str = "") -> None:
         self.index = index
         self.call_id = call_id
         self.name = name
-        self.arguments = ""
+        self._fragments: list[str] = []
+
+    @property
+    def arguments(self) -> str:
+        """完整参数文本；分片到齐后再合并，避免每次追加复制全部前缀。"""
+        return "".join(self._fragments)
+
+    @arguments.setter
+    def arguments(self, value: str) -> None:
+        self._fragments = [value] if value else []
 
     def merge(self, *, call_id: str | None = None, name: str | None = None, fragment: str | None = None) -> None:
         """并入一个分片。
@@ -269,7 +280,7 @@ class ToolCallBuffer:
         if name:
             self.name = name
         if fragment:
-            self.arguments += fragment
+            self._fragments.append(fragment)
 
     def finalize(self) -> ToolCallEvent | dict[str, str]:
         """产出 :class:`ToolCallEvent`；参数无法解析时**返回错误描述**而不是半成品。"""

@@ -43,6 +43,21 @@ rehydrate_max_chars = 2000        # 每个文件最多读回多少字符
 
 project_memory_enabled = true     # 关掉则完全不读项目 LOGOX.md
 
+[anamnesis]
+enabled = true
+memory_enabled = true
+idle_seconds = 1800
+sleep_start = "00:00"
+sleep_end = "08:00"
+provider = "ollama"
+model = ""                       # Explicit local model; no cloud fallback.
+request_timeout_s = 180.0        # 入梦连续无模型数据期限，不是请求总时长
+nap_max_steps = 4
+sleep_max_steps = 64
+user_archive_tokens = 800
+project_archive_tokens = 1600
+prompt_memory_max_ratio = 0.05
+
 [shell]
 backend = "auto"                  # auto | gitbash | wsl | powershell（D19）
 timeout_s = 120.0
@@ -84,7 +99,7 @@ layout = "auto"                   # auto | dual | single
 fullscreen = false
 sidebar_width = 32
 diff_context_lines = 3
-stream_fps = 10
+stream_fps = 30
 show_reasoning = "collapsed"      # collapsed | expanded | hidden（D31）
 icon_set = "unicode"              # unicode | ascii | nerd
 animations = true

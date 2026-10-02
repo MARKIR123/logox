@@ -104,8 +104,6 @@ class MessageMeta(BaseModel):
 
     model_config = _FROZEN
 
-    created_at: float | None = None
-    token_estimate: int | None = None
     #: 这条消息从哪来：正常会话 / 压缩产物 / 钩子注入
     source: Literal["session", "compaction", "hook"] = "session"
     turn_summary: str | None = None

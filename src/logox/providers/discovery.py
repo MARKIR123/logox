@@ -33,11 +33,18 @@ from typing import Any
 
 from logox.providers.base import ModelInfo, Provider
 
-__all__ = ["DEFAULT_TIMEOUT_S", "DiscoveryResult", "discover_models"]
+__all__ = ["DEFAULT_TIMEOUT_S", "LOCAL_TIMEOUT_S", "DiscoveryResult", "discover_models", "merge_models"]
 
 #: 抓取超时。**故意比请求超时短得多**：这是登录流程里的一步，
 #: 用户站在那儿等着；抓不到就用预设表，不值得让他等 2 分钟。
 DEFAULT_TIMEOUT_S = 12.0
+
+#: **本地（免鉴权）端点**的抓取超时（D188）。
+#:
+#: 比 `DEFAULT_TIMEOUT_S` 短得多，因为两类端点的"慢"含义完全不同：
+#: 云端慢 = 网络抖动，值得等；本机慢 = **服务根本没在跑**，等下去只是白等
+#: （连接被拒在毫秒级就返回了，真等满 3 秒说明它确实不可达）。
+LOCAL_TIMEOUT_S = 3.0
 
 
 @dataclass

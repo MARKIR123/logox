@@ -1,4 +1,4 @@
-"""双水位线上下文修剪与无损换页压缩引擎 (Compaction Engine)。
+"""双水位线上下文修剪与历史摘要压缩引擎 (Compaction Engine)。
 
 实现机制：
 1. 双水位线防颠簸 (High/Low Watermark)：
@@ -14,17 +14,20 @@
    - 锁定 System + LOGOX.md + 首轮任务目标；
    - 锁定最近 K 轮对话尾部窗口；
    - 中间历史平铺追加至 FoldedEpoch 列表，一步直达，杜绝指针套娃。
+4. 极小窗口：所有历史轮次只保留摘要，工具原文归档；仍超高水位时本地汇总。
+   - 当前轮次与系统提示保持，历史首尾原文锚点取消；失败保留摘要并暂停。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 from logox.context.storage import SessionTranscriptWriter
-from logox.context.tokens import TokenEstimator, estimate_message_tokens
+from logox.context.tokens import TokenEstimator
 from logox.kernel.events import Usage
 from logox.kernel.messages import (
     Message,
@@ -43,36 +46,81 @@ __all__ = [
     "FoldedEpoch",
     "context_tokens_of",
     "split_turn_spans",
+    "INDEX_MARKER",
+    "MEMO_MARKER",
+    "TRUNCATE_MARKER",
+    "is_index_message",
+    "format_messages_for_summary",
+    "MEMO_SYSTEM_PROMPT",
 ]
 
 
-#: 归档索引消息的**首行标记**。🩸 单一事实来源（D156）：
-#: `_render_index()` 用它渲染，`HierarchicalContextBuilder` 用它**认出头部的末尾**，
-#: `Compactor._is_index_message()` 用它把**旧索引**从保留的前缀里剔掉。
-#:
-#: ⚠️ **判据是"文本以它开头"，不是"文本包含它"**（CHANGE-052 实测修正）。
-#:
-#: 为什么必须收紧：新结构下折叠区**逐字保留用户的提问**，而用户（或助手）
-#: 引用文档时**极易在正文里出现这个词** —— 本会话就有一轮把索引示例贴进来问，
-#: 于是那条 user 消息的正文里带着 `[历史归档索引]`。
-#: 若用"包含"判定，`_folded_head()` 会**提前**停在它那里 ⇒ 缓存前缀被截短 ⇒
-#: 下一轮 `covered` 前进过多 ⇒ **中间那段折叠对被静默丢掉**
-#: （与 F-53 是同一类"看起来正常、实际失忆"的缺陷）。
+#: 归档索引消息的首行标记（单一事实来源）。
 INDEX_MARKER = "[历史归档索引]"
+#: 阶段 3 全局工作状态备忘录的首行标记。
+MEMO_MARKER = "[历史全局工作状态备忘录]"
+#: 旧会话兼容标记：当前压缩不再生成机械硬截断。
+TRUNCATE_MARKER = "[安全机械硬截断]"
+
+#: 阶段 3 全局工作状态备忘录系统提示词。
+MEMO_SYSTEM_PROMPT = """你是一个专业的代码与会话上下文压缩引擎。
+你的任务是将提供的早期历史会话（包含用户的核心目标、长提问、报错信息以及助手的操作摘要）提炼为一份精简的 Markdown 格式【历史全局工作状态备忘录】。
+
+请严格遵循以下结构输出，不要输出任何多余的寒暄或前言后语：
+## 1. 核心目标与技术背景
+- 阐明用户最初始的核心任务、要解决的问题以及项目整体背景。
+
+## 2. 已完成的关键技术决策与代码修改清单
+- 列出历史上已确认的核心架构决定、修改/创建的文件路径、修改的核心函数名与修复的 Bug。
+
+## 3. 当前上下文已知的重要事实与参数
+- 记录会话中确立的关键环境变量、配置项、测试结果或重要技术约束。
+
+## 4. 当前未解决的遗留问题与待办清单
+- 列出当前尚未完成的任务、待验证项或遗留问题。
+
+字数要求：紧凑精炼，突出重点，避免冗长废话。"""
 
 
 def is_index_message(message: Message) -> bool:
-    """这条消息是不是**归档索引**？
+    """这条消息是不是归档索引、全局状态备忘录或硬截断标记？
 
-    判据 = **有某个文本块以 `INDEX_MARKER` 开头**（不是"包含"）。
-    索引由 `_render_index()` 产出，其第一行就是该标记；而正文里的**引用**
-    总会带前缀（`▎ │ `、引号、说明文字……）⇒ 不会误判。
+    判据 = 有某个文本块以 INDEX_MARKER、MEMO_MARKER 或 TRUNCATE_MARKER 开头。
     """
     for block in message.blocks:
         text = getattr(block, "text", None)
-        if isinstance(text, str) and text.startswith(INDEX_MARKER):
+        if isinstance(text, str) and (
+            text.startswith(INDEX_MARKER)
+            or text.startswith(MEMO_MARKER)
+            or text.startswith(TRUNCATE_MARKER)
+        ):
             return True
     return False
+
+
+def format_messages_for_summary(messages: list[Message]) -> str:
+    """把需要被压缩的历史消息序列格式化为供 LLM 阅读提炼的纯文本转录。"""
+    lines: list[str] = []
+    for msg in messages:
+        role_label = {"user": "用户", "tool": "工具返回"}.get(msg.role, "助手")
+        text = msg.text.strip()
+        if any(text.startswith(marker) for marker in (INDEX_MARKER, MEMO_MARKER, TRUNCATE_MARKER)):
+            if text:
+                lines.append(f"【历史载体】: {text}")
+            continue
+        summary = getattr(msg.meta, "turn_summary", "") if msg.meta else ""
+        # Users remain verbatim; assistant summaries are the contract-defined carrier.
+        if summary and msg.role == "assistant":
+            lines.append(f"【{role_label}】: {text if MEMO_MARKER in text else summary}")
+        elif text:
+            lines.append(f"【{role_label}】: {text}")
+        for block in msg.blocks:
+            if type(block).__name__ == "ToolResultBlock":
+                content = getattr(block, "content", "")
+                pointer = getattr(block, "blob_path", None)
+                if content or pointer:
+                    lines.append(f"【工具返回 {block.id}】: {content}" + (f"\n归档指针: {pointer}" if pointer else ""))
+    return "\n\n".join(lines)
 
 
 def context_tokens_of(usage: Usage | None) -> int | None:
@@ -94,14 +142,34 @@ def context_tokens_of(usage: Usage | None) -> int | None:
 
 @dataclass
 class FoldedEpoch:
-    """单个已归档历史区间的索引记录。"""
+    """单个已归档历史区间的**账目**（审计线索：报告 / 压缩现场 dump）。
+
+    ★ D187：这里**只记不可推导的事实**（折了哪些轮、对应哪些行），
+    **不记载荷的副本** —— 原先的 ``summary`` 字段已删除。
+
+    为什么删 `summary`（它的来历与三重缺陷）
+    ----------------------------------------
+    它**曾经是模型可见的载体**：``CHANGE-052`` 之前，归档索引会把 epoch 摘要
+    渲染进去，所以压缩必须把摘要存在账本里。改成"逐轮 ``user`` 逐字 +
+    ``assistant`` 摘要"之后，摘要**逐条挂在消息上**（且带 ``（已归档 · 行 A~B）``
+    前缀）⇒ 账本这份成了副本：
+
+    1. **有损**：拼接用 ``；``，而摘要**自身就含 ``；``**（实测 60 轮 / 115 个分号）
+       ⇒ 切不回各轮；
+    2. **是子集而非超集**：缺轮号与行号（消息上每条都有）；
+    3. **必然漂移且无人能发现**：两份不一致时没有机制判定谁对
+       —— 同类问题见 ``CHANGE-052`` 删掉索引里的 epoch 汇总。
+
+    ⚠️ 这也解释了**为什么没有 ``summary_count``**：每条折叠产物的 assistant
+    都必带 ``turn_summary``（含兜底与"（本轮无助手回复）"）⇒ 条数恒等于
+    ``to_turn - from_turn + 1``，是**可推导**的，存下来又是副本。
+    """
 
     epoch_id: int
     from_turn: int
     to_turn: int
     start_line: int
     end_line: int
-    summary: str
 
 
 @dataclass
@@ -122,6 +190,8 @@ class CompactionResult:
     #: 折叠时是否用了**确定性兜底摘要**（某几轮缺 `turn_summary`）——
     #: 对应 `CompactionFinished.degraded`（"摘要失败 → 降级")
     degraded: bool = False
+    #: 最终策略：none / prune / prune+fold / summary-only / local-memo / archive-blocked。
+    strategy: str = "prune"
 
 
 def split_turn_spans(messages: list[Message]) -> list[tuple[int, int]]:
@@ -248,10 +318,10 @@ class Compactor:
         # 0 = 关闭。
         rehydrate_files: int = 5,
         rehydrate_max_chars: int = 2000,
-        estimator: Optional[TokenEstimator] = None,
+        estimator: TokenEstimator | None = None,
         #: ★ D158：κ 的分桶键（`f"{provider}/{model}"`）—— 不同分词器的偏差不能互相污染
         model_key: str = "",
-        transcript_writer: Optional[SessionTranscriptWriter] = None,
+        transcript_writer: SessionTranscriptWriter | None = None,
     ) -> None:
         # ★ D159：水位线计算抽成 `_recompute_watermarks()`，这样 `/model` 换窗口时
         #   可以重算，而不必重建整个 Compactor（同一件事只有一处实现）。
@@ -278,6 +348,7 @@ class Compactor:
         #: 上一次折叠的轮数与是否降级（D156：报告用；每次折叠前重置）
         self._last_folded_turns: int = 0
         self._last_degraded: bool = False
+        self._last_tail_len: int = 0
         self._next_epoch_id = 1
 
     def reset(self) -> None:
@@ -321,7 +392,7 @@ class Compactor:
         """是否跨过高水位线，需要触发压缩。"""
         return current_tokens >= self.high_watermark
 
-    def compact(
+    def _execute_stage1_and_2(
         self,
         messages: list[Message],
         *,
@@ -329,43 +400,41 @@ class Compactor:
         system_prompt: str = "",
         last_usage: Usage | None = None,
         current_tokens: int | None = None,
-    ) -> CompactionResult:
-        """执行压缩修剪流程。
+    ) -> tuple[bool, CompactionResult | None, list[Message], int, int, int, int]:
+        """执行触发判定、阶段 1（工具修剪）与阶段 2（首尾滑动窗口折叠）。
 
-        触发判据（CHANGE-005 裁定 1）：取**真实用量**与**估算**里**较大**的那个。
-
-        为什么不能只信估算：估算器带校准系数且被夹在 ``[0.5, 2.0]`` 里，
-        最坏会**低估一半** —— 而固定 reserve 拦不住“低估一半”。
-        为什么不能只信真实：它是**上一次请求**的数字，比当前上下文少一段
-        （上一轮回答 + 本轮提问）。两者取大，**两个方向都偏保守**。
-
-        注意：**只有触发判据看真实值**。剪完之后的“是否已降到低水位以下”
-        仍用估算 —— 因为真实值描述的是**改动之前**的上下文，改动后就过期了。
-
-        ★ **D158 起**：``current_tokens`` 由 ``TokenLedger`` 给出（**锚点 + 增量**）——
-        精确锚点负责"已经发出去的那一段"，估算只负责锚点之后的新增消息，误差量级从
-        "整个上下文"缩小到"最后几条"。传了就优先用它；没传则保持旧的 ``max(估算, 真实)``
-        （直接使用 Compactor 的调用方与既有单测不受影响）。
+        返回：
+            (is_done, early_result, working_messages, tokens_before, tokens_after, pruned_count, folded_from)
+        若无需压缩或阶段 1 即可满足要求，is_done=True 且 early_result 包含完整返回结果。
         """
-        # 发给 API 的消息中天然不含 ReasoningBlock
         clean_messages = self._strip_reasoning(messages)
-        estimated = self.estimator.estimate_messages(
-            clean_messages, system_prompt=system_prompt, model_key=self.model_key
-        )
+        self._last_degraded = False
+        self._last_folded_turns = 0
         if current_tokens is not None and current_tokens > 0:
-            # ★ D158：锚点式判据（精确已知的一段 + 只估增量），由 TokenLedger 算好传进来
             tokens_before = current_tokens
         else:
+            estimated = self.estimator.estimate_messages(
+                clean_messages, system_prompt=system_prompt, model_key=self.model_key
+            )
             real = context_tokens_of(last_usage)
             tokens_before = max(estimated, real) if real is not None else estimated
 
         if not force and not self.should_compact(tokens_before):
-            return CompactionResult(
-                messages=clean_messages,
-                tokens_before=tokens_before,
-                tokens_after=tokens_before,
-                pruned_count=0,
-                epochs=list(self.epochs),
+            return (
+                True,
+                CompactionResult(
+                    messages=clean_messages,
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_before,
+                    pruned_count=0,
+                    epochs=list(self.epochs),
+                    strategy="none",
+                ),
+                clean_messages,
+                tokens_before,
+                tokens_before,
+                0,
+                0,
             )
 
         pruned_count = 0
@@ -374,27 +443,33 @@ class Compactor:
         # ------------------------------------------------------------------ #
         # 阶段 1：超长工具返回修剪 (Tool Output Pruning)
         # ------------------------------------------------------------------ #
-        working_messages, tool_pruned = self._prune_tool_results(
-            working_messages
-        )
+        working_messages, tool_pruned = self._prune_tool_results(working_messages)
         pruned_count += tool_pruned
 
         tokens_now = self.estimator.estimate_messages(
             working_messages, system_prompt=system_prompt, model_key=self.model_key
         )
 
-        # 如果回落至低水位线以下，阶段 1 即可完成任务（force 模式下继续执行阶段 2 折叠）
         if not force and tokens_now <= self.low_watermark:
-            return CompactionResult(
-                messages=working_messages,
-                tokens_before=tokens_before,
-                tokens_after=tokens_now,
-                pruned_count=pruned_count,
-                epochs=list(self.epochs),
+            return (
+                True,
+                CompactionResult(
+                    messages=working_messages,
+                    tokens_before=tokens_before,
+                    tokens_after=tokens_now,
+                    pruned_count=pruned_count,
+                    epochs=list(self.epochs),
+                    strategy="prune",
+                ),
+                working_messages,
+                tokens_before,
+                tokens_now,
+                pruned_count,
+                0,
             )
 
         # ------------------------------------------------------------------ #
-        # 阶段 2：首尾锚点滑动窗口与分段表追加 (Anchor + Sliding Window)
+        # 阶段 2：逐轮历史折叠与分段表追加 (Sliding Window)
         # ------------------------------------------------------------------ #
         working_messages, window_pruned, folded_from = self._apply_sliding_window(
             working_messages
@@ -405,16 +480,166 @@ class Compactor:
             working_messages, system_prompt=system_prompt, model_key=self.model_key
         )
 
+        return (
+            False,
+            None,
+            working_messages,
+            tokens_before,
+            tokens_after,
+            pruned_count,
+            folded_from,
+        )
+
+    def compact(
+        self,
+        messages: list[Message],
+        *,
+        force: bool = False,
+        system_prompt: str = "",
+        last_usage: Usage | None = None,
+        current_tokens: int | None = None,
+        memo_text: str | None = None,
+        allow_stage3: bool = True,
+    ) -> CompactionResult:
+        """执行压缩修剪流程（同步版本）。
+
+        若经过阶段 1 和阶段 2 之后 Token 占用仍高于 low_watermark，则启动阶段 3：
+        - 若提供了 memo_text，整合为全局工作状态备忘录；
+        - 先使用逐轮摘要；同步入口不发模型请求，超预算交由内核暂停。
+        """
+        is_done, early, working_messages, tokens_before, tokens_after, pruned_count, folded_from = (
+            self._execute_stage1_and_2(
+                messages,
+                force=force,
+                system_prompt=system_prompt,
+                last_usage=last_usage,
+                current_tokens=current_tokens,
+            )
+        )
+        if is_done and early is not None:
+            return early
+
+        strategy = "prune+fold" if folded_from > 0 else "prune"
+        degraded = self._last_degraded
+
+        if allow_stage3 and tokens_after > self.low_watermark:
+            extreme, boundary, archive_ok = self._summary_only_view(self._strip_reasoning(messages))
+            if archive_ok and (boundary > 0 or extreme != self._strip_reasoning(messages)):
+                pruned_count += sum(isinstance(block, ToolResultBlock) and not block.archived for message in messages for block in message.blocks)
+                working_messages, folded_from = extreme, boundary
+                self._last_tail_len = len(self._strip_reasoning(messages)) - boundary
+                tokens_after = self.estimator.estimate_messages(working_messages, system_prompt=system_prompt, model_key=self.model_key)
+                strategy = "summary-only"
+                if tokens_after >= self.high_watermark and memo_text and memo_text.strip():
+                    candidate, _ = self._apply_memo_compaction(working_messages, memo_text, self._last_tail_len, folded_from)
+                    candidate_tokens = self.estimator.estimate_messages(candidate, system_prompt=system_prompt, model_key=self.model_key)
+                    if candidate_tokens < tokens_after:
+                        working_messages, tokens_after, strategy = candidate, candidate_tokens, "local-memo"
+            elif not archive_ok:
+                working_messages, folded_from = self._strip_reasoning(messages), 0
+                tokens_after = self.estimator.estimate_messages(working_messages, system_prompt=system_prompt, model_key=self.model_key)
+                strategy, degraded = "archive-blocked", True
+
         return CompactionResult(
             messages=working_messages,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
             pruned_count=pruned_count,
             epochs=list(self.epochs),
-            folded_from_index=folded_from,
+            folded_from_index=self._source_boundary(messages, folded_from),
             folded_turns=self._last_folded_turns,
-            degraded=self._last_degraded,
+            degraded=degraded,
+            strategy=strategy,
         )
+
+    async def compact_async(
+        self,
+        messages: list[Message],
+        *,
+        force: bool = False,
+        system_prompt: str = "",
+        last_usage: Usage | None = None,
+        current_tokens: int | None = None,
+        memo_summarizer: Any | None = None,
+        allow_stage3: bool = True,
+    ) -> CompactionResult:
+        """执行压缩修剪流程（异步版本，支持模型调用生成阶段 3 备忘录）。"""
+        is_done, early, working_messages, tokens_before, tokens_after, pruned_count, folded_from = (
+            self._execute_stage1_and_2(
+                messages,
+                force=force,
+                system_prompt=system_prompt,
+                last_usage=last_usage,
+                current_tokens=current_tokens,
+            )
+        )
+        if is_done and early is not None:
+            return early
+
+        strategy = "prune+fold" if folded_from > 0 else "prune"
+        degraded = self._last_degraded
+
+        if allow_stage3 and tokens_after > self.low_watermark:
+            extreme, boundary, archive_ok = self._summary_only_view(self._strip_reasoning(messages))
+            if archive_ok and (boundary > 0 or extreme != self._strip_reasoning(messages)):
+                pruned_count += sum(isinstance(block, ToolResultBlock) and not block.archived for message in messages for block in message.blocks)
+                working_messages = extreme
+                folded_from = boundary
+                self._last_tail_len = len(self._strip_reasoning(messages)) - boundary
+                tokens_after = self.estimator.estimate_messages(
+                    working_messages, system_prompt=system_prompt, model_key=self.model_key)
+                strategy = "summary-only"
+                self._last_folded_turns = len(split_turn_spans(messages)) - 1
+                if tokens_after >= self.high_watermark and callable(memo_summarizer):
+                    tail_len = self._last_tail_len
+                    historical = working_messages[:-tail_len] if tail_len else working_messages
+                    tail = working_messages[-tail_len:] if tail_len else []
+                    mandatory_tokens = self.estimator.estimate_messages(tail, system_prompt=system_prompt, model_key=self.model_key)
+                    target_tokens = max(1, self.high_watermark - mandatory_tokens - 128)
+                    # No model can solve a current turn that already consumes the whole budget.
+                    if mandatory_tokens < self.high_watermark:
+                        try:
+                            res = memo_summarizer(historical, target_tokens=target_tokens)
+                            memo_text = await res if asyncio.iscoroutine(res) else res
+                        except Exception as exc:
+                            logger.warning("本地全量历史压缩失败，保留逐轮摘要：%s", exc)
+                            memo_text = None
+                        if isinstance(memo_text, str) and memo_text.strip():
+                            candidate, _ = self._apply_memo_compaction(working_messages, memo_text, tail_len, folded_from)
+                            candidate_tokens = self.estimator.estimate_messages(candidate, system_prompt=system_prompt, model_key=self.model_key)
+                            if candidate_tokens < tokens_after:
+                                working_messages, tokens_after = candidate, candidate_tokens
+                                strategy = "local-memo"
+                        if strategy != "local-memo":
+                            degraded = True
+            elif not archive_ok:
+                # Archive failure must not let stage 2 silently discard tool payloads.
+                working_messages = self._strip_reasoning(messages)
+                folded_from = 0
+                tokens_after = self.estimator.estimate_messages(working_messages, system_prompt=system_prompt, model_key=self.model_key)
+                strategy = "archive-blocked"
+                degraded = True
+
+        return CompactionResult(
+            messages=working_messages,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            pruned_count=pruned_count,
+            epochs=list(self.epochs),
+            folded_from_index=self._source_boundary(messages, folded_from),
+            folded_turns=self._last_folded_turns,
+            degraded=degraded,
+            strategy=strategy,
+        )
+
+    @staticmethod
+    def _source_boundary(messages: list[Message], clean_boundary: int) -> int:
+        """Translate a filtered view boundary back to the original history cursor."""
+        if clean_boundary <= 0:
+            return 0
+        kept = [i for i, message in enumerate(messages)
+                if message.role in ("user", "system") or any(not isinstance(block, ReasoningBlock) for block in message.blocks)]
+        return kept[clean_boundary] if clean_boundary < len(kept) else len(messages)
 
     def _strip_reasoning(self, messages: list[Message]) -> list[Message]:
         """源头阻断：过滤发往模型 API 的所有思考块。"""
@@ -422,7 +647,7 @@ class Compactor:
         for msg in messages:
             new_blocks = [b for b in msg.blocks if not isinstance(b, ReasoningBlock)]
             if new_blocks:
-                res.append(Message(role=msg.role, blocks=new_blocks, meta=msg.meta))
+                res.append(msg.model_copy(update={"blocks": new_blocks}))
             elif msg.role in ("user", "system"):
                 res.append(msg)
         return res
@@ -464,7 +689,7 @@ class Compactor:
         ]
         return set(tool_indices[-self.keep_recent_tool_results :])
 
-    def _prune_tool_results(self, messages: list[Message]) -> Tuple[list[Message], int]:
+    def _prune_tool_results(self, messages: list[Message]) -> tuple[list[Message], int]:
         """把保留窗口之外的旧工具结果换成**摘要 + 索引**。
 
         “摘要”是**确定性节选**（首部 + 尾部），**不是语义摘要** ——
@@ -500,6 +725,10 @@ class Compactor:
                         blob_path = self.writer.save_tool_blob(
                             block.id, block.content, force=True
                         )
+                    if blob_path is None:
+                        # 写盘失败时保留原文，不能把不存在的归档当成可恢复数据。
+                        new_blocks.append(block)
+                        continue
 
                 line_count = len(block.content.splitlines()) or 1
                 byte_size = len(block.content.encode("utf-8", errors="replace"))
@@ -526,7 +755,7 @@ class Compactor:
 
     def _apply_sliding_window(
         self, messages: list[Message]
-    ) -> Tuple[list[Message], int, int]:
+    ) -> tuple[list[Message], int, int]:
         """**逐轮折叠**中间历史：每轮压成 ``[user 全文, assistant 摘要]``（CHANGE-052）。
 
         返回 ``(新消息列表, 被修剪条数, 折叠边界)``。折叠边界是输入列表的下标，
@@ -543,6 +772,9 @@ class Compactor:
         2. **按轮成对** —— 不再是"所有摘要挤在一条索引消息里"，也不再受
            `summaries[:3]` 的数量上限（实测它丢掉了 21 条摘要里的 18 条）；
         3. **工具块整段丢弃** —— 用户裁定"其中的工具调用去掉，这部分信息已经压缩在摘要中"。
+        4. ★ **D187：账本不再记载荷副本** —— 那一版的索引里还有"epoch 摘要汇总"，
+           于是每条摘要同时存在两处（索引里一份、各轮消息上一份）；现已删净，
+           摘要**只在各轮消息上**（`FoldedEpoch.summary` 字段一并删除）。
 
         ⚠️ **两条必须守住的不变量**：
 
@@ -588,16 +820,18 @@ class Compactor:
             folded.extend(pair)
             degraded = degraded or used_fallback
 
-        # 账本（审计线索：报告 / 压缩现场 dump / /debug 用；**不再渲染进索引**）
+        # 账本（审计线索：报告 / 压缩现场 dump 用；**不再渲染进索引**）
+        # ★ D187：**只记区间，不记摘要正文** —— 正文的唯一载体是折叠产出的
+        #   assistant 消息（模型看得到的那一份，带行号前缀）。
         range_start = self.epochs[-1].to_turn + 1 if self.epochs else 1
         self._record_epoch(
             messages[fold_spans[0][0] : fold_spans[-1][1]],
             from_turn=range_start,
             to_turn=range_start + len(fold_spans) - 1,
-            summaries=[m.meta.turn_summary for m in folded if m.meta.turn_summary],
         )
         self._last_folded_turns = len(fold_spans)
         self._last_degraded = degraded
+        self._last_tail_len = len(tail_window)
         # ★ 重读工作集（裁定 4）：必须在 `_render_index()` 之前，索引里要带上它
         self._working_set = self._rehydrate_working_set(
             messages[fold_spans[0][0] : fold_spans[-1][1]]
@@ -613,7 +847,7 @@ class Compactor:
         #   旧实现靠 `_head_anchor()` 顺带保住这段（它返回 `messages[:first_turn_end]`）；
         #   锚点删除后，这份责任必须显式接住。
         head_prefix = [
-            m for m in messages[: remaining[0][0]] if not self._is_index_message(m)
+            m for m in messages[: remaining[0][0]] if not m.text.startswith(INDEX_MARKER)
         ]
         compacted_list = [
             *head_prefix,
@@ -622,6 +856,74 @@ class Compactor:
             *tail_window,
         ]
         return compacted_list, len(messages) - len(tail_window), tail_start
+
+    def _summary_only_view(self, messages: list[Message]) -> tuple[list[Message], int, bool]:
+        """Archive historical tools before replacing every old turn with its summary."""
+        spans = split_turn_spans(messages)
+        boundary = spans[-1][0] if spans else 0
+        archived_messages: list[Message] = []
+        for message in messages:
+            blocks = []
+            for block in message.blocks:
+                if not isinstance(block, ToolResultBlock) or block.archived:
+                    blocks.append(block)
+                    continue
+                if self.writer is None:
+                    return messages, 0, False
+                pointer = self.writer.blob_path_of(block.id) or self.writer.save_tool_blob(block.id, block.content, force=True)
+                if pointer is None:
+                    return messages, 0, False
+                blocks.append(block.model_copy(update={"archived": True, "content": f"[工具原文归档: {pointer}]"}))
+            archived_messages.append(message.model_copy(update={"blocks": blocks}))
+        messages = archived_messages
+        if boundary == 0:
+            return messages, 0, True
+        # Already compacted carriers are durable state. Do not rewrite their index
+        # merely because audit/state records have added lines to the transcript.
+        if all(message.meta.source == "compaction" for message in messages[:boundary]):
+            return messages, boundary, True
+        summaries: list[Message] = []
+        for start, end in spans[:-1]:
+            turn = messages[start:end]
+            # Existing summary-only/memo prefixes are already valid carriers: reuse verbatim.
+            if all(message.meta.source == "compaction" for message in turn):
+                summaries.extend(message for message in turn if message.role == "assistant" and not message.text.startswith(INDEX_MARKER))
+                continue
+            carriers: list[str] = []
+            pointers: list[str] = []
+            for message in turn:
+                text = message.text.strip()
+                if text.startswith(MEMO_MARKER):
+                    carriers.append(text)
+                elif message.role == "assistant" and message.meta.turn_summary:
+                    carriers.append(message.meta.turn_summary)
+                for block in message.blocks:
+                    if not isinstance(block, ToolResultBlock):
+                        continue
+                    pointers.append(block.content)
+            if not carriers:
+                # Existing compacted prefixes may contain multiple historical summaries.
+                carriers = [m.text.strip() for m in turn if m.meta.source == "compaction" and m.role == "assistant" and m.text.strip()]
+            if not carriers:
+                carriers = [_fallback_summary(turn)]
+            body = f"【历史第 {len(summaries) + 1} 轮摘要】" + "\n".join(carriers)
+            if pointers:
+                body += "\n工具原文归档：\n" + "\n".join(pointers)
+            summaries.append(Message(role="assistant", blocks=[TextBlock(text=body)],
+                meta=MessageMeta(source="compaction", turn_summary=body)))
+        pointer = (f"原始对话：{self.writer.log_file} · " + (f"行 1~{self.writer.current_line}" if self.writer.current_line else "行号未知")) if self.writer is not None else "原始对话仍保留在会话历史中"
+        index = Message(role="user", blocks=[TextBlock(text=f"{INDEX_MARKER} 历史只保留逐轮摘要；{pointer}")], meta=MessageMeta(source="compaction"))
+        return [*summaries, index, *messages[boundary:]], boundary, True
+
+    def _apply_memo_compaction(
+        self, messages: list[Message], memo_text: str, tail_len: int, folded_from: int
+    ) -> tuple[list[Message], int]:
+        """One local memo replaces all historical carriers; no original-question anchor."""
+        if tail_len <= 0 or len(messages) <= tail_len:
+            return messages, folded_from
+        memo_msg = Message(role="assistant", blocks=[TextBlock(text=f"{MEMO_MARKER}\n\n{memo_text.strip()}\n")],
+            meta=MessageMeta(source="compaction", turn_summary=memo_text.strip()))
+        return [memo_msg, *messages[-tail_len:]], folded_from
 
     @staticmethod
     def _is_index_message(message: Message) -> bool:
@@ -738,19 +1040,16 @@ class Compactor:
         *,
         from_turn: int,
         to_turn: int,
-        summaries: list[str],
     ) -> FoldedEpoch:
-        """把本次折叠记进账本（**审计线索**：报报告 / 压缩现场 dump / `/debug`）。
+        """把本次折叠记进账本（**审计线索**：报告 / 压缩现场 dump）。
 
-        ★ CHANGE-052 的两处变化：
+        ★ CHANGE-052 的变化：**行号改由 `MessageMeta.transcript_line` 算**
+        （不再问 `writer.turn_lines_of()`）—— 后者依赖"轮次号→行号"的正则映射，
+        而压缩器的轮次号是**视图相对**的、和 transcript 的 `session` 级编号
+        **不同源** ⇒ 查出来的区间指向**别的轮次**（实测区间查询 100% 返回 None）。
+        `transcript_line` 由 replay 从记录的 `"line"` 字段带来，**免疫该问题**。
 
-        * **行号改由 `MessageMeta.transcript_line` 算**（不再问
-          `writer.turn_lines_of()`）—— 后者依赖"轮次号→行号"的正则映射，
-          而压缩器的轮次号是**视图相对**的、和 transcript 的 `session` 级编号
-          **不同源** ⇒ 查出来的区间指向**别的轮次**（实测区间查询 100% 返回 None）。
-          `transcript_line` 由 replay 从记录的 `"line"` 字段带来，**免疫该问题**；
-        * **摘要由调用方传入**（`summaries`）—— 折叠产物本身就带摘要，
-          这里不必再扫一遍；顺带**删掉 `summaries[:3]`**（实测它把 21 条摘要砍到 3 条）。
+        ★ D187：**不再接收 `summaries`** —— 账本不记载荷的副本（见 `FoldedEpoch`）。
         """
         numbers = [
             m.meta.transcript_line
@@ -781,7 +1080,6 @@ class Compactor:
             to_turn=to_turn,
             start_line=start_line,
             end_line=end_line,
-            summary="；".join(summaries) if summaries else _fallback_summary(folded_slice),
         )
         self._next_epoch_id += 1
         self.epochs.append(epoch)
@@ -816,7 +1114,8 @@ class Compactor:
         if session_dir is not None:
             lines.append(f"完整日志目录：{session_dir}")
             lines.append("  · 对话原文：transcript.jsonl（上方“行 A~B”即该文件的行号）")
-            lines.append("  · 工具输出：tools/<call_id>.log（按需 fs_read 读取）")
+            blob_dir = getattr(self.writer, "blob_dir", session_dir / "tools")
+            lines.append(f"  · 工具输出目录：{blob_dir}（文件 tool_<call_id>.log，路径分隔符替换为下划线，按需 fs_read 读取）")
         else:
             lines.append("（未接入 transcript 写入器：无法给出日志路径）")
         lines.extend(self._render_working_set())

@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -34,7 +35,7 @@ class BlobStore:
     def _blob_path(self, sha256_hash: str) -> Path:
         """根据 64 位十六进制哈希生成两级分片路径。"""
         clean_hash = sha256_hash.strip().lower()
-        if len(clean_hash) != 64:
+        if re.fullmatch(r"[0-9a-f]{64}", clean_hash) is None:
             raise ValueError(f"不合法的 SHA-256 哈希长度：{sha256_hash!r}")
         return self.base_dir / clean_hash[:2] / clean_hash[2:]
 
@@ -42,7 +43,7 @@ class BlobStore:
         """存储字节切片，返回 64 位 SHA-256 十六进制哈希。天然幂等。"""
         sha256_hash = hashlib.sha256(data).hexdigest()
         target = self._blob_path(sha256_hash)
-        if target.is_file():
+        if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == sha256_hash:
             return sha256_hash
 
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +69,10 @@ class BlobStore:
         target = self._blob_path(sha256_hash)
         if not target.is_file():
             return None
-        return target.read_bytes()
+        data = target.read_bytes()
+        if hashlib.sha256(data).hexdigest() != sha256_hash.strip().lower():
+            raise ValueError("CAS 快照内容与 SHA-256 不一致")
+        return data
 
     def restore_to_file(self, sha256_hash: str, target_path: Path | str) -> bool:
         """将指定哈希的内容原子写入到目标文件。返回是否成功。"""

@@ -9,19 +9,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any
 
-from logox.context.compaction import CompactionResult, Compactor
+from logox.context.anamnesis import AnamesisMemory
+from logox.context.compaction import CompactionResult, Compactor, FoldedEpoch
 from logox.context.memory import ProjectMemory, find_project_memory
 from logox.context.storage import SessionTranscriptWriter
-from logox.context.tokens import TokenEstimator, TokenLedger
+from logox.context.tokens import TokenEstimator, TokenLedger, estimate_text_tokens
 from logox.kernel.events import Usage
 from logox.kernel.loop import CompactionReport, ContextBundle
-from logox.kernel.messages import Message, ReasoningBlock
+from logox.kernel.messages import Message, ReasoningBlock, ToolResultBlock
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +46,8 @@ TURN_SUMMARY_PROMPT_INSTRUCTION = """## 回合交付与摘要规范 (Turn Summar
    - ❌ 不要写在正文中间，也不要在调用工具的中间步骤里写。
    - ❌ 不要用 `<turn_summary>` 这类标签 —— 那只是普通正文，不会被识别。
 
-2. 格式与长度：**一个段落**（它必须占据正文末尾的**连续若干行**，不可换行）。
-   **参考字数在200字左右，无硬性规定** —— 因为每一轮做的事有多有少。但"不设上限"**不等于**"可以啰嗦"：
+2. 格式与长度：**一个段落**（字数不设上限，即使在窄屏幕上被折成好几行也是正常的显示效果）。
+   因为每一轮做的事有多有少。但"不设上限"**不等于**"可以啰嗦"：
    「**用尽可能少的字把话说清楚**」是硬要求。自检方法：
    删掉某个短语之后，读的人还明白这一轮发生了什么吗？
    还明白 → 它本来就多余，不该写；不明白 → 它必须留着。
@@ -103,7 +106,9 @@ def _folded_head(messages: list[Message]) -> list[Message]:
 
 @dataclass
 class _FoldCache:
-    """压缩缓存。**可以被随时丢掉** —— 丢了只是变慢，不会变错。
+    """压缩后的有效历史前缀，退出前随 context_state 落盘。
+
+    模型生成的全局备忘录无法从原始历史确定性重建，不能当作可丢弃缓存。
 
     :param covered: ``history`` 中前多少条已被 ``prefix`` 代表（单调不减）
     :param prefix: 已折叠部分的表示，固定为 ``[锚点, 锚点回答摘要, 归档索引]``（初始为空，共 3 条）
@@ -192,8 +197,11 @@ class HierarchicalContextBuilder:
         model_key: str = "",
         #: ★ D156：dev 期把每次"真的发生了压缩"的上下文转储到磁盘（默认跟随环境变量）
         dump_compaction: bool | None = None,
-        estimator: Optional[TokenEstimator] = None,
+        estimator: TokenEstimator | None = None,
         skill_manager: Any = None,
+        anamnesis_home: Path | None = None,
+        anamnesis_enabled: bool = False,
+        anamnesis_ratio: float = 0.05,
     ) -> None:
         self.base_system = system
         self.skill_manager = skill_manager
@@ -229,6 +237,9 @@ class HierarchicalContextBuilder:
         )
 
         self.project_memory_enabled = project_memory_enabled
+        self.anamnesis_memory = AnamesisMemory(self.cwd, anamnesis_home,
+                                               enabled=anamnesis_enabled, project_enabled=project_memory_enabled,
+                                               ratio=anamnesis_ratio)
         #: 缓存的项目级记忆（启动时自动扫描一次）；开关关闭时是空记忆
         self.memory: ProjectMemory = (
             find_project_memory(self.cwd) if project_memory_enabled else ProjectMemory(sources=[], total_tokens=0)
@@ -236,6 +247,9 @@ class HierarchicalContextBuilder:
         self._last_pruned_count = 0
         #: 压缩缓存（D1/D3）—— 见 :meth:`_assemble` 与 :meth:`_absorb_fold`
         self._cache = _FoldCache()
+        self._tool_overrides: dict[int, dict[str, ToolResultBlock]] = {}
+        self._override_refs: dict[int, Message] = {}
+        self._state_dirty = False
 
     def set_model(self, *, model_key: str, window_capacity: int | None = None) -> None:
         """切换模型时更新**计量侧**的三样东西（D159）。
@@ -250,6 +264,8 @@ class HierarchicalContextBuilder:
         ``window_capacity=None`` 表示"查不到新窗口"（自定义模型名）⇒ 沿用旧窗口，
         只换 κ 桶与锚点，并在日志里留一句。
         """
+        if model_key != self.model_key:
+            self.ledger.note_rewrite()
         self.model_key = model_key
         self.compactor.model_key = model_key
         if window_capacity is not None and window_capacity > 0:
@@ -265,6 +281,7 @@ class HierarchicalContextBuilder:
             if self.project_memory_enabled
             else ProjectMemory(sources=[], total_tokens=0)
         )
+        self.anamnesis_memory._cache.clear()
         return self.memory
 
     def record_usage(self, estimated_tokens: int, usage: Usage) -> None:
@@ -276,12 +293,40 @@ class HierarchicalContextBuilder:
             )
             logger.debug("Token 估算动态校准系数更新为: %.3f", new_factor)
 
-    def _assemble_system_prompt(self) -> str:
+    def system_prompt_snapshot(self) -> str:
+        """当前系统提示的**只读快照**（`/reload` 用来判断"前缀是否变了"）。
+
+        为什么要单独开一个公开方法：系统提示是**拼出来的**（基础人设 + 记忆 + 技能索引 +
+        摘要契约），而它同时是厂商侧 KV 缓存的前缀。`/reload` 重扫记忆/技能之后必须能回答
+        "这次重载会不会让前缀失效" —— 但装配根不该去调 ``_assemble_system_prompt`` 这种
+        私有名（那是"得记得跟着改"的第二次调用）。
+
+        纯函数：不改任何状态、不触发压缩、不发事件。
+        """
+        return self._assemble_system_prompt()
+
+    def _refresh_anamnesis(self, history: list[Message]) -> None:
+        if not self.anamnesis_memory.enabled:
+            return
+        # Keep the complete current turn and mandatory system rules ahead of background facts.
+        current = []
+        for message in reversed(history):
+            current.append(message)
+            if message.role == "user":
+                break
+        mandatory = estimate_text_tokens(self._assemble_system_prompt(include_anamnesis=False))
+        mandatory += sum(estimate_text_tokens(m.model_dump_json()) for m in current)
+        available = self.window_capacity - self.compactor.reserve_tokens - mandatory
+        self.anamnesis_memory.refresh(window=self.window_capacity, available=available)
+
+    def _assemble_system_prompt(self, *, include_anamnesis: bool = True) -> str:
         """组装顶层系统人设：基础人设 + LOGOX.md 长期记忆 + 技能包渐进索引 + 回合摘要契约。"""
         parts = [self.base_system.rstrip()] if self.base_system.strip() else []
         memory_block = self.memory.render_system_prompt_block()
         if memory_block:
             parts.append(memory_block.strip())
+        if include_anamnesis and self.anamnesis_memory.block:
+            parts.append(self.anamnesis_memory.block)
 
         if self.skill_manager is not None and hasattr(self.skill_manager, "build_prompt_index"):
             skills_block = self.skill_manager.build_prompt_index()
@@ -309,6 +354,30 @@ class HierarchicalContextBuilder:
         """手动强制执行一次上下文修剪压缩 (对应 /compact 命令)。"""
         return self._assemble(history, force=True, last_usage=last_usage)
 
+    async def build_async(
+        self,
+        history: list[Message],
+        *,
+        last_usage: Usage | None = None,
+        summarizer: Any | None = None,
+    ) -> ContextBundle:
+        """组装供大模型调用的标准上下文包（异步版本，支持阶段 3 模型提炼备忘录）。"""
+        return await self._assemble_async(
+            history, force=False, last_usage=last_usage, summarizer=summarizer
+        )
+
+    async def force_compact_async(
+        self,
+        history: list[Message],
+        *,
+        last_usage: Usage | None = None,
+        summarizer: Any | None = None,
+    ) -> ContextBundle:
+        """手动强制执行一次上下文修剪压缩（异步版本，支持阶段 3 模型提炼备忘录）。"""
+        return await self._assemble_async(
+            history, force=True, last_usage=last_usage, summarizer=summarizer
+        )
+
     def _assemble(
         self, history: list[Message], *, force: bool, last_usage: Usage | None = None
     ) -> ContextBundle:
@@ -318,6 +387,7 @@ class HierarchicalContextBuilder:
         ``缓存前缀 + history[游标:]``。折叠只把"游标之后"的部分吃进前缀，
         因此**同一段历史不会被反复折叠**——这正是页表不再重复堆积的原因。
         """
+        self._refresh_anamnesis(history)
         full_system = self._assemble_system_prompt()
 
         # ★ 缓存自校验（D3）：history 被整体替换（/resume、/rewind、/new）时必须认出来。
@@ -328,7 +398,7 @@ class HierarchicalContextBuilder:
         if not self._cache.is_valid_for(history):
             self._invalidate_cache()
 
-        view = self._cache.prefix + history[self._cache.covered:]
+        view = self._context_view(history)
 
         # ⚠️ **必须无条件调用 compact()**，不能"先估算、再决定要不要调"。
         #   compact() 除了折叠，还负责 `_strip_reasoning` —— 把思考链在发往模型前
@@ -349,7 +419,7 @@ class HierarchicalContextBuilder:
             # 锚点式判据（精确锚点 + 只估增量）——取代旧的 max(估算, 真实)（D158）
             current_tokens=prediction.tokens,
         )
-        self._absorb_fold(result, history)
+        self._remember_compaction(result, history)
         self._last_pruned_count = result.pruned_count
         # ★ D158：记下"这一次实际发出多少条、预测多少 token"——
         #   下一次 reconcile 靠它确定锚点覆盖范围，并把它当作**校准分母**
@@ -358,14 +428,15 @@ class HierarchicalContextBuilder:
             sent_count=len(result.messages), predicted_tokens=result.tokens_after
         )
 
-        memory_paths = [str(s.path).replace("\\", "/") for s in self.memory.sources]
+        memory_paths = [str(s.path).replace("\\", "/") for s in self.memory.sources] + self.anamnesis_memory.sources
 
         # ★ D156：把"压缩到底做了什么"翻译成**内核侧的中性报告**（纯数据，不做 IO）。
         #   内核拿到它才会发布 `CompactionFinished` —— 在补上这条线之前，
         #   时间线提示 / `compact_count` / `pre_compact` 钩子 / 事后查证四条线全是死的（F-54）。
         folded = result.folded_from_index > 0
         report: CompactionReport | None = None
-        if folded or result.pruned_count:
+        if folded or result.pruned_count or result.strategy in ("prune+fold+memo", "prune+fold+truncated"):
+            strategy = result.strategy or ("prune+fold" if folded else "prune")
             report = CompactionReport(
                 tokens_before=result.tokens_before,
                 tokens_after=result.tokens_after,
@@ -373,10 +444,78 @@ class HierarchicalContextBuilder:
                 message_count_after=len(result.messages),
                 pruned_count=result.pruned_count,
                 folded_turns=result.folded_turns,
-                strategy="prune+fold" if folded else "prune",
+                strategy=strategy,
                 degraded=result.degraded,
             )
             # dev 期转储：**只在真的发生了压缩时**写（避免噪音）
+            self._dump_compaction_context(
+                before=view,
+                after=result.messages,
+                system=full_system,
+                report=report,
+                epochs=list(self.compactor.epochs),
+            )
+
+        return ContextBundle(
+            system=full_system,
+            messages=result.messages,
+            token_estimate=result.tokens_after,
+            memory_sources=memory_paths,
+            pruned_count=result.pruned_count,
+            compaction=report,
+        )
+
+    async def _assemble_async(
+        self,
+        history: list[Message],
+        *,
+        force: bool,
+        last_usage: Usage | None = None,
+        summarizer: Any | None = None,
+    ) -> ContextBundle:
+        """``build_async`` 与 ``force_compact_async`` 的统一实现。"""
+        if self.anamnesis_memory.enabled:
+            import asyncio
+
+            await asyncio.to_thread(self._refresh_anamnesis, history)
+        full_system = self._assemble_system_prompt()
+
+        if not self._cache.is_valid_for(history):
+            self._invalidate_cache()
+
+        view = self._context_view(history)
+        prediction = self._prepare(view, full_system, last_usage=last_usage)
+
+        result = await self.compactor.compact_async(
+            view,
+            force=force,
+            system_prompt=full_system,
+            last_usage=last_usage,
+            current_tokens=prediction.tokens,
+            memo_summarizer=summarizer,
+        )
+        self._remember_compaction(result, history)
+        self._last_pruned_count = result.pruned_count
+        self.ledger.note_build(
+            sent_count=len(result.messages), predicted_tokens=result.tokens_after
+        )
+
+        memory_paths = [str(s.path).replace("\\", "/") for s in self.memory.sources] + self.anamnesis_memory.sources
+
+        folded = result.folded_from_index > 0
+        report: CompactionReport | None = None
+        if folded or result.pruned_count or result.strategy in ("prune+fold+memo", "prune+fold+truncated"):
+            strategy = result.strategy or ("prune+fold" if folded else "prune")
+            report = CompactionReport(
+                tokens_before=result.tokens_before,
+                tokens_after=result.tokens_after,
+                message_count_before=len(view),
+                message_count_after=len(result.messages),
+                pruned_count=result.pruned_count,
+                folded_turns=result.folded_turns,
+                strategy=strategy,
+                degraded=result.degraded,
+            )
             self._dump_compaction_context(
                 before=view,
                 after=result.messages,
@@ -446,8 +585,9 @@ class HierarchicalContextBuilder:
             ]
             for epoch in epochs:
                 lines.append(
-                    f"- 第 {epoch.from_turn}~{epoch.to_turn} 轮 · 行 {epoch.start_line}~{epoch.end_line}"
-                    f" · {epoch.summary}"
+                    f"- 第 {epoch.from_turn}~{epoch.to_turn} 轮"
+                    f" · 行 {epoch.start_line}~{epoch.end_line}"
+                    " · 摘要正文见下方逐轮消息（D187：账本不记副本）"
                 )
             lines += ["", "## system（逐字）", "", "```text", system.rstrip(), "```", ""]
             lines += ["## 压缩后模型实际看到的消息", ""]
@@ -499,8 +639,11 @@ class HierarchicalContextBuilder:
             model_key=self.model_key,
             prefix_digest=digest,
         )
+        # Anchor counts describe sent messages; pure-reasoning messages are not sent.
+        visible = [message for message in view if message.role in ("user", "system")
+                   or any(not isinstance(block, ReasoningBlock) for block in message.blocks)]
         prediction = self.ledger.predict(
-            view,
+            visible,
             system_prompt=full_system,
             estimator=self.estimator,
             model_key=self.model_key,
@@ -531,7 +674,7 @@ class HierarchicalContextBuilder:
         full_system = self._assemble_system_prompt()
         if not self._cache.is_valid_for(history):
             self._invalidate_cache()
-        view = self._cache.prefix + history[self._cache.covered:]
+        view = self._context_view(history)
         prediction = self._prepare(view, full_system, last_usage=last_usage)
         if force:
             if not self._has_work_todo(view):
@@ -576,8 +719,219 @@ class HierarchicalContextBuilder:
         （新增 T-3 就是抓这个：删掉下面这行 `compactor.reset()` 会立刻变红）。
         """
         self._cache = _FoldCache()
+        self._tool_overrides.clear()
+        self._override_refs.clear()
+        self._state_dirty = False
         self.compactor.reset()
         self.ledger.note_rewrite()
+
+    def reset(self) -> None:
+        """开始新会话时清除有效视图和旧用量锚点。"""
+        self._invalidate_cache()
+
+    def _context_view(self, history: list[Message]) -> list[Message]:
+        """原始历史保持完整；模型使用折叠前缀和已卸载的工具块。"""
+        if not self._cache.is_valid_for(history) or any(
+            index >= len(history) or history[index] is not ref for index, ref in self._override_refs.items()
+        ):
+            self._invalidate_cache()
+        tail = []
+        for index in range(self._cache.covered, len(history)):
+            message = history[index]
+            replacements = self._tool_overrides.get(index)
+            if replacements:
+                # Keep live metadata: a final summary may arrive after compaction.
+                message = message.model_copy(
+                    update={
+                        "blocks": [
+                            replacements.get(block.id, block) if isinstance(block, ToolResultBlock) else block
+                            for block in message.blocks
+                        ]
+                    }
+                )
+            tail.append(message)
+        return self._cache.prefix + tail
+
+    def estimate_context(self, history: list[Message]) -> int:
+        """只估算当前有效视图，不压缩、不读日志、不请求模型。"""
+        return self.estimator.estimate_messages(
+            self.compactor._strip_reasoning(self._context_view(history)),
+            system_prompt=self._assemble_system_prompt(),
+            model_key=self.model_key,
+        )
+
+    @staticmethod
+    def _source_units(history: list[Message]) -> list[tuple[int, Message]]:
+        """工具批次在内存是一个消息，JSONL 是多行；按单个工具结果绑定。"""
+        return [
+            (index, message.model_copy(update={"blocks": [block]}))
+            if message.role == "tool"
+            else (index, message)
+            for index, message in enumerate(history)
+            for block in (message.blocks if message.role == "tool" else [None])
+        ]
+
+    @staticmethod
+    def _history_digest(history: list[Message]) -> str:
+        """绑定原始正文与工具配对；回放行号、摘要与推理签名不影响绑定。"""
+        digest = hashlib.sha256()
+        for _, message in HierarchicalContextBuilder._source_units(history):
+            payload = {
+                "role": message.role,
+                "blocks": [
+                    block.model_dump(mode="json")
+                    for block in message.blocks
+                    if not isinstance(block, ReasoningBlock)
+                ],
+            }
+            digest.update(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            )
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _remember_compaction(self, result: CompactionResult, history: list[Message]) -> None:
+        previous = (self._cache.covered, self._cache.prefix, self._tool_overrides.copy())
+        self._absorb_fold(result, history)
+        if not result.pruned_count and result.folded_from_index <= 0 and not self._state_dirty:
+            return
+        if result.pruned_count and result.folded_from_index <= 0:
+            self.ledger.note_rewrite()
+        self._tool_overrides = {
+            i: blocks for i, blocks in self._tool_overrides.items() if i >= self._cache.covered
+        }
+        self._override_refs = {i: history[i] for i in self._tool_overrides}
+        indices = [
+            i
+            for i in range(self._cache.covered, len(history))
+            if history[i].role in ("user", "system")
+            or any(not isinstance(b, ReasoningBlock) for b in history[i].blocks)
+        ]
+        tail = result.messages[len(self._cache.prefix) :]
+        if len(indices) != len(tail):
+            logger.warning("压缩状态未保存：有效尾部与原始消息边界不一致")
+            return
+        for index, message in zip(indices, tail, strict=True):
+            archived = {
+                block.id: block
+                for block in message.blocks
+                if isinstance(block, ToolResultBlock) and block.archived
+            }
+            if archived:
+                self._tool_overrides[index] = archived
+                self._override_refs[index] = history[index]
+        if (
+            previous == (self._cache.covered, self._cache.prefix, self._tool_overrides)
+            and not self._state_dirty
+        ):
+            return
+        units = self._source_units(history)
+        state = {
+            "version": 1,
+            "history_count": len(units),
+            "history_digest": self._history_digest(history),
+            "covered": sum(index < self._cache.covered for index, _ in units),
+            "prefix": [message.model_dump(mode="json") for message in self._cache.prefix],
+            "tools": [
+                {
+                    "index": unit_index,
+                    "blocks": [self._tool_overrides[index][message.blocks[0].id].model_dump(mode="json")],
+                }
+                for unit_index, (index, message) in enumerate(units)
+                if index in self._tool_overrides and message.blocks[0].id in self._tool_overrides[index]
+            ],
+            "epochs": [epoch.__dict__ for epoch in self.compactor.epochs],
+            "working_set": self.compactor._working_set,
+        }
+        self._state_dirty = (
+            self.writer.write_step(
+                turn=sum(m.role == "user" for m in history),
+                step=0,
+                role="system",
+                event_type="context_state",
+                state=state,
+            )
+            is None
+        )
+        if self._state_dirty:
+            logger.warning("压缩状态写入失败：当前视图仍有效，但退出后无法保证恢复本次压缩")
+
+    def restore_state(self, history: list[Message], records: list[dict[str, Any]]) -> bool:
+        """从已过滤回滚的记录恢复最新匹配状态，老日志保持原始历史。"""
+        self._invalidate_cache()
+        units = self._source_units(history)
+        for record in reversed(records):
+            if record.get("type") != "context_state":
+                continue
+            try:
+                state = record["state"]
+                if (
+                    not isinstance(state, dict)
+                    or type(state.get("version")) is not int
+                    or state["version"] != 1
+                ):
+                    raise ValueError("不支持的状态版本")
+                count, covered = state["history_count"], state["covered"]
+                if (
+                    type(count) is not int
+                    or type(covered) is not int
+                    or not 0 <= covered <= count <= len(units)
+                ):
+                    raise ValueError("原始消息边界不匹配")
+                if any(
+                    0 < boundary < len(units) and units[boundary - 1][0] == units[boundary][0]
+                    for boundary in (count, covered)
+                ):
+                    raise ValueError("状态边界切断工具批次")
+                if state["history_digest"] != self._history_digest([message for _, message in units[:count]]):
+                    raise ValueError("原始历史内容已变化")
+                prefix = [Message.model_validate(item) for item in state["prefix"]]
+                from logox.context.compaction import is_index_message
+
+                if prefix and not is_index_message(prefix[-1]):
+                    raise ValueError("折叠前缀缺少归档索引或备忘录")
+                if bool(prefix) != bool(covered):
+                    raise ValueError("折叠前缀与覆盖游标不匹配")
+                raw_covered = units[covered][0] if covered < len(units) else len(history)
+                overrides: dict[int, dict[str, ToolResultBlock]] = {}
+                seen: set[int] = set()
+                for item in state["tools"]:
+                    index = item["index"]
+                    if type(index) is not int or not covered <= index < count or index in seen:
+                        raise ValueError("工具消息位置不匹配")
+                    blocks = [ToolResultBlock.model_validate(block) for block in item["blocks"]]
+                    raw_index, source_message = units[index]
+                    raw_ids = {
+                        block.id for block in source_message.blocks if isinstance(block, ToolResultBlock)
+                    }
+                    if not blocks or any(not block.archived or block.id not in raw_ids for block in blocks):
+                        raise ValueError("工具归档与原始调用不匹配")
+                    if any(self.writer.blob_path_of(block.id) is None for block in blocks):
+                        raise ValueError("工具原文归档缺失")
+                    seen.add(index)
+                    overrides.setdefault(raw_index, {}).update({block.id: block for block in blocks})
+                epochs = [FoldedEpoch(**item) for item in state["epochs"]]
+                if any(type(value) is not int for epoch in epochs for value in epoch.__dict__.values()):
+                    raise ValueError("折叠账本格式无效")
+                working_set = state["working_set"]
+                if not isinstance(working_set, list) or any(
+                    not isinstance(item, (tuple, list))
+                    or len(item) != 2
+                    or any(not isinstance(value, str) for value in item)
+                    for item in working_set
+                ):
+                    raise ValueError("工作集格式无效")
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("忽略不可恢复的压缩状态：%s", exc)
+                continue
+            self._cache = _FoldCache(covered=raw_covered, prefix=prefix, refs=list(history[:raw_covered]))
+            self._tool_overrides = overrides
+            self._override_refs = {index: history[index] for index in overrides}
+            self.compactor.epochs = epochs
+            self.compactor._next_epoch_id = max((epoch.epoch_id for epoch in epochs), default=0) + 1
+            self.compactor._working_set = [tuple(item) for item in working_set]
+            return True
+        return False
 
     def _absorb_fold(self, result: CompactionResult, history: list[Message]) -> None:
         """把一次成功的折叠记进缓存：前缀 = ``[锚点, 锚点回答摘要, 归档索引]``，游标前推（D1）。

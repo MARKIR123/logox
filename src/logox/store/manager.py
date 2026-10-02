@@ -88,8 +88,27 @@ class SessionManager:
 
     def find_most_recent(self, cwd: Path | str) -> SessionInfo | None:
         """获取当前工作区最近活跃的会话；无会话时返回 None。"""
-        sessions = self.list_sessions(cwd)
-        return sessions[0] if sessions else None
+        project_dir = self.get_project_dir(cwd)
+        if not project_dir.is_dir():
+            return None
+        candidates: list[tuple[float, Path]] = []
+        try:
+            for path in project_dir.glob("*.jsonl"):
+                try:
+                    if path.is_file():
+                        candidates.append((path.stat().st_mtime, path))
+                except OSError:
+                    continue
+        except OSError as exc:
+            logger.warning("扫描会话目录失败：%s", exc)
+            return None
+        # 稳定排序保持相同 mtime 下原目录枚举顺序；仅解析最新可读文件。
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for _, path in candidates:
+            info = self.scan_session_metadata(path, cwd=str(cwd))
+            if info is not None:
+                return info
+        return None
 
     def create_session(
         self,

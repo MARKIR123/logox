@@ -43,6 +43,7 @@ class SessionPersistenceSubscriber:
                 role="user",
                 event_type="user_prompt",
                 content=event.text,
+                timestamp=event.ts,
             )
         elif isinstance(event, ev.ModelDelta):
             if event.kind == "text":
@@ -85,7 +86,7 @@ class SessionPersistenceSubscriber:
             call_info = self._tool_calls.pop(event.call_id, {})
             tool_name = call_info.get("name", "tool")
             content_str = event.content if event.content else (event.result_digest or str(event.error_kind or "ok"))
-            blob_path = self.writer.save_tool_blob(event.call_id, content_str)
+            blob_path = self.writer.save_tool_blob(event.call_id, content_str, force=True)
 
             self.writer.write_step(
                 turn=event.turn,

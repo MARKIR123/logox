@@ -5,27 +5,14 @@
 :func:`render_blocks` 与 :func:`render_cached` 是"块 → 文本"的纯函数。
 因此时间线的绝大多数行为都能用普通 unittest 覆盖。
 
-两个关键设计
-------------
-1. **卡片以文本块渲染**：卡片视觉由 `cards.py` 的纯渲染函数产出，时间线只是把它们
-   拼起来。于是"同一套视觉"既用于主时间线，也能用在别处（例如浮层里的预览）。
-2. **前缀缓存（D56）**：每次刷新只重渲染**活跃尾部**，因此每帧的工作量与会话长度无关。
-   500 块的会话实测：单次全量渲染 9 ms，而缓存命中后只渲染 1 块。
+卡片由 `cards.py` 的纯函数生成；UI 与完整文本兼容入口共用视觉规则。
+按块内容键缓存排版（D199），包括未变的最后一块。新增块仅计算新块；较早的
+工具状态或推理正文原地改变，也会让对应结果失效。键保留字符串引用，不进行
+全文序列化；每帧仍遍历块与行，不能声称成本与会话长度无关。
 
-前缀缓存的正确性靠**一条不变量**
---------------------------------
-
-> **缓存里的块，必须已经写完、不会再变。**
-
-因此前缀只推进到 ``blocks[:-1]``（**最后一块永远重渲染**），于是"正在流式的正文"
-与"运行中的工具卡片"天然落在尾部。这比"猜哪些块会变"稳得多——猜错的症状是
-**用户看到过时的信息却没有任何提示**，属于最恶劣的一类缺陷。
-
-缓存失效是**被动**的：谁改了数据谁负责声明。为此 :class:`TimelineBuffer` 提供
-``invalidate()``，并在每个会改动既有块的方法里调用它。
-
-**为什么不做"每帧比对内容"**：比对需要把每个块序列化一遍再比，那本身就是
-O(全部内容)，省下来的比花掉的还多。
+UI 使用不可变的文本片段和行，避免先拼接完整历史再拆行。正在增长的 Markdown
+复用未变结构及代码行；完整 Text 兼容访问按需拼接。缓存仅保留当前块，删除历史
+或清空后释放旧结果。TimelineBuffer.invalidate 负责请求重画，不代替内容键校验。
 """
 
 from __future__ import annotations
@@ -36,10 +23,10 @@ from typing import Any, Literal
 
 from rich.text import Text
 
+from logox.difftext import DiffHunk
 from logox.kernel import events as ev
 from logox.kernel.events import ChangeStat
 from logox.tui import format as fmt
-from logox.difftext import DiffHunk
 from logox.tui.content.cards import (
     CardContext,
     ToolCardState,
@@ -48,7 +35,8 @@ from logox.tui.content.cards import (
     render_reasoning,
     render_tool_card,
 )
-from logox.tui.content.markdown import render_markdown
+from logox.tui.content.markdown import MarkdownRenderCache, render_markdown
+from logox.tui.content.smoother import StreamSmoother
 
 __all__ = [
     "ActiveStatus",
@@ -63,7 +51,7 @@ __all__ = [
     "render_cached",
 ]
 
-BlockKind = Literal["user", "assistant", "divider", "notice", "tool", "reasoning", "diff", "raw"]
+BlockKind = Literal["user", "assistant", "divider", "notice", "tool", "reasoning", "diff", "raw", "anamnesis"]
 
 #: 超过这么多块时可折叠历史（UI-SPEC §11 第 7 项）
 FOLD_THRESHOLD = 30
@@ -107,6 +95,7 @@ class Block:
 
     # 手工指定是否展开（None = 用全局开关）
     expanded: bool | None = None
+    card: Any | None = None
 
 
 _MODEL_BLOCK_KINDS = frozenset({"assistant", "reasoning", "tool", "diff"})
@@ -203,14 +192,22 @@ def render_blocks(
     active_status: ActiveStatus | None = None,
     now: float | None = None,
     block_ranges: list[tuple[int, int, Block]] | None = None,
+    markdown_cache: MarkdownRenderCache | None = None,
+    assistant_rows_out: list[Text] | None = None,
 ) -> Text:
     """把块序列渲染成 Rich ``Text``（纯函数，可完全单测）。
 
     ★ 两个展开开关是**正交**的（D125）：``expand_tools`` 管工具卡与 diff（``Ctrl+O``），
-    ``expand_reasoning`` 管思考链（``Ctrl+T``）。**拆开的原因**是这两类内容的
+    ``expand_reasoning`` 管普通思考与入梦卡片（``Ctrl+T``）。**拆开的原因**是这两类内容的
     "想看程度"完全不同 —— 用户经常只想看"到底执行了什么"，而思考链是冗长的内心独白；
     一个开关管两件事时，用户会被迫同时收下不想要的那一半。
     """
+    if assistant_rows_out is not None and len(blocks) == 1 and blocks[0].kind == "assistant":
+        rows = _assistant_rows(blocks[0], prev_block, context, show_track, markdown_cache)
+        assistant_rows_out.extend(rows)
+        if block_ranges is not None:
+            block_ranges.append((0, len(rows), blocks[0]))
+        return Text()
     palette = context.palette
     width = max(20, context.width)
     out = Text()
@@ -226,7 +223,12 @@ def render_blocks(
     for index, block in enumerate(blocks):
         prev = blocks[index - 1] if index > 0 else prev_block
         b_start = out.plain.count("\n")
-        if block.kind in _MODEL_BLOCK_KINDS:
+        if block.kind == "anamnesis" and block.card is not None:
+            card = block.card.render(expanded=block.expanded if block.expanded is not None else expand_reasoning,
+                                     width=sub_context.width, color=success_color)
+            out.append_text(_prefix_lines(card, prefix))
+            out.append("\n")
+        elif block.kind in _MODEL_BLOCK_KINDS:
             # 若前一个块不是模型块，说明本块是一个新模型回合的起点，输出统一角色头部 ✦ Logox
             if prev is None or prev.kind not in _MODEL_BLOCK_KINDS:
                 out.append_text(Text("✦ Logox\n", style=f"bold {success_color}"))
@@ -235,7 +237,7 @@ def render_blocks(
                 # 若前序也是模型块（如思考或工具卡片），在回答正文前保留一行空行呼吸分段
                 if prev is not None and prev.kind in _MODEL_BLOCK_KINDS:
                     out.append("\n")
-                for line in render_markdown(block.text, sub_context.width, sub_context):
+                for line in render_markdown(block.text, sub_context.width, sub_context, cache=markdown_cache):
                     out.append_text(prefix)
                     out.append_text(line)
                     out.append("\n")
@@ -344,46 +346,78 @@ def render_blocks(
     return out
 
 
+def _assistant_rows(
+    block: Block, prev: Block | None, context: CardContext, show_track: bool,
+    cache: MarkdownRenderCache | None,
+) -> list[Text]:
+    """直接交付正文行，避开全文拼接与全文 span 分割；视觉与 render_blocks 一致。"""
+    color = str(getattr(context.palette, "success", "") or "green")
+    width = max(18, max(20, context.width) - 2)
+    body = render_markdown(block.text, width, context, cache=cache)
+    previous = cache.decorated_lines if cache is not None and cache.decoration == (show_track, color) else []
+    decorated: list[tuple[Text, Text]] = []
+    rows: list[Text] = []
+    if prev is None or prev.kind not in _MODEL_BLOCK_KINDS:
+        rows.append(Text("✦ Logox", style=f"bold {color}"))
+    else:
+        rows.append(Text())
+    for index, line in enumerate(body):
+        if index < len(previous) and previous[index][0] == line:
+            row = previous[index][1]
+        else:
+            row = Text()
+            # 原实现的前缀只给轨道着色；不能把颜色继承到整个正文。
+            if show_track:
+                row.append("▎ ", style=color)
+            row.append_text(line)
+        decorated.append((line, row))
+        rows.append(row)
+    rows.append(Text())
+    if cache is not None:
+        cache.decorated_lines = decorated
+        cache.decoration = (show_track, color)
+    return rows
+
+
 @dataclass
 class RenderResult:
-    """一次渲染的产物 + **工作量**（D56 的度量口径）。
+    """渲染结果与本帧工作量（D56 / D199）。
 
-    这里**没有预先拼好的整段文本**（D126），而是三段：
-
-    ``head_text``（折叠提示这类插在最前面的东西，可能为空）→
-    ``prefix_text``（命中缓存的那一段）→ ``tail_text``（本帧真正重渲染的那一段）。
-
-    两个理由，都是实测出来的：
-
-    1. **拼接是 O(整个会话)**：``Text.append_text`` 要复制 plain 与全部 spans，
-       80 条消息的会话里每帧约 6ms —— 而它唯一的用武之地是"增量切分不成立时
-       退回整体切分"那条罕见路径。所以它变成 :attr:`text` 这个**按需拼接**的属性。
-    2. **上层需要知道"前缀是哪一段"**：它要只切尾部、复用前缀的行。
-       如果只给它一段拼好的文本，那一步就必然又是 O(整个会话)
-       —— 症状是"会话越长，敲一个字越卡"。
-
-    不变量：``text.plain == head_text.plain + (prefix_text or "").plain + tail_text.plain``。
+    UI 通过 segments 取得每个块的不可变 Text 或行，复用未变结果而不先合并
+    完整历史。兼容调用保留 head_text / prefix_text / tail_text；text 属性按需
+    拼接，分段入口优先拼接 segments。prefix_blocks 表示复用块数，
+    tail_rendered_blocks 表示本帧重排块数，不要求两者在空间上形成连续前后缀。
     """
 
     prefix_blocks: int = 0
     tail_rendered_blocks: int = 0
     tail_chars: int = 0
     prefix_hit: bool = False
-    #: 本帧是否**重建**了缓存（缓存没命中 / 落后 / 渲染参数变了）
+    #: 本帧是否有块需要重新排版。
     cache_rebuilt: bool = False
     #: 位于前缀之前的内容（折叠提示）；非空时前缀**不是**整段文本的开头
     head_text: Text = field(default_factory=Text)
     #: 命中的前缀文本（**就是缓存里那个对象**，身份稳定 ⇒ 上层可以据此复用行）
     prefix_text: Text | None = None
-    #: 本次真正重新渲染的那一段（含最后一块与活跃状态行）
+    #: 兼容入口的动态状态尾部。
     tail_text: Text = field(default_factory=Text)
     #: 渲染行与 Block 的区间映射 [(start_line, end_line, block)]
     block_ranges: list[tuple[int, int, Block]] = field(default_factory=list)
+    segments: list[tuple[Block | None, Text | list[Text]]] | None = None
 
     @property
     def text(self) -> Text:
         """整段文本（头部 + 前缀 + 尾部）。**按需拼接**，见类 docstring。"""
         out = Text()
+        if self.segments is not None:
+            for _block, piece in self.segments:
+                if isinstance(piece, list):
+                    for row in piece:
+                        out.append_text(row)
+                        out.append("\n")
+                else:
+                    out.append_text(piece)
+            return out
         out.append_text(self.head_text)
         if self.prefix_text is not None:
             out.append_text(self.prefix_text)
@@ -403,48 +437,77 @@ class RenderResult:
 
 
 @dataclass
+class _BlockRenderEntry:
+    block: Block
+    key: tuple[Any, ...]
+    text: Text | None
+    ranges: list[tuple[int, int, Block]]
+    newline_count: int
+    active_text: Text | None
+    rows: list[Text] | None = None
+    active_rows: list[Text] | None = None
+
+
+@dataclass
 class TimelineRenderCache:
-    """前缀缓存：**覆盖了多少块**与**那段文本**必须成对出现，因此放在同一个对象里。
-
-    ⚠️ 这个类是一次**真实缺陷**的直接产物：第一版把 ``cached_blocks`` 与
-    ``cached_text`` 当成两个独立字段，于是出现"块数说 30、文本只有 29"的错配，
-    屏幕上就少显示了一条用户消息——**没有任何报错**，只是内容悄悄不对。
-    把两者绑成一个不可分割的值之后，这种错配从"可能发生"变成"无法表达"。
-
-    ``expand_tools`` / ``expand_reasoning`` 与 ``width`` 也在这里：它们一变，
-    所有块的渲染结果都变，缓存必须整体作废。
-
-    ⚠️ **拆成两个开关时最容易漏的就是这里**（D125-d）。忘了加第二维会怎样：
-    按 ``Ctrl+T`` 后 ``matches`` 认为"渲染参数没变" → **直接复用旧画面** →
-    症状是"**按键毫无反应，且没有任何报错**"。这比崩溃难查得多，所以
-    ``tests/tui/test_timeline_cache.py`` 与 ``test_render_inline_app.py``
-    各有一条用例专门按这个键、断言画面真的变了。
-    """
+    """按消息块缓存不可变文本；完整文本仅供兼容读取时按需拼接。"""
 
     blocks: list[Block] = field(default_factory=list)
-    text: Text | None = None
+    entries: dict[int, _BlockRenderEntry] = field(default_factory=dict)
+    markdown: dict[int, MarkdownRenderCache] = field(default_factory=dict)
+    _text: Text | None = None
+    params: tuple[Any, ...] | None = None
     expand_tools: bool = False
     expand_reasoning: bool = False
-    #: ★ D176：双轨标记开关。**必须进缓存键** —— 漏了就会"按 Ctrl+B 毫无反应且不报错"（D125-d 同型）
     show_track: bool = True
     width: int = 0
     block_ranges: list[tuple[int, int, Block]] = field(default_factory=list)
+    newline_count: int = 0
 
     @property
     def covers(self) -> int:
         return len(self.blocks)
 
+    @property
+    def text(self) -> Text | None:
+        if self._text is None and self.blocks:
+            out = Text()
+            for block in self.blocks:
+                entry = self.entries[id(block)]
+                if entry.text is None:
+                    entry.text = Text()
+                    for row in entry.rows or []:
+                        entry.text.append_text(row)
+                        entry.text.append("\n")
+                out.append_text(entry.text)
+            self._text = out
+        return self._text
+
+    @text.setter
+    def text(self, value: Text | None) -> None:
+        self._text = value
+
     def matches(
-        self, *, expand_tools: bool, expand_reasoning: bool, show_track: bool = True, width: int
+        self, *, expand_tools: bool, expand_reasoning: bool, show_track: bool = True, width: int,
     ) -> bool:
-        """渲染参数是否与本缓存一致（块**内容**是否变过由 `blocks` 的身份比对判断）。"""
         return (
-            self.show_track == show_track
-            and self.text is not None
+            self.params is not None
+            and self.show_track == show_track
             and self.expand_tools == expand_tools
             and self.expand_reasoning == expand_reasoning
             and self.width == width
         )
+
+
+def _block_render_key(block: Block, prev: Block | None) -> tuple[Any, ...]:
+    # 字符串保留引用，未变时比较不会扫描整段正文。统计与 DiffHunk 是冻结值。
+    return (
+        block.kind, block.text, block.token, block.name, block.args_summary,
+        block.args_text, block.state, block.duration_ms, block.error_kind,
+        block.change_stat, block.payload, block.path, tuple(block.hunks),
+        block.expanded, prev.kind if prev is not None else None,
+        getattr(block.card, "revision", 0),
+    )
 
 
 def render_cached(
@@ -454,142 +517,132 @@ def render_cached(
     context: CardContext,
     expand_tools: bool = False,
     expand_reasoning: bool = False,
-    #: ★ D176：是否绘制双轨标记；由 `TimelineComponent.render` 传入（纯函数不读外部状态）
     show_track: bool = True,
     hidden_count: int = 0,
     folded: bool = False,
     active_status: ActiveStatus | None = None,
     now: float | None = None,
+    segmented: bool = False,
 ) -> RenderResult:
-    """渲染块序列并复用**前缀缓存**（D56 的核心）；返回结果与**更新后的缓存**。
+    """按内容键复用每个块；新增块不使已有历史重新排版（D199）。
 
-    **不变量**：缓存里的块必须已经写完、不会再变。因此缓存只覆盖 ``blocks[:-1]``
-    ——最后一块永远重渲染，于是"正在流式的正文"与"运行中的工具卡片"天然落在尾部，
-    无需猜测谁会变。
-
-    缓存有效性同时检查三件事，缺一不可：
-
-    1. **参数**：宽度与展开状态与缓存时一致（`cache.matches`）；
-    2. **身份**：缓存覆盖的每个块仍**是**当前列表里的同一个对象（块只被追加、
-       不被替换，所以 `is` 比对既零成本又精确）；
-    3. **覆盖范围**：缓存块数必须与当前可缓存块数**相等**——少了就说明缓存落后了
-       （这一步正是上面那个真实缺陷的成因），多了就说明块被清空了。
-
-    任何一条不满足都退回全量渲染。**宁可慢一帧，也不能显示过时的内容。**
-
-    ⚠️ **缓存的重建发生在本函数内部**（D126 起），而不是留给调用方。
-    两个好处，都是实测出来的：
-
-    1. **不再重复渲染一次前缀**：以前调用方在缓存失效那一帧要自己再调一次
-       ``render_blocks(blocks[:-1])``，而本函数刚刚才渲染过 ``blocks``；
-    2. **同一帧里就能拿到稳定的前缀对象**：上层要用它去复用"已切好的行"，
-       拿不到就得等下一帧，而那一帧又要多切一次整段文本（= 用户按下第一个键时的卡顿）。
+    ``segmented=True`` 给 UI 不可变文本片段，避免先合并整个历史。
+    默认保留完整 Text 的兼容入口；缓存只拥有当前块，不累积已删除历史。
     """
-    reusable = max(0, len(blocks) - 1)  # 最后一块永不缓存
-    reuse = cache.covers if cache.covers <= reusable else 0
-
-    if reuse and not cache.matches(
-            expand_tools=expand_tools,
-            expand_reasoning=expand_reasoning,
-            show_track=show_track,
-            width=context.width
-    ,
-        ):
-        reuse = 0
-    if reuse and any(cache.blocks[index] is not blocks[index] for index in range(reuse)):
-        reuse = 0
-    if reuse and reuse != reusable:
-        # 缓存落后（块数对不上）→ 必须重渲染，否则新块既不在缓存里、也不会被渲染出来
-        reuse = 0
-
-    rebuilt = reuse != reusable
-    cache_ranges: list[tuple[int, int, Block]] = []
-    if rebuilt:
-        # ⚠️ ``blocks`` 与 ``text`` 必须**同生共死**：分开更新过一次，
-        # 症状是屏幕上少一条消息且毫无报错（见 `TimelineRenderCache`）。
-        cache.blocks = blocks[:reusable]
-        cache.text = (
-            render_blocks(
-                cache.blocks,
-                context,
-                expand_tools=expand_tools,
-                expand_reasoning=expand_reasoning,
-                show_track=show_track,
-                block_ranges=cache_ranges,
+    params = (
+        context.width, expand_tools, expand_reasoning, show_track,
+        tuple(vars(context.palette).items()), tuple(sorted(context.glyphs.items())),
+        context.diff_context_lines,
+    )
+    previous_entries = cache.entries if cache.params == params else {}
+    entries: dict[int, _BlockRenderEntry] = {}
+    segments: list[tuple[Block | None, Text | list[Text]]] = []
+    ranges: list[tuple[int, int, Block]] = []
+    offset = 0
+    misses = 0
+    rendered_chars = 0
+    prev: Block | None = None
+    for block in blocks:
+        key = _block_render_key(block, prev)
+        entry = previous_entries.get(id(block))
+        if entry is None or entry.block is not block or entry.key != key:
+            local_ranges: list[tuple[int, int, Block]] = []
+            assistant_rows = [] if segmented and block.kind == "assistant" else None
+            text = render_blocks(
+                [block], context, expand_tools=expand_tools,
+                expand_reasoning=expand_reasoning, show_track=show_track,
+                prev_block=prev, block_ranges=local_ranges,
+                markdown_cache=cache.markdown.setdefault(id(block), MarkdownRenderCache()) if block.kind == "assistant" else None,
+                assistant_rows_out=assistant_rows,
             )
-            if cache.blocks
-            else None
-        )
-        cache.block_ranges = cache_ranges
-        cache.expand_tools = expand_tools
-        cache.expand_reasoning = expand_reasoning
-        # ★ D176：重建后也要**记下**双轨开关 —— 漏了这一步的后果是「切回去时被当成没变而直接复用缓存」
-        #   （按 Ctrl+B 第二次毫无反应）。
-        cache.show_track = show_track
-        cache.width = context.width
-        reuse = reusable
+            entry = _BlockRenderEntry(
+                block, key, text if assistant_rows is None else None,
+                local_ranges, text.plain.count("\n") if assistant_rows is None else len(assistant_rows),
+                text[:-1] if text.plain.endswith("\n") else text,
+                assistant_rows, assistant_rows[:-1] if assistant_rows is not None else None,
+            )
+            misses += 1
+            rendered_chars += len(text.plain) if assistant_rows is None else sum(len(row.plain) + 1 for row in assistant_rows)
+        entries[id(block)] = entry
+        segments.append((block, entry.rows if entry.rows is not None else entry.text))
+        ranges.extend((s + offset, e + offset, b) for s, e, b in entry.ranges)
+        offset += entry.newline_count
+        prev = block
+
+    if misses or len(cache.blocks) != len(blocks) or any(a is not b for a, b in zip(cache.blocks, blocks, strict=False)):
+        cache.text = None
+    cache.entries = entries
+    cache.markdown = {id(b): cache.markdown[id(b)] for b in blocks if b.kind == "assistant" and id(b) in cache.markdown}
+    cache.blocks = list(blocks)
+    cache.params = params
+    cache.width = context.width
+    cache.expand_tools = expand_tools
+    cache.expand_reasoning = expand_reasoning
+    cache.show_track = show_track
+    cache.newline_count = offset
+    cache.block_ranges = ranges
 
     head = Text()
     if folded and hidden_count > 0:
-        # 折叠提示行**不参与缓存**：它不对应任何 Block，长度随 fold 状态变化
         head.append(
             f"—— 已折叠 {hidden_count} 块历史（Ctrl+H 展开）——\n\n",
             style=context.palette.text_faint,
         )
-
-    tail_blocks = blocks[reuse:]
-    prev = blocks[reuse - 1] if reuse > 0 else None
-    tail_ranges: list[tuple[int, int, Block]] = []
-    tail_text = render_blocks(
-        tail_blocks,
-        context,
-        expand_tools=expand_tools,
-        expand_reasoning=expand_reasoning,
-        # ★ D176：尾部也必须拿到开关（漏了它 ⇒ 助手消息的 `▎` 永远不变）
-        show_track=show_track,
-        prev_block=prev,
-        active_status=active_status,
-        now=now,
-        block_ranges=tail_ranges,
-    )
-
+    tail = Text()
+    trimmed = False
+    if active_status is not None:
+        suffix = ""
+        for _block, piece in reversed(segments):
+            ending = (
+                "".join(row.plain[-2:] + "\n" for row in piece[-2:])[-2:]
+                if isinstance(piece, list) else piece.plain[-2:]
+            )
+            suffix = ending[-(2 - len(suffix)):] + suffix
+            if len(suffix) == 2:
+                break
+        for index in range(len(segments) - 1, -1, -1):
+            block, text = segments[index]
+            if isinstance(text, list):
+                if text:
+                    if suffix == "\n\n" and not text[-1].plain:
+                        segments[index] = (block, entries[id(block)].active_rows)
+                        trimmed = True
+                    break
+            elif text.plain:
+                if suffix == "\n\n":
+                    segments[index] = (block, entries[id(block)].active_text)
+                    trimmed = True
+                break
+        tail = render_blocks(
+            [], context, prev_block=prev, active_status=active_status,
+            show_track=show_track, now=now,
+        )
     head_lines = head.plain.count("\n")
-    all_ranges: list[tuple[int, int, Block]] = []
-    if reuse and cache.block_ranges:
-        for s, e, b in cache.block_ranges:
-            all_ranges.append((s + head_lines, e + head_lines, b))
-    offset = head_lines + (cache.text.plain.count("\n") if reuse and cache.text else 0)
-    for s, e, b in tail_ranges:
-        all_ranges.append((s + offset, e + offset, b))
-
+    all_ranges = [(s + head_lines, e + head_lines, b) for s, e, b in ranges]
+    prefix = None if segmented else cache.text
+    if trimmed and prefix is not None:
+        prefix = prefix[:-1]
+    if segmented:
+        if head.plain:
+            segments.insert(0, (None, head))
+        if tail.plain:
+            segments.append((None, tail))
     return RenderResult(
-        prefix_blocks=reuse,
-        tail_rendered_blocks=len(tail_blocks),
-        tail_chars=len(tail_text.plain),
-        # "命中"的语义是**真的复用了上次缓存的文本**，而不是"缓存覆盖了 n块"：
-        # 重建那一帧也覆盖了 ``reusable`` 块，但它是刚算出来的。
-        prefix_hit=bool(reuse) and not rebuilt,
-        cache_rebuilt=rebuilt,
-        head_text=head,
-        # 注意：是**缓存里那个原对象**（不是被复制过的一份）——
-        # 身份稳定是上层复用"已切好的行"的前提（见 `RenderResult` 的说明）。
-        prefix_text=cache.text if reuse else None,
-        tail_text=tail_text,
-        block_ranges=all_ranges,
+        prefix_blocks=len(blocks) - misses,
+        tail_rendered_blocks=misses,
+        tail_chars=rendered_chars + len(tail.plain),
+        prefix_hit=bool(blocks) and misses < len(blocks),
+        cache_rebuilt=bool(misses),
+        head_text=head, prefix_text=prefix, tail_text=tail,
+        block_ranges=all_ranges, segments=segments if segmented else None,
     )
 
 
-# --------------------------------------------------------------------------- #
-# D139：展示提示（`ToolDisplay`）的收口
-# --------------------------------------------------------------------------- #
-
-#: 有**自己的渲染器**的展示类型 —— 出现这些时，卡片不再重复铺一遍纯文本输出。
-#: 依据 UI-SPEC §5.6：「结果主体（调用该工具的 `DisplayHint` 渲染器）」。
-_RICH_DISPLAY_KINDS = frozenset({"diff", "lines", "table", "error"})
+_RICH_DISPLAY_KINDS = frozenset({"diff"})
 
 
 def _is_rich_display(display: object | None) -> bool:
-    """这个展示提示是否"自带渲染器"（是 ⇒ 卡片不再铺原始文本，避免重复）。"""
+    """这个展示提示是否自带渲染器；是则避免重复铺原始文本。"""
     return display is not None and getattr(display, "kind", None) in _RICH_DISPLAY_KINDS
 
 
@@ -620,7 +673,7 @@ class TimelineBuffer:
         self.blocks: list[Block] = []
         self.fold_threshold = fold_threshold
         self.folded = False
-        #: 展开开关**两个正交维度**（D125）：工具卡+diff / 思考链。
+        #: 工具+diff / 普通思考+入梦分别跟随 Ctrl+O / Ctrl+T。
         #: 都是**会话内 UI 状态**，不进持久化 —— 所以 `/resume` 载入历史后回到默认折叠。
         self.expand_tools = False
         #: ★ D176：是否绘制**双轨标记**（用户消息 `▌` / 模型输出 `▎`）。
@@ -629,6 +682,7 @@ class TimelineBuffer:
         #: 与 `expand_tools` 同类：**只影响渲染**，不进持久化。
         self.show_track = True
         self.expand_reasoning = False
+        self.smoother = StreamSmoother()
         self._pending_delta: list[str] = []
         #: 推理增量缓冲（M4 新增）：真实模型一次思考有几百个片段，
         #: 逐个覆盖推理块文本是 O(n²)，因此与正文一样只在帧级合并（D56）
@@ -651,7 +705,7 @@ class TimelineBuffer:
     def invalidate(self, *, layout: bool = True) -> None:
         """声明"数据变了"。
 
-        **谁改了数据谁负责调用它**——这是前缀缓存能成立的全部依据。
+        谁改了数据谁负责调用它以请求重画；渲染缓存另外校验实际显示字段。
         ``layout=True`` 表示块的**数量**变了（需要重算布局），
         ``layout=False`` 表示只改了块的内容（只需重绘）。
         """
@@ -660,8 +714,13 @@ class TimelineBuffer:
             self._dirty_layout = True
 
     def has_pending(self) -> bool:
-        """本帧是否有东西要渲染（含"只改了显示状态"的情况）。"""
-        return self._dirty or bool(self._pending_delta) or bool(self._pending_reasoning)
+        """本帧是否有东西要渲染（含"只改了显示状态"的情况与平滑器未释出字符）。"""
+        return (
+            self._dirty
+            or bool(self._pending_delta)
+            or bool(self._pending_reasoning)
+            or self.smoother.has_pending()
+        )
 
     def take_dirty_layout(self) -> bool:
         """取走"需要重算布局"标记（取走即清零，与 `_dirty` 分开跑）。"""
@@ -670,6 +729,18 @@ class TimelineBuffer:
         return value
 
     # -- 基础写入 ------------------------------------------------------- #
+
+    def add_anamnesis_reference(self, run_id: str) -> Block:
+        from logox.tui.content.anamnesis import AnamesisCard
+
+        existing = next((b for b in self.blocks if b.kind == "anamnesis" and b.card.run_id == run_id), None)
+        if existing is not None:
+            return existing
+        self.flush_delta()
+        block = Block(kind="anamnesis", card=AnamesisCard(run_id, phase="restoring"))
+        self.blocks.append(block)
+        self.invalidate()
+        return block
 
     def add_user(self, text: str) -> Block:
         self.flush_delta()
@@ -686,39 +757,52 @@ class TimelineBuffer:
         return block
 
     def add_delta(self, text: str) -> None:
-        """流式正文增量：只进缓冲，**不产生块、也不失效缓存**（节流的关键）。"""
-        self._pending_delta.append(text)
+        """流式正文增量：喂入平滑器，**不产生块、也不失效缓存**（节流的关键）。"""
+        self.smoother.feed_text(text)
         self._dirty = True
 
     def add_reasoning_delta(self, text: str) -> None:
-        """流式推理增量：同样只进缓冲（真实模型一次思考有几百个片段）。"""
-        self._pending_reasoning.append(text)
+        """流式推理增量：喂入平滑器（真实模型一次思考有几百个片段）。"""
+        self.smoother.feed_reasoning(text)
         self._dirty = True
 
+    def step_delta(self, *, include_reasoning: bool = True) -> Block | None:
+        """从流式平滑器按弹性打字机速率释出本帧正文增量并合并成块。"""
+        if include_reasoning:
+            self.step_reasoning()
+        text = self.smoother.step_text()
+        if not text:
+            return None
+        last = self.blocks[-1] if self.blocks else None
+        if last is not None and last.kind == "assistant":
+            last.text += text
+            self.invalidate(layout=False)
+            return last
+        return self.add_assistant(text)
+
+    def step_reasoning(self) -> Block | None:
+        """从流式平滑器按弹性打字机速率释出本帧推理增量并追加到推理块。"""
+        added = self.smoother.step_reasoning()
+        if not added:
+            return None
+        block = self._last_of("reasoning")
+        if block is None:
+            block = self.start_reasoning()
+        self.update_reasoning(block.text + added)
+        return block
+
     def flush_delta(self) -> Block | None:
-        """把缓冲的增量落成块。返回新产生的**正文**块（推理另见 flush_reasoning）。
+        """把缓冲的增量全部落成块（终态瞬时排空）。返回新产生的**正文**块。
 
         ⚠️ **必须与紧邻的上一个正文块合并，不能另起一块**（D76）。
-
-        这是用户第三次报障的真正原因（原话："有没有可能是流式输出的问题呢？"
-        ——**他猜对了**）。一次请求里正文会被 flush 好几次（每帧一次），
-        而每一帧都 ``add_assistant()`` 出一块。屏幕上于是变成：
-
-            我是 Logox，                      ← 第 1 帧的块，自己占一行
-            一个在终端里工作的编码助手。至于底层是哪个模型，…
-
-        第一块只有十几格就断了，因为**它是另一块**，而不是同一段文字的第二行。
-        折行器再对也没用——它根本没机会把两块连起来。
-
-        症状与"软换行没重排"（D68）**看起来一样、成因完全不同**：
-        D68 是同一块内部没重排，D76 是文字被切成了多块。
-        两者都会让用户看到"莫名其妙的换行"。
         """
         self.flush_reasoning()
-        if not self._pending_delta:
+        text = self.smoother.flush_all_text()
+        if not text and self._pending_delta:
+            text = "".join(self._pending_delta)
+            self._pending_delta.clear()
+        if not text:
             return None
-        text = "".join(self._pending_delta)
-        self._pending_delta.clear()
         last = self.blocks[-1] if self.blocks else None
         if last is not None and last.kind == "assistant":
             # 同一段正文的后续帧 → 续写。**不能新建块**，否则渲染层会把它当独立段落。
@@ -728,17 +812,13 @@ class TimelineBuffer:
         return self.add_assistant(text)
 
     def flush_reasoning(self) -> Block | None:
-        """把缓冲的推理增量**累加**进当前推理块。
-
-        ⚠️ 这里是 **append 而不是覆盖**，而且**当前块内的文本要一起算**：
-        一次请求会 flush 很多帧（每帧一次），若每帧只覆盖成"本帧的增量"，
-        帧 1 的推理就丢了——实测症状是"推理块只有最后一句"。
-        正确做法是把"当前块已有的文本 + 本帧增量"一起写回去。
-        """
-        if not self._pending_reasoning:
+        """把缓冲的推理增量全部**累加**进当前推理块（终态瞬时排空）。"""
+        added = self.smoother.flush_all_reasoning()
+        if not added and self._pending_reasoning:
+            added = "".join(self._pending_reasoning)
+            self._pending_reasoning.clear()
+        if not added:
             return None
-        added = "".join(self._pending_reasoning)
-        self._pending_reasoning.clear()
         block = self._last_of("reasoning")
         if block is None:
             block = self.start_reasoning()
@@ -952,13 +1032,13 @@ class TimelineBuffer:
         self.invalidate(layout=False)
 
     def toggle_expand_reasoning(self) -> None:
-        """``Ctrl+T``：切换**思考链**的展开（D125）。
+        """``Ctrl+T``：切换**普通思考与入梦卡片**的展开（D125）。
 
-        与 :meth:`toggle_expand_tools` 是**两个独立开关**，互不影响 ——
+        普通思考与入梦共用此开关，与 :meth:`toggle_expand_tools` 独立。
         用户经常只想核对"执行了什么"，而思考链是冗长的内心独白。
         （例外处理与 `Ctrl+O` 一致）
         """
-        if self._clear_block_expand_overrides(("reasoning",)):
+        if self._clear_block_expand_overrides(("reasoning", "anamnesis")):
             self.expand_reasoning = False
         else:
             self.expand_reasoning = not self.expand_reasoning
@@ -967,7 +1047,7 @@ class TimelineBuffer:
     def _clear_block_expand_overrides(self, kinds: tuple[str, ...]) -> bool:
         """把指定的块打回"跟随全局开关"（`expanded=None`）；返回**是否真的清了东西**。
 
-        块级覆盖的**唯一**来源是 D40 的"失败自动展开"；用户一按全局键，
+        块级覆盖来自失败自动展开或单卡片点击；用户一按全局键，
         意图就是让全局开关说了算（F-40）。注意**只清已有块**：
         之后新失败的卡片仍会自动展开一次（那是 D40 要求的）。
 
@@ -990,7 +1070,7 @@ class TimelineBuffer:
     def set_expand_reasoning(self, value: bool) -> None:
         if self.expand_reasoning != value:
             self.expand_reasoning = value
-            self._clear_block_expand_overrides(("reasoning",))
+            self._clear_block_expand_overrides(("reasoning", "anamnesis"))
             self.invalidate(layout=False)
 
     def ingest(self, event: ev.AnyEvent, *, tool_args_summary: str = "") -> bool:

@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -60,7 +61,7 @@ from logox.config.schema import ThemePalette
 from logox.tui import format as fmt
 from logox.tui.content.cards import CardContext
 
-__all__ = ["MarkdownBlock", "parse_markdown", "render_markdown"]
+__all__ = ["MarkdownBlock", "MarkdownRenderCache", "parse_markdown", "render_markdown"]
 
 # --------------------------------------------------------------------------- #
 # 块级解析
@@ -423,7 +424,20 @@ def _highlight_code(line: str, palette: ThemePalette) -> Text:
 # --------------------------------------------------------------------------- #
 
 
-def render_markdown(source: str, width: int, context: CardContext) -> list[Text]:
+@dataclass
+class MarkdownRenderCache:
+    """只保留当前 Markdown 结构的排版与代码行，不缓存历次增长的全文。"""
+
+    params: tuple[Any, ...] | None = None
+    blocks: dict[tuple[Any, ...], list[Text]] = field(default_factory=dict)
+    code_lines: dict[tuple[int, str], list[Text]] = field(default_factory=dict)
+    decorated_lines: list[tuple[Text, Text]] = field(default_factory=list)
+    decoration: tuple[bool, str] | None = None
+
+
+def render_markdown(
+    source: str, width: int, context: CardContext, *, cache: MarkdownRenderCache | None = None,
+) -> list[Text]:
     """把 Markdown 渲染成**行列表**（每行是一个 Rich ``Text``）。
 
     ``width`` 是可用宽度；保证每一行 ``cell_len <= width``。
@@ -433,26 +447,47 @@ def render_markdown(source: str, width: int, context: CardContext) -> list[Text]
         return []
     lines: list[Text] = []
     blocks = parse_markdown(source)
+    params = (width, tuple(vars(palette).items()))
+    old = cache.blocks if cache is not None and cache.params == params else {}
+    retained: dict[tuple[Any, ...], list[Text]] = {}
+    if cache is not None and cache.params != params:
+        cache.code_lines.clear()
 
     for index, block in enumerate(blocks):
-        if block.kind == "code":
-            lines.extend(_render_code_block(block, width, palette))
+        key = (
+            block.kind, block.text, block.level, block.marker, block.lang,
+            tuple(block.lines), tuple(block.header), tuple(block.align),
+            tuple(tuple(row) for row in block.rows),
+        )
+        if key in old:
+            rendered = old[key]
+        elif block.kind == "code":
+            rendered = _render_code_block(
+                block, width, palette, line_cache=cache.code_lines if cache is not None else None,
+            )
         elif block.kind == "heading":
-            lines.extend(_render_heading(block, width, palette))
+            rendered = _render_heading(block, width, palette)
         elif block.kind == "hr":
-            lines.append(_render_hr(width, palette))
+            rendered = [_render_hr(width, palette)]
         elif block.kind == "quote":
-            lines.extend(_render_quote(block, width, palette))
+            rendered = _render_quote(block, width, palette)
         elif block.kind in ("bullet", "ordered"):
-            lines.extend(_render_list_item(block, width, palette))
+            rendered = _render_list_item(block, width, palette)
         elif block.kind == "table":
-            lines.extend(_render_table(block, width, palette))
+            rendered = _render_table(block, width, palette)
         else:
-            lines.extend(_render_paragraph(block.text, width, palette))
+            rendered = _render_paragraph(block.text, width, palette)
+        retained[key] = rendered
+        lines.extend(rendered)
 
         # 块之间空一行（最后一块之后不空）——阅读节奏靠它，不是靠行尾空格
         if index != len(blocks) - 1 and block.kind != "hr":
             lines.append(Text())
+    if cache is not None:
+        cache.params = params
+        cache.blocks = retained
+        live_code = {(width, raw) for block in blocks if block.kind == "code" for raw in block.lines}
+        cache.code_lines = {key: value for key, value in cache.code_lines.items() if key in live_code}
     return lines
 
 
@@ -738,7 +773,10 @@ def _render_table_records(block: MarkdownBlock, width: int, palette: ThemePalett
     return out
 
 
-def _render_code_block(block: MarkdownBlock, width: int, palette: ThemePalette) -> list[Text]:
+def _render_code_block(
+    block: MarkdownBlock, width: int, palette: ThemePalette,
+    *, line_cache: dict[tuple[int, str], list[Text]] | None = None,
+) -> list[Text]:
     """代码块：四周完整圆角边框闭合 + 语言标签，**内容不重排**（只对超长行硬切）。
 
     为什么代码不做 word-wrap：缩进和换行对代码是**语义**，重排会改变含义
@@ -770,6 +808,11 @@ def _render_code_block(block: MarkdownBlock, width: int, palette: ThemePalette) 
 
     inner = max(1, width - _CODE_BORDER_CELLS)
     for raw in block.lines:
+        key = (width, raw)
+        if line_cache is not None and key in line_cache:
+            out.extend(line_cache[key])
+            continue
+        rendered_line: list[Text] = []
         # 超长行硬切（不丢内容），逐段着色并右侧补齐闭合
         for chunk in _split_hard(raw, inner):
             piece = Text("│ ", style=palette.md_code_block_border)
@@ -780,7 +823,10 @@ def _render_code_block(block: MarkdownBlock, width: int, palette: ThemePalette) 
             if pad > 0:
                 piece.append(" " * pad)
             piece.append(" │", style=palette.md_code_block_border)
-            out.append(piece)
+            rendered_line.append(piece)
+        out.extend(rendered_line)
+        if line_cache is not None:
+            line_cache[key] = rendered_line
 
     # 底边：╰──────╯
     footer = Text("╰" + "─" * (width - 2) + "╯", style=palette.md_code_block_border)

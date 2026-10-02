@@ -26,7 +26,7 @@ dependencies = [
 [project.scripts]
 logox = "logox.cli:main"
 
-# 开发期依赖（可选）。测试本身用标准库 unittest 编写（D45），pytest 只是可选的运行器。
+# 开发期依赖（可选）。现有测试包含 unittest 与 pytest 用例；完整验收需要安装 dev 依赖。
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
@@ -65,8 +65,7 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["logox"]
 
-# 测试用标准库 unittest 编写（D45）：无网络环境下也能运行。
-# pytest 可用时可直接收集这些测试（pytest 原生支持 unittest 风格），无需改写。
+# pytest 同时收集 unittest 与 pytest 用例；安装 dev 依赖后可离线运行。
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

@@ -1,6 +1,6 @@
 """差分渲染器（D80 / MODULE_tui_render §4）。
 
-这是整个重写的核心，也是"流畅"的来源。算法与 Pi 的 ``TUI.doRender`` 一致：
+这是整个重写的核心，也是"流畅"的来源。沿用逐行差分（D80），主屏历史保留按 D199/A 修订：
 
 1. **把组件渲染成行**（``render(width) -> list[Text]``）；
 2. **与上一帧逐行比较**，找出 ``first_changed`` / ``last_changed``；
@@ -12,14 +12,15 @@
 便宜一个数量级。而 AI agent 界面最常见的动作是**末尾追加**，
 于是"变化区间"通常只有最后几行。
 
-三种策略（与 Pi 一致）
+当前绘制策略（D199/A）
 ----------------------
 ====================== ============================================================
 条件                    策略
 ====================== ============================================================
 首帧                    直接输出全部行（**不清屏**，假定屏幕干净）
-宽度或高度变了          清屏 + 全量重画（折行位置全变，无法增量）
-内容变短了              清屏 + 全量重画（否则旧行会残留在下面）
+宽度或高度变了          只清当前屏 + 重画可见尾部，保留回滚历史
+内容变短了              清理当前多余行，必要时只重画可见尾部
+屏外旧块变化            用屏内稳定行对齐，仅更新当前画面；旧历史保留当时状态
 通常情况                移到 ``first_changed``，清到末尾，重画变化段
 ====================== ============================================================
 
@@ -44,7 +45,7 @@ from typing import Any
 
 from rich.text import Text
 
-from logox.tui.render.ansi import strip_ansi, text_to_ansi, visible_width
+from logox.tui.render.ansi import CLEAR_VIEWPORT, strip_ansi, text_to_ansi, visible_width
 from logox.tui.render.component import Component, Container, fit_lines
 from logox.tui.render.keys import Key
 from logox.tui.render.terminal import Terminal
@@ -62,7 +63,7 @@ MIN_RENDER_INTERVAL_MS = 16.0
 SYNC_BEGIN = "\x1b[?2026h"
 SYNC_END = "\x1b[?2026l"
 
-#: 清屏（含清回滚历史）—— 只在宽度/高度变化或内容变短时用
+#: 清屏（含清回滚历史）—— 仅供显式清空／进入应用，普通重绘禁止使用
 CLEAR_ALL = "\x1b[2J\x1b[H\x1b[3J"
 
 #: 当前帧丢弃旧帧的**不变量**：一帧的字节必须完整成对
@@ -400,7 +401,7 @@ class Screen:
         这样测试可以完全绕过节流与终端（直接调它），
         而节流的判断集中在 :meth:`request_render` 一处。
 
-        算法与 Pi 的 ``TUI.doRender`` 一致。三个必须一起理解的状态：
+        沿用行差分，主屏历史按 D199/A 保留。三个相关状态：
 
         * ``_hardware_cursor_row`` —— 终端光标**实际**在第几行；
         * ``_previous_viewport_top`` —— 上一帧可见区域的**首行行号**；
@@ -410,11 +411,12 @@ class Screen:
         （滚出去的行进了终端的回滚缓冲，用户能滚回去看）。所以"第 0 行"
         是缓冲区里的绝对行号，而屏幕上看得见的只有最后 ``height`` 行。
         一旦要改的行已经滚出可视区（``first < viewport_top``），
-        **增量重画就不再可能**（那几行已经不在屏幕上了），只能整屏重画。
-        漏掉这个判断的症状是：内容一长，界面就开始花。
+        不回写那些旧历史行；用屏内稳定行对齐当前画面，无锚点时只重画可见尾部。
+        把旧逻辑行号直接当屏内坐标，会使当前画面错位。
         """
         self._render_requested = False
         self._last_render_at = time.monotonic() * 1000.0
+        self._cancel_deferred()
 
         width = max(1, self.terminal.columns)
         height = max(1, self.terminal.rows)
@@ -436,6 +438,7 @@ class Screen:
         #    逐字符样式再渲染"，代价与**总字符数**成正比。会话一长，敲一个字就要
         #    重算几千行的字节（实测 2000 行 ≈ 33ms），而这几千行里变了的通常只有 1 行。
         #    所以这里按**对象身份**复用：同一行对象 → 字节一定一样。
+        previous_rows = self._serialized_rows
         new_lines = self._serialize_rows(raw)
         self._lines = new_lines
         self._serialized_rows = raw
@@ -483,9 +486,9 @@ class Screen:
             self._position_hardware_cursor(self._cursor_pos, len(new_lines))
             return
 
-        # ⑥ 要改的行已经滚出可视区 → 只能整屏重画（见 docstring）
+        # ⑥ 变化涉及屏外旧行：保留回滚历史，以屏内稳定行对齐当前画面。
         if first < prev_viewport_top:
-            self._full_render(new_lines, width, height, clear=True)
+            self._render_visible_changes(new_lines, raw, previous_rows, width, height)
             return
 
         self._write_incremental(
@@ -661,8 +664,12 @@ class Screen:
         self.stats["full_redraws"] += 1
         buffer = [SYNC_BEGIN]
         if clear:
-            buffer.append(CLEAR_ALL)
-        buffer.append("\r\n".join(lines))
+            # D199/A：只重画当前屏；历史回滚区保持原样，禁止重放全部会话。
+            buffer.append(CLEAR_VIEWPORT)
+            visible = lines[max(0, len(lines) - height):]
+        else:
+            visible = lines
+        buffer.append("\r\n".join(visible))
         buffer.append(SYNC_END)
         self.terminal.write("".join(buffer))
 
@@ -680,6 +687,58 @@ class Screen:
         self._previous_width = width
         self._previous_height = height
         self._position_hardware_cursor(self._cursor_pos, len(lines))
+
+    def _render_visible_changes(
+        self, lines: list[str], rows: list[Text], old_rows: list[Text],
+        width: int, height: int,
+    ) -> None:
+        """以屏内稳定行对齐逻辑行号；已滚入历史的内容不再回写。"""
+        old_top = self._previous_viewport_top
+        positions: dict[int, int] = {}
+        repeated: set[int] = set()
+        for index, row in enumerate(rows):
+            identity = id(row)
+            if identity in positions:
+                repeated.add(identity)
+            positions[identity] = index
+        old_identities: set[int] = set()
+        for row in old_rows:
+            identity = id(row)
+            if identity in old_identities:
+                repeated.add(identity)
+            old_identities.add(identity)
+        shift: int | None = None
+        for index in range(old_top, min(len(old_rows), old_top + height)):
+            row = old_rows[index]
+            target = positions.get(id(row))
+            if target is not None and id(row) not in repeated and row.plain and rows[target] is row:
+                shift = target - index
+                break
+        if shift is None or old_top + shift < 0:
+            self._full_render(lines, width, height, clear=True)
+            return
+
+        if shift >= 0:
+            self._previous = [""] * shift + self._previous
+        else:
+            self._previous = self._previous[-shift:]
+        top = max(0, old_top + shift)
+        self._previous_viewport_top = top
+        self._hardware_cursor_row = max(0, self._hardware_cursor_row + shift)
+        first, last = self._diff(lines)
+        appended = len(lines) > len(self._previous)
+        if appended:
+            if first == -1:
+                first = len(self._previous)
+            last = len(lines) - 1
+        first = max(top, first)
+        if last >= first:
+            self._write_incremental(lines, first, last, appended, width, height, top)
+        else:
+            self.stats["skipped"] += 1
+            self._position_hardware_cursor(self._cursor_pos, len(lines))
+        self._previous = lines
+        self._previous_width, self._previous_height = width, height
 
     # -- 内部：硬件光标 -------------------------------------------------- #
 

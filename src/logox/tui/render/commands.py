@@ -3,10 +3,10 @@
 为什么单独一个文件
 ==================
 
-`render/app.py` 的职责是"把内核接到渲染器上"（订阅事件、驱动帧、管输入）。
+`render/app.py` 的职责是「把内核接到渲染器上」（订阅事件、驱动帧、管输入）。
 而 ``/login`` 这类命令要做的是**一串带浮层的交互**：选供应商 → 输密钥 →
 抓模型 → 确认保存 → 切模型。把它塞进 `app.py` 会让那个文件同时负责
-"渲染循环"与"业务对话"，两边都不好读、也不好测。
+"渲染循环「与」业务对话"，两边都不好读、也不好测。
 
 于是分成两边，中间只隔一个窄接口（:class:`CommandHost`）：
 
@@ -30,15 +30,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from rich.text import Text
-
 from rich.cells import cell_len
+from rich.text import Text
 
 from logox.tui.commands import (
     PLANNED_COMMANDS,
@@ -63,7 +63,7 @@ logger = logging.getLogger("logox.tui.render.commands")
 #: 思考档位。**必须与** ``ProviderConfig.thinking_effort`` 的 Literal 一致
 #: （测试里有一条断言盯着这件事，见 `tests/tui/test_render_commands.py`）。
 #:
-#: 为什么不直接引用 schema 里那个 Literal：界面只该知道"档位"这个名字，
+#: 为什么不直接引用 schema 里那个 Literal：界面只该知道「档位」这个名字，
 #: 不该去反射厂商侧的数据模型；而且内核接受的是**字符串**，由它自己转配置。
 EFFORT_LEVELS: tuple[str, ...] = ("off", "low", "medium", "high", "auto")
 
@@ -82,6 +82,16 @@ class CommandHost(Protocol):
     content_width: int
     #: 可用内容高度（面板据此决定滚动窗口）
     content_rows: int
+
+    @property
+    def busy(self) -> bool:
+        """是否正在生成回复。
+
+        `/reload` 据此**拒绝执行**（Q3-A 裁定）：重扫记忆/技能会换掉系统提示，
+        而正在流式生成的那一次请求参数在发起时就固化进 `ChatRequest` 了 ——
+        中途重载得到的是"半旧的这一轮 + 全新的下一轮"，两边都不是用户想要的状态。
+        """
+        ...
 
     async def push_overlay(self, component: Any, *, max_rows: int | None = None) -> Any:
         """显示一个浮层并等它交出结果（Esc 取消 → 组件自己决定返回什么）。"""
@@ -194,7 +204,7 @@ class CommandRunner:
         """写回 ``state.toml``（D30）。**失败只提示，不中断**。
 
         放进线程池是因为文件写入是阻塞的——直接 ``await`` 同步版本会卡住事件循环，
-        而事件循环同时还在跑流式输出（症状是"打字突然一顿"）。
+        而事件循环同时还在跑流式输出（症状是「打字突然一顿」）。
         """
         store = getattr(self._runtime, "state_store", None)
         if store is None:
@@ -243,10 +253,9 @@ class CommandRunner:
         """选供应商 → 输密钥 → 抓模型 → 确认是否记住 → 热替换内核的 provider。
 
         三步都要能**优雅退出**（Esc = 取消，当前会话原封不动）。这类多步交互最容易
-        写出的缺陷是"取消到一半留下半成品状态"，因此本方法只在**最后一步之后**
+        写出的缺陷是「取消到一半留下半成品状态」，因此本方法只在**最后一步之后**
         才碰内核与 `state.toml`。
         """
-        del argument  # /login 不接受参数（供应商名由选择器给）
         runtime = self._runtime
         if getattr(runtime, "registry", None) is None:
             self.host.notice("/login 需要 Provider 注册表（当前装配没有提供）", token="warning")
@@ -257,30 +266,53 @@ class CommandRunner:
             self.host.notice("没有任何可用的 Provider", token="warning")
             return
 
-        choices: list[Choice] = []
-        for name in names:
-            details = runtime.provider_details(name)
-            env_name = details.get("api_key_env") or ""
-            hint = f"需要 {env_name}" if env_name else "无需密钥"
-            if name == runtime.provider_name:
-                hint = f"当前 · {hint}"
-            choices.append(Choice(value=name, label=name, hint=hint))
-
-        picked = await self._pick(
-            self._state("选择供应商", choices, current=runtime.provider_name)
+        # 支持 /login [provider] [--reset]（D190：凭据复用与显式重置）
+        tokens = argument.strip().split()
+        is_reset = any(tok.lower() in ("--reset", "-r", "reset") for tok in tokens)
+        explicit_provider = next(
+            (tok for tok in tokens if not tok.startswith("-") and tok.lower() != "reset"), None
         )
-        if picked is None:
-            self.host.notice("已取消登录（当前会话不变）", token="text_faint")
-            return
-        provider_name = picked.value
+
+        provider_name = explicit_provider if (explicit_provider and explicit_provider in names) else None
+
+        if provider_name is None:
+            choices: list[Choice] = []
+            for name in names:
+                details = runtime.provider_details(name)
+                env_name = details.get("api_key_env") or ""
+                has_key = bool(details.get("has_key"))
+                if not env_name:
+                    hint = "无需密钥"
+                elif has_key:
+                    hint = f"已配置 ({env_name})"
+                else:
+                    hint = f"未配置 · 需要 {env_name}"
+                if name == runtime.provider_name:
+                    hint = f"当前 · {hint}"
+                choices.append(Choice(value=name, label=name, hint=hint))
+
+            picked = await self._pick(
+                self._state("选择供应商", choices, current=runtime.provider_name)
+            )
+            if picked is None:
+                self.host.notice("已取消登录（当前会话不变）", token="text_faint")
+                return
+            provider_name = picked.value
+
         details = runtime.provider_details(provider_name)
         env_name = details.get("api_key_env") or ""
+        has_key = bool(details.get("has_key"))
 
         api_key: str | None = None
-        if env_name:
+        if env_name and (not has_key or is_reset):
+            prompt_title = (
+                f"输入 API Key · {provider_name}"
+                if not has_key
+                else f"重设 API Key · {provider_name}"
+            )
             entered = await self.host.push_overlay(
                 PromptComponent(
-                    title=f"输入 API Key · {provider_name}",
+                    title=prompt_title,
                     label=f"环境变量名：{env_name}（粘贴后按 Enter）",
                     palette=self._palette(),
                 )
@@ -289,6 +321,8 @@ class CommandRunner:
                 self.host.notice("已取消登录（当前会话不变）", token="text_faint")
                 return
             api_key = entered
+        elif env_name and has_key:
+            self.host.notice(f"复用已保存的密钥凭据（{env_name}）", token="text_faint")
 
         # **先验证再替换**：构造失败时当前 provider 原封不动。
         try:
@@ -298,7 +332,7 @@ class CommandRunner:
             return
 
         # ---- ★ 自动抓取真实可用模型（D65） ----
-        # 密钥刚到手，这是唯一能问端点"你有哪些模型"的时刻。抓取失败**不影响登录**：
+        # 密钥刚到手或复用，查询端点「你有哪些模型」。抓取失败**不影响登录**：
         # 回退到本地预设表，并把原因说出来。
         if hasattr(runtime, "refresh_models"):
             self.host.notice(f"正在向 {provider_name} 查询可用模型…", token="text_faint")
@@ -322,13 +356,41 @@ class CommandRunner:
         # 到这里才开始真正改变运行时
         model = runtime.default_model_for(provider_name) or runtime.model
         self._swap_provider(provider, provider_name, model)
+
+        applier = getattr(runtime, "apply_model", None)
+        if callable(applier):
+            prober = getattr(runtime, "probe_model_window", None)
+            if callable(prober):
+                with contextlib.suppress(Exception):
+                    await prober(model)
+            applier(model)
+            eager_compactor = getattr(runtime, "eager_compact_if_needed", None)
+            if callable(eager_compactor):
+                try:
+                    compact_report = await eager_compactor()
+                    if compact_report is not None:
+                        desc = "已及早压缩"
+                        token = "text_faint"
+                        if compact_report.strategy == "prune+fold+memo":
+                            desc = "已深度提炼为全局备忘录"
+                            token = "accent"
+                        elif compact_report.strategy == "prune+fold+truncated":
+                            desc = "已执行安全机械截断"
+                            token = "warning"
+                        self.host.notice(
+                            f"—— 切换供应商后历史会话 ({compact_report.tokens_before:,} tokens) {desc}至 {compact_report.tokens_after:,} tokens ——",
+                            token=token,
+                        )
+                except Exception as exc:
+                    logger.warning("及早压缩执行失败：%s", exc)
+
         await self._persist(
             lambda: runtime.state_store.set_last_model(provider=provider_name, model=model),
             f"供应商 {provider_name}",
         )
 
     async def _remember_key(self, env_name: str, api_key: str) -> None:
-        """问"要不要把密钥写进文件"，然后照办。
+        """问「要不要把密钥写进文件」，然后照办。
 
         **默认焦点在"否"**（见 `ConfirmComponent`）：误按一次 Enter 不应该做出
         "把密钥写进磁盘"这种决定。
@@ -390,12 +452,18 @@ class CommandRunner:
     # ------------------------------------------------------------------ #
 
     async def _cmd_model(self, argument: str) -> None:
-        """不带参数 → 弹窗选；带参数 → 直接切（两种都支持）。
+        """不带参数 → 弹窗选；带参数 → 直接切；``refresh`` → 重抓本地清单。
 
-        直接切是留给"我知道要哪个"的场景（也是脚本化与测试的入口），
-        弹窗是留给"我不记得有哪些"的场景。**同一个切换实现**，两条入口。
+        直接切是留给「我知道要哪个」的场景（也是脚本化与测试的入口），
+        弹窗是留给「我不记得有哪些」的场景。**同一个切换实现**，两条入口。
+
+        ``/model refresh``（D188）专给本地免鉴权端点：刚 `ollama pull` 了新模型时，
+        重启太重、盲打 `/model <名字>` 又要求你先记住名字 —— 打它刷新一次。
         """
         wanted = argument.strip()
+        if wanted.lower() == "refresh":
+            await self._refresh_models()
+            return
         if wanted:
             await self._switch_model(wanted)
             return
@@ -425,6 +493,46 @@ class CommandRunner:
             return
         await self._switch_model(picked.value)
 
+    async def _refresh_models(self) -> None:
+        """重抓**本地**端点（Ollama / LM Studio）的模型清单，并**如实**报告结果。
+
+        这里刻意不静默降级：用户主动打了一条命令，就该知道到底成没成
+        （D47 第三条：宁可少列，也不假装成功）。启动时那一次才是静默的。
+        """
+        runtime = self._runtime
+        refresher = getattr(runtime, "refresh_local_models", None)
+        if not callable(refresher):
+            self.host.notice(
+                "当前装配不支持刷新本地模型；可直接用 /model <模型名>",
+                token="warning",
+            )
+            return
+        results = await refresher()
+        if not results:
+            self.host.notice(
+                "没有免鉴权端点（本地 Ollama / LM Studio）。云端模型在 /login 成功后自动抓取。",
+                token="text_faint",
+            )
+            return
+        for name, result in results:
+            if getattr(result, "ok", False):
+                count = len(getattr(result, "models", []) or [])
+                if count == 0:
+                    self.host.notice(
+                        f"—— {name} 刷新完成，但端点返回 0 个模型（沿用上次结果）——",
+                        token="warning",
+                    )
+                else:
+                    self.host.notice(
+                        f"—— 已刷新 {name}：{count} 个模型（再打 /model 就能看到）——",
+                        token="accent",
+                    )
+            else:
+                self.host.notice(
+                    f"—— {name} 刷新失败：{getattr(result, 'error', '未知原因')}（沿用上次结果）——",
+                    token="warning",
+                )
+
     async def _switch_model(self, model: str) -> None:
         """切换模型：改内核 → 更新状态行 → 写 `state.toml`。"""
         runtime = self._runtime
@@ -444,7 +552,31 @@ class CommandRunner:
         except Exception as exc:
             self.host.notice(f"无法切换到 {model}：{exc}", token="danger")
             return
-        if window is None and callable(applier):
+
+        # ★ D188：及早压缩（Eager Compaction）——换到小窗口模型后若当前历史超标，立即就地压缩
+        compact_report = None
+        eager_compactor = getattr(runtime, "eager_compact_if_needed", None)
+        if callable(eager_compactor):
+            try:
+                compact_report = await eager_compactor()
+            except Exception as exc:
+                logger.warning("及早压缩执行失败（不影响模型切换）：%s", exc)
+
+        if compact_report is not None:
+            size = f"，窗口 {window // 1000}k" if window else ""
+            desc = "已自动压缩"
+            token = "text_faint"
+            if compact_report.strategy == "prune+fold+memo":
+                desc = "已深度提炼为全局备忘录"
+                token = "accent"
+            elif compact_report.strategy == "prune+fold+truncated":
+                desc = "已执行安全机械截断"
+                token = "warning"
+            self.host.notice(
+                f"—— 模型已切换为 {model}{size}；历史会话 ({compact_report.tokens_before:,} tokens) {desc}至 {compact_report.tokens_after:,} tokens ——",
+                token=token,
+            )
+        elif window is None and callable(applier):
             # 自定义模型名（不在预设表里）⇒ 查不到上下文窗口：如实告知，而不是默默沿用旧窗口
             self.host.notice(
                 f"—— 模型已切换为 {model}；未查到该模型的上下文窗口，压缩阈值沿用当前值 ——",
@@ -504,6 +636,65 @@ class CommandRunner:
         )
 
     # ------------------------------------------------------------------ #
+    # /reload
+    # ------------------------------------------------------------------ #
+
+    async def _cmd_reload(self, argument: str) -> None:
+        """重扫磁盘上的资源：记忆 / 技能 / 模板命令 / 主题，并校验配置。
+
+        **不重载 Python 代码**（改 `.py` 仍要重启）——边界见 MODULE_08 §5.2。
+        正在生成回复时拒绝执行：中途重载会得到"半旧的这一轮 + 全新的下一轮"，
+        而正在流式生成的那次请求参数在发起时就固化进 `ChatRequest` 了。
+        """
+        del argument  # 没有"只重载某一项"这回事：重扫是廉价的，选择性重载只会多一份开关
+        runtime = self._runtime
+        reloader = getattr(runtime, "reload_resources", None)
+        if not callable(reloader):
+            self.host.notice("当前环境不支持资源重载", token="warning")
+            return
+        if getattr(self.host, "busy", False):
+            self.host.notice("—— 正在回答，等这一轮结束后再 /reload ——", token="warning")
+            return
+
+        try:
+            # 走线程池：记忆扫描与配置校验都是同步文件 IO，
+            # 直接 await 会把事件循环卡住（症状是"打字一顿"，与 `_persist` 同一个理由）。
+            report = await asyncio.to_thread(reloader)
+        except Exception as exc:  # 重载本身炸了也必须看得见，且不能中断会话
+            logger.exception("/reload 失败")
+            self.host.notice(f"资源重载失败：{type(exc).__name__}: {exc}", token="danger")
+            return
+
+        for item in report.items:
+            if item.error:
+                self.host.notice(f"· {item.name}：{item.error}", token="danger")
+            else:
+                self.host.notice(f"· {item.name}：{item.detail}", token="text_faint")
+
+        # 主题要在界面侧重读才算生效：`load_theme` 每次调用都读文件，
+        # 所以"同名文件改了内容"这条路径只有这里能走通（`/theme` 切走再切回也可以）。
+        try:
+            applied = self.host.apply_theme(self.host.theme.name)
+            self.host.notice(f"· 主题：{applied}（文件已重读，视口已重绘）", token="text_faint")
+        except Exception as exc:
+            self.host.notice(
+                f"· 主题：{self.host.theme.name} 重读失败（保持当前主题）：{exc}", token="danger"
+            )
+
+        if report.prefix_changed:
+            self.host.notice(
+                f"—— 已重载；系统提示已变（{report.system_tokens_before:,} → "
+                f"{report.system_tokens_after:,} tokens），下一次请求的缓存前缀按全价重算一次 ——",
+                token="warning",
+            )
+        else:
+            self.host.notice("—— 已重载；系统提示未变（缓存前缀不受影响）——", token="text_faint")
+
+        for note in report.not_reloaded:
+            self.host.notice(f"（本项仍需重启：{note}）", token="text_muted")
+        self.host.refresh_status()
+
+    # ------------------------------------------------------------------ #
     # /effort
     # ------------------------------------------------------------------ #
 
@@ -511,7 +702,7 @@ class CommandRunner:
         """切换思考档位（D42 / **D58：设置即生效**）。
 
         "生效"的精确含义：**下一次将要发起的模型请求**用新档位。正在流式生成的那一次
-        不受影响——请求参数在发起时就固化进 `ChatRequest` 了；要"追溯"只能取消当前
+        不受影响——请求参数在发起时就固化进 `ChatRequest` 了；要「追溯」只能取消当前
         请求再重发，那会把用户正在读的回答拦腰截断。
         """
         effort = argument.strip().lower()
@@ -743,7 +934,7 @@ class CommandRunner:
         与自动压缩共用同一条实现（`builder.force_compact`）与同一对事件，
         所以：时间线会显示压缩提示、状态栏的 ctx 会立刻变小、`pre_compact` 钩子也会触发。
         """
-        del argument  # 本项目压缩是确定性的（拼每轮摘要），没有"给模型的压缩指令"这回事
+        del argument  # 本项目压缩是确定性的（拼每轮摘要），没有「给模型的压缩指令」这回事
         runtime = self._runtime
         applier = getattr(runtime, "apply_compact", None)
         if not callable(applier):
@@ -753,10 +944,17 @@ class CommandRunner:
         if report is None:
             self.host.notice("—— 无须压缩（当前上下文未超过阈值）——", token="text_faint")
             return
+        details = f"（修剪 {report.pruned_count} 条工具结果，折叠 {report.folded_turns} 轮）"
+        token = "text_faint"
+        if report.strategy == "prune+fold+memo":
+            details = f"（阶段 3 提炼为全局工作状态备忘录，折叠 {report.folded_turns} 轮）"
+            token = "accent"
+        elif report.strategy == "prune+fold+truncated":
+            details = f"（阶段 3 安全机械截断兜底，折叠 {report.folded_turns} 轮）"
+            token = "warning"
         self.host.notice(
-            f"—— 已压缩：{report.tokens_before:,} → {report.tokens_after:,} tokens"
-            f"（修剪 {report.pruned_count} 条工具结果，折叠 {report.folded_turns} 轮）——",
-            token="text_faint",
+            f"—— 已压缩：{report.tokens_before:,} → {report.tokens_after:,} tokens {details}——",
+            token=token,
         )
         self.host.refresh_status()
 
@@ -776,7 +974,7 @@ class CommandRunner:
             ("代码", _code_stamp_with_hint()),
         ]
         # ★ D158/D159：上下文**计量方式**与 κ 样本数 ——
-        #   "精确锚点 / 纯估算"以及"这个模型校准过几次"都是排查压缩行为的关键事实
+        #   "精确锚点 / 纯估算「以及」这个模型校准过几次"都是排查压缩行为的关键事实
         builder = getattr(runtime, "context_builder", None)
         ledger = getattr(builder, "ledger", None)
         estimator = getattr(builder, "estimator", None)
@@ -828,6 +1026,57 @@ class CommandRunner:
     # ------------------------------------------------------------------ #
     # /summary（D131 会话概览与用量大盘）
     # ------------------------------------------------------------------ #
+
+    async def _cmd_anamnesis(self, argument: str) -> None:
+        service = getattr(self._runtime, "anamnesis", None)
+        if service is None:
+            self.host.notice("当前运行时没有入梦服务", token="warning")
+            return
+        parts = argument.strip().split()
+        action = parts[0].lower() if parts else "auto"
+        run_id = parts[1] if len(parts) == 2 else ""
+        if len(parts) > 2 or (run_id and action not in {"report", "trace"}):
+            self.host.notice("用法：/anamnesis [nap|sleep|stop|status|history|report [run_id]|trace [run_id]]", token="warning")
+            return
+        if action == "stop":
+            service.note_activity("input")
+            service.request_wake("用户停止入梦")
+            self.host.notice("已请求暂停入梦；已完成分析会保留", token="text_faint")
+        elif action in {"auto", "nap", "sleep"}:
+            service.note_submission()
+            self.host.notice(await service.start(action), token="text_faint")
+        elif action in {"status", "report", "history", "trace"}:
+            if action == "status":
+                status = service.status()
+                text = (f"Anamnesis · {status.mode or '待机'} · {status.phase}\n"
+                        f"模型：{status.model or '尚未配置'}\n问题：{status.question or '—'}\n"
+                        f"原因：{status.reason or '—'}\n剩余资料：{status.remaining}\n"
+                        "空闲超过配置阈值后自动开始；发送消息或 /anamnesis stop 暂停当前窗口。")
+                memory = getattr(getattr(self._runtime, "context_builder", None), "anamnesis_memory", None)
+                if memory is not None and memory.skipped:
+                    text += "\n本次前台跳过的记忆：\n" + "\n".join(memory.skipped)
+            elif action == "history":
+                history = await service.history()
+                text = "Anamnesis · 当前项目入梦历史\n\n" + ("\n".join(
+                    f"{item['run_id']} · {item.get('mode', '旧记录')} · {item.get('phase', '未知')}\n"
+                    f"  会话：{item.get('session_id') or '旧记录未绑定会话'}\n"
+                    f"  {item.get('error') or item.get('question', '')}"
+                    for item in reversed(history)) or "尚无入梦记录")
+                text += "\n\n/anamnesis report <run_id> 查看报告；/anamnesis trace <run_id> 查看完整过程。"
+            elif action == "trace" or run_id:
+                try:
+                    if not run_id:
+                        history = await service.history()
+                        run_id = history[-1]["run_id"] if history else ""
+                    text = await service.run_record(run_id, trace=action == "trace") if run_id else "尚无入梦记录"
+                except (ValueError, OSError) as exc:
+                    text = f"无法读取入梦记录：{exc}"
+            else:
+                text = await service.latest_report()
+            await self.host.push_overlay(PanelComponent(Text(text), palette=self._palette(),
+                                                        max_rows=self._panel_rows(), footer="↑↓ 滚动浏览 · Esc 关闭"))
+        else:
+            self.host.notice("用法：/anamnesis [nap|sleep|stop|status|history|report [run_id]|trace [run_id]]", token="warning")
 
     async def _cmd_summary(self, argument: str) -> None:
         """查看当前会话演进脉络与用量大盘（/summary）。"""
@@ -1376,10 +1625,7 @@ def _render_summary_content(
             ),
             model_name,
         )
-        if est is not None:
-            cost_str = f"{format_cost(est)} USD"
-        else:
-            cost_str = "— (未知模型定价)"
+        cost_str = f"{format_cost(est)} USD" if est is not None else "— (未知模型定价)"
     elif total_tokens > 0:
         cost_str = "— (未知模型定价)"
     else:
@@ -1391,5 +1637,3 @@ def _render_summary_content(
     )
 
     return body
-
-

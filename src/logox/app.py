@@ -4,11 +4,11 @@
 ==============
 
 内核需要五样东西才能跑：事件总线、Provider、工具注册表、上下文组装器、权限决策器。
-如果这些由内核自己去找（自己 ``import`` 具体实现），内核就"认识所有人"了——
+如果这些由内核自己去找（自己 ``import`` 具体实现），内核就「认识所有人」了——
 从此无法单独测试、也无法替换（`ARCHITECTURE.md` 规则 R2）。
 
-**没有它会怎样**：`import` 会在各层之间互相纠缠，你说不清"改这个会不会影响那个"。
-本项目把"插线"这件事集中到这一个文件里，于是：
+**没有它会怎样**：`import` 会在各层之间互相纠缠，你说不清「改这个会不会影响那个」。
+本项目把「插线」这件事集中到这一个文件里，于是：
 
 * `kernel/` 不知道谁实现了 `Provider`；
 * `tui/` 不知道内核是哪个类（只认 :class:`~logox.kernel.port.KernelPort` 三成员协议）；
@@ -51,6 +51,8 @@ from logox.tui.theme import DEFAULT_THEME, load_theme
 
 __all__ = [
     "Runtime",
+    "ReloadItem",
+    "ResourceReloadReport",
     "StartupError",
     "UiPermissionDecider",
     "build_runtime",
@@ -80,9 +82,41 @@ class StartupError(NamedTuple):
     exit_code: int = EXIT_CONFIG_ERROR
 
 
+@dataclass(frozen=True)
+class ReloadItem:
+    """`/reload` 里的一项资源：成功给 ``detail``，失败给 ``error``。"""
+
+    name: str
+    detail: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ResourceReloadReport:
+    """一次资源重载的结果（`/reload`，见 docs/modules/08_app_and_collaboration.md §5.2）。
+
+    ``prefix_changed`` 是这份报告里**最容易被忽略、却最该被说出来**的一项：
+    记忆与技能索引都拼在系统提示里，而系统提示是厂商侧 KV 缓存的前缀。
+    前缀一变，下一次请求那段就按全价重算。账本不会算错（锚点靠 `prefix_digest`
+    自动失效），但用户有权知道"这一下多花了钱"。
+    """
+
+    items: list[ReloadItem] = field(default_factory=list)
+    #: 重扫之后系统提示是否变了（决定要不要提示"前缀重算"）
+    prefix_changed: bool = False
+    system_tokens_before: int = 0
+    system_tokens_after: int = 0
+    #: 需要重启才生效的东西（**诚实清单**，不是错误）
+    not_reloaded: list[str] = field(default_factory=list)
+
+    @property
+    def failures(self) -> list[ReloadItem]:
+        return [item for item in self.items if item.error]
+
+
 @dataclass
 class Runtime:
-    """一次会话的全部对象。``prepare_runtime`` 就是"配置 → 装配"，随后交给界面。"""
+    """一次会话的全部对象。``prepare_runtime`` 就是「配置 → 装配」，随后交给界面。"""
 
     bus: EventBus
     kernel: KernelLoop
@@ -95,15 +129,15 @@ class Runtime:
     tools: list[str]
     state_store: Any | None = None
     warnings: list[str] = field(default_factory=list)
-    #: 是否"还没登录"（缺密钥，当前 provider 是占位适配器）。
-    #: 界面据此在启动时提示"运行 /login"，而不是让用户对着沉默的模型发呆。
+    #: 是否「还没登录」（缺密钥，当前 provider 是占位适配器）。
+    #: 界面据此在启动时提示「运行 /login」，而不是让用户对着沉默的模型发呆。
     needs_login: bool = False
     #: Provider 注册表（``/login`` 与 ``/model`` 要靠它列举与构造适配器）。
     #:
     #: **它只在装配根与界面之间传递，界面不会 import ``providers/``**
     #: ——界面拿到的是一个对象，调它的方法即可（鸭子类型），B1/B2 红线因此不破。
     registry: Any | None = None
-    #: 密钥文件（``.env``）的位置；``/login`` 成功且用户选择"记住"时写它。
+    #: 密钥文件（``.env``）的位置；``/login`` 成功且用户选择「记住」时写它。
     #:
     #: 为什么由装配根决定：找哪个文件是**环境知识**（项目级优先、其次用户级，
     #: 见 :func:`resolve_env_file`），界面不该自己猜。界面只拿到一个路径。
@@ -125,18 +159,135 @@ class Runtime:
     plugin_manager: Any | None = None
     command_manager: Any | None = None
     skill_manager: Any | None = None
+    anamnesis: Any | None = None
+    #: 运行时动态或测试注入的模型窗口缓存 (model_id -> context_window)
+    _dynamic_model_windows: dict[Any, int] = field(default_factory=dict)
+    #: 切模型前的上一个窗口容量（用于 D193 扩容安全豁免判定）
+    _previous_window: int | None = None
 
     def window_for(self, model: str) -> int | None:
-        """查某个模型的上下文窗口（查不到返回 None）。**不发网络请求。**"""
+        """查某个模型的上下文窗口（查不到返回 None）。**纯静态、不发网络请求。**"""
+        if model in self._dynamic_model_windows:
+            return self._dynamic_model_windows[model]
         if self.registry is None:
             return None
         try:
+            if hasattr(self.registry, "window_for"):
+                win = self.registry.window_for(self.provider_name, model)
+                if win is not None:
+                    return win
             for info in self.registry.list_models(self.provider_name):
                 if info.id == model:
                     return getattr(info, "context_window", None)
         except Exception as exc:  # noqa: BLE001 - 查不到不是错误，只是少了优化
             logger.debug("查询模型窗口失败（沿用当前窗口）：%s", exc)
         return None
+
+    def _get_local_fallback_provider(self) -> tuple[Any, str] | None:
+        """Use an explicitly selected/configured local endpoint; never a cloud fallback."""
+        from urllib.parse import urlparse
+
+        local_names = {"ollama", "lm-studio"}
+        if self.provider_name in local_names:
+            spec = self.registry.spec(self.provider_name) if self.registry else None
+            url = str(getattr(spec, "base_url", "") or "http://127.0.0.1")
+            if urlparse(url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+                return None
+            provider = getattr(self.kernel, "_provider", None)
+            if provider is not None and type(provider).__name__ != "MissingKeyProvider":
+                return provider, getattr(self.kernel, "_model", self.model)
+        configured = getattr(self.config, "providers", {})
+        instance = configured.get("ollama") if isinstance(configured, dict) else None
+        models = getattr(instance, "models", []) if instance is not None else []
+        if not models or self.registry is None:
+            return None
+        spec = self.registry.spec("ollama")
+        if urlparse(spec.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+            return None
+        try:
+            return self.registry.build("ollama"), models[0]
+        except Exception as exc:
+            logger.warning("本地压缩模型不可用：%s", exc)
+            return None
+
+    async def _invoke_summarizer(
+        self,
+        provider: Any,
+        model: str,
+        transcript: str,
+        target_tokens: int,
+        timeout_s: float,
+    ) -> str | None:
+        import asyncio
+
+        from logox.context.compaction import MEMO_SYSTEM_PROMPT
+        from logox.kernel.messages import Message, TextBlock
+        from logox.providers.base import (
+            ChatRequest,
+            DeltaEvent,
+            ProviderErrorEvent,
+            StopEvent,
+        )
+
+        user_prompt = (
+            f"请将以下早期历史会话深度压缩为全局工作状态备忘录，目标输出长度约为 {target_tokens} tokens。\n\n"
+            f"{transcript}"
+        )
+        request = ChatRequest(
+            model=model,
+            system=MEMO_SYSTEM_PROMPT,
+            messages=[Message(role="user", blocks=[TextBlock(text=user_prompt)])],
+            tools=[],
+            temperature=0.2,
+            max_tokens=max(1, min(target_tokens, 3000)),
+            thinking=None,
+        )
+        chunks: list[str] = []
+        try:
+            async with asyncio.timeout(timeout_s):
+                async for event in provider.stream(request):
+                    if isinstance(event, DeltaEvent):
+                        if event.kind != "reasoning" and event.text:
+                            chunks.append(event.text)
+                    elif isinstance(event, StopEvent):
+                        break
+                    elif isinstance(event, ProviderErrorEvent):
+                        logger.warning("模型提炼备忘录发生供应商错误: %s", event.message)
+                        return None
+        except Exception as exc:
+            logger.warning("模型提炼备忘录执行异常: %s", exc)
+            return None
+
+        result_text = "".join(chunks).strip()
+        return result_text if result_text else None
+
+    def create_memo_summarizer(self) -> Any:
+        """Summarize extreme-window history through a configured local model only."""
+        from logox.context.compaction import format_messages_for_summary
+
+        async def _summarizer(messages: list[Any], *, target_tokens: int = 1500) -> str | None:
+            transcript = format_messages_for_summary(messages)
+            local = self._get_local_fallback_provider()
+            if not transcript.strip() or local is None:
+                return None
+            provider, model = local
+            from logox.context.compaction import MEMO_SYSTEM_PROMPT
+            from logox.context.tokens import TokenEstimator
+
+            if self.provider_name in {"ollama", "lm-studio"}:
+                window = self.window_for(model)
+            else:
+                window = getattr(self.registry.spec("ollama"), "context_window", None)
+            if isinstance(window, int) and window > 0:
+                tokens = TokenEstimator().estimate_text(transcript + MEMO_SYSTEM_PROMPT) + 128
+                available = window - tokens
+                if available <= 0:
+                    logger.warning("历史摘要输入超过本地压缩模型窗口，保留摘要并暂停")
+                    return None
+                target_tokens = min(target_tokens, available)
+            return await self._invoke_summarizer(provider, model, transcript, target_tokens, timeout_s=30.0)
+
+        return _summarizer
 
     async def apply_compact(self) -> Any | None:
         """手动压缩一次（`/compact`，D161）。返回 `CompactionReport`（没压出东西则 None）。
@@ -145,19 +296,16 @@ class Runtime:
         界面不该直接把事件塞进总线。装配根是唯一同时认识两侧的地方，所以由它
         ①调 builder ②发 `CompactionStarted`/`CompactionFinished` ③更新状态栏。
         界面只调这一个方法，与 `apply_model()` 同一形状。
-
-        手动压缩**不依赖模型**（本项目压缩是本地纯计算：拼每轮 `turn_summary`），
-        所以它不需要任何 API 调用即可生效 —— 这正是"我们不依赖模型去压缩"的落地。
         """
         builder = self.context_builder
-        if builder is None or not hasattr(builder, "force_compact"):
+        if builder is None or not (hasattr(builder, "force_compact") or hasattr(builder, "force_compact_async")):
             return None
 
         kernel = self.kernel
         history = list(getattr(kernel, "history", []) or [])
         last_usage = getattr(kernel, "_last_request_usage", None)
 
-        # 先发"即将压缩"（钩子 `pre_compact` 在这里触发）——与自动路径保持一致
+        # 先发「即将压缩」（钩子 `pre_compact` 在这里触发）——与自动路径保持一致
         plan = getattr(builder, "plan", None)
         if callable(plan):
             # force=True：手动压缩有意跳过水位线，判据换成"有没有可做的活"
@@ -173,7 +321,14 @@ class Runtime:
                     )
                 )
 
-        bundle = builder.force_compact(history, last_usage=last_usage)
+        summarizer = self.create_memo_summarizer()
+        if hasattr(builder, "force_compact_async"):
+            bundle = await builder.force_compact_async(
+                history, last_usage=last_usage, summarizer=summarizer
+            )
+        else:
+            bundle = builder.force_compact(history, last_usage=last_usage)
+
         report = getattr(bundle, "compaction", None)
         if report is None:
             return None
@@ -188,7 +343,7 @@ class Runtime:
                 tokens_before=report.tokens_before,
                 pruned_count=report.pruned_count,
                 folded_turns=report.folded_turns,
-                strategy="manual",
+                strategy=report.strategy,
             )
         )
         metrics = getattr(self.reducer, "metrics", None)
@@ -196,14 +351,148 @@ class Runtime:
             metrics.context_tokens = report.tokens_after
         return report
 
+    def reload_resources(self) -> ResourceReloadReport:
+        """重扫磁盘上的可热重载资源（`/reload`，见 MODULE_08 §5.2）。
+
+        为什么放在装配根：这是**唯一同时认识**构建器 / 技能包 / 模板命令 / 配置的地方。
+        界面只知道"我要重载"，不知道"要动几个对象、每个对象怎么重扫"（与 `apply_model` 同一形状）。
+
+        **边界（不做的事和做的一样重要）**：
+
+        * 不重载 Python 代码 —— 改 `.py` 仍要重启（`/status` 的「代码」行继续承担告警）；
+        * 不重连 MCP、不重建插件注册表（`PluginManager` 没有卸载路径，重扫会重复注册）；
+        * 不替换 `config` 的构造期字段（窗口 / 水位线 / reserve 已烤进 builder 与 compactor）；
+        * 每项独立 try/except —— 技能包扫失败不该让记忆也不刷（与 `/login`、`/theme` 同一口径：
+          降级成一行提示，会话继续）。
+        """
+        from logox.context.tokens import estimate_text_tokens
+
+        items: list[ReloadItem] = []
+        builder = self.context_builder
+
+        before = ""
+        if builder is not None and hasattr(builder, "system_prompt_snapshot"):
+            with contextlib.suppress(Exception):
+                before = builder.system_prompt_snapshot()
+
+        # ---- ① 项目记忆（LOGOX.md / AGENTS.md，D119） ----
+        if builder is None:
+            items.append(ReloadItem("项目记忆", error="当前运行时没有接上下文构建器"))
+        else:
+            try:
+                memory = builder.refresh_memory()
+                if getattr(memory, "is_empty", True):
+                    items.append(ReloadItem("项目记忆", detail="没有生效的记忆文件"))
+                else:
+                    names = "、".join(
+                        Path(getattr(src, "path", "?")).name for src in memory.sources
+                    )
+                    items.append(
+                        ReloadItem("项目记忆", detail=f"{names} · {memory.total_tokens:,} tokens")
+                    )
+            except Exception as exc:  # noqa: BLE001 - 一项失败不影响其他项
+                logger.warning("重扫项目记忆失败：%s", exc)
+                items.append(ReloadItem("项目记忆", error=f"{type(exc).__name__}: {exc}"))
+
+        # ---- ② 技能包（M10 / D113） ----
+        skills = self.skill_manager
+        if skills is None:
+            items.append(ReloadItem("技能包", detail="未启用"))
+        else:
+            try:
+                skills.reload()
+                items.append(ReloadItem("技能包", detail=f"{len(skills.list_skills())} 个"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("重扫技能包失败：%s", exc)
+                items.append(ReloadItem("技能包", error=f"{type(exc).__name__}: {exc}"))
+
+        # ---- ③ 模板命令（M10 / D112） ----
+        manager = self.command_manager
+        if manager is None:
+            items.append(ReloadItem("模板命令", detail="未启用"))
+        else:
+            try:
+                manager.reload()
+                items.append(ReloadItem("模板命令", detail=f"{len(manager.list_commands())} 条"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("重扫模板命令失败：%s", exc)
+                items.append(ReloadItem("模板命令", error=f"{type(exc).__name__}: {exc}"))
+
+        # ---- ④ 配置：**只校验，不替换** ----
+        items.append(self._check_config_on_reload())
+
+        # ---- ⑤ 前缀代价（记忆与技能索引都在系统提示里） ----
+        after = ""
+        if builder is not None and hasattr(builder, "system_prompt_snapshot"):
+            with contextlib.suppress(Exception):
+                after = builder.system_prompt_snapshot()
+
+        def _tokens(text: str) -> int:
+            if not text:
+                return 0
+            with contextlib.suppress(Exception):
+                return estimate_text_tokens(text)
+            return 0
+
+        return ResourceReloadReport(
+            items=items,
+            prefix_changed=bool(builder is not None and before != after),
+            system_tokens_before=_tokens(before),
+            system_tokens_after=_tokens(after),
+            not_reloaded=[
+                "Python 代码（改 .py 仍需重启）",
+                "MCP 服务连接与插件注册",
+                "config.toml 的上下文与压缩参数",
+            ],
+        )
+
+    def _check_config_on_reload(self) -> ReloadItem:
+        """重读 `config.toml` 并**只报告**（`/reload` 的第 ④ 项）。
+
+        为什么不替换运行中的 `config`：窗口容量、水位线、reserve、压缩参数在装配时就已经
+        传到 builder / compactor 里了（`ctx_config = getattr(bundle.config, "context")`）。
+        只换 `self.config` 会造成"两份事实"——配置文件里写着 A、跑着的是 B，
+        而这正是本项目反复出现的那类缺陷。所以这里的价值是**尽早暴露配置写错**，
+        而不是"让配置立刻生效"。
+        """
+        try:
+            from logox.config.loader import load as load_config
+            from logox.providers.registry import BUILTIN_SPECS
+
+            paths = self.paths if self.paths is not None else LogoxPaths.default()
+            bundle = load_config(
+                self.cwd,
+                paths=paths,
+                known_providers=tuple(BUILTIN_SPECS),
+            )
+        except Exception as exc:  # noqa: BLE001 - 校验本身失败也只报告
+            return ReloadItem("配置", error=f"{type(exc).__name__}: {exc}")
+
+        errors = list(getattr(bundle, "errors", []) or [])
+        if errors:
+            first = errors[0]
+            where = Path(first.path).name
+            if getattr(first, "line", None):
+                where = f"{where}:{first.line}"
+            field = f" [{first.field}]" if getattr(first, "field", None) else ""
+            more = f"（共 {len(errors)} 处）" if len(errors) > 1 else ""
+            return ReloadItem("配置", error=f"{where}{field} {first.message}{more}")
+
+        warnings = list(getattr(bundle, "warnings", []) or [])
+        detail = f"{len(warnings)} 条警告" if warnings else "无问题"
+        return ReloadItem("配置", detail=f"{detail}（改动需重启生效）")
+
     def apply_model(self, model: str) -> int | None:
-        """切换模型：内核 + 上下文计量（窗口/κ 桶）+ 状态栏**一起**更新（D159）。
+        """切换模型：内核 + 上下文计量（窗口/κ 桶）+ 状态栏**一起**更新（D159 / D193）。
 
         为什么要收成一个方法：`/model` 之前只调 `kernel.set_model()`，于是
         上下文构建器仍在用旧模型的窗口与 κ 桶 —— 换到窗口更小的模型后压缩永不触发，
-        而请求会撞上厂商的 400。界面不该知道"窗口从哪查、要改几个对象"，
+        而请求会撞上厂商的 400。界面不该知道「窗口从哪查、要改几个对象」，
         这些是**装配知识**，属于装配根。
         """
+        old_window = getattr(self.context_builder, "window_capacity", None) if self.context_builder else None
+        self._previous_window = old_window
+
         setter = getattr(self.kernel, "set_model", None)
         if callable(setter):
             setter(model)
@@ -218,6 +507,31 @@ class Runtime:
             if metrics is not None:
                 metrics.context_window = window
         return window
+
+    async def eager_compact_if_needed(self) -> Any | None:
+        """换模型后若当前上下文超过新模型的高水位线，及早压缩一次（D188 / D193）。
+
+        若未超标、处于扩容安全区或无需压缩返回 None；压缩成功返回 CompactionReport。
+        """
+        builder = self.context_builder
+        if builder is None:
+            return None
+
+        kernel = self.kernel
+        history = list(getattr(kernel, "history", []) or [])
+        if not history:
+            return None
+
+        plan = getattr(builder, "plan", None)
+        if not callable(plan):
+            return None
+        # Builder's fold cache is the actual effective view; previous-model usage is not.
+        planned = plan(history, last_usage=None, force=False)
+        if planned is None:
+            return None
+
+        # 越过高水位线，立即就地压缩！
+        return await self.apply_compact()
 
     def list_mcp_servers(self) -> list[Any]:
         if self.mcp_manager is None:
@@ -256,19 +570,23 @@ class Runtime:
 
     async def async_close(self) -> None:
         """异步关闭运行时持有的外部进程与连接。"""
+        if self.anamnesis is not None:
+            await self.anamnesis.aclose()
         if self.mcp_manager is not None:
             await self.mcp_manager.close_all()
 
     def close(self) -> None:
         """同步关闭运行时资源。"""
-        if self.mcp_manager is not None:
+        if self.mcp_manager is not None or self.anamnesis is not None:
             import asyncio
 
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self.mcp_manager.close_all())
+                if self.anamnesis is not None:
+                    self.anamnesis.request_close()
+                loop.create_task(self.async_close())
             except RuntimeError:
-                asyncio.run(self.mcp_manager.close_all())
+                asyncio.run(self.async_close())
 
     # ------------------------------------------------------------------ #
     # 供 `/login` 与 `/model` 使用的窄接口
@@ -280,7 +598,7 @@ class Runtime:
         界面据此画出选择列表（"需要 DEEPSEEK_API_KEY"这种提示）。全部是纯数据，
         界面不需要知道 ``ProviderSpec`` 这个模型的存在。
         """
-        empty = {"name": name, "api_key_env": "", "base_url": "", "models": []}
+        empty = {"name": name, "api_key_env": "", "base_url": "", "models": [], "has_key": False}
         if self.registry is None:
             return empty
         # `spec()` 对未知名字**抛异常**（装配期就炸掉是它的设计）——
@@ -288,11 +606,24 @@ class Runtime:
         if name not in self.registry.names():
             return empty
         spec = self.registry.spec(name)
+        has_key = False
+        if not spec.api_key_env:
+            has_key = True
+        else:
+            try:
+                from logox.providers.registry import resolve_api_key
+
+                resolve_api_key(spec, getattr(self.registry, "_environ", None))
+                has_key = True
+            except Exception:
+                has_key = False
+
         return {
             "name": name,
             "api_key_env": spec.api_key_env,
             "base_url": spec.base_url,
             "models": list(spec.models),
+            "has_key": has_key,
         }
 
     def available_providers(self) -> list[str]:
@@ -320,13 +651,20 @@ class Runtime:
         """列举一个 provider 可用的模型 id（**纯本地、零网络**）。
 
         来源按优先级合并：**上次抓到的真实列表** → 本地预设表。
-        抓取本身在 `/login` 成功那一步做（见 :meth:`refresh_models`）——
+        抓取本身在 `/login` 成功那一步做（见 :meth:`refresh_models`），
+        本地端点则在启动时后台抓一次、或用 `/model refresh` 现抓（D188）——
         这样 `/model` 弹窗点开就是瞬时的，不用等网络。
+
+        ★ **免鉴权端点（本地 Ollama / LM Studio）有缓存时直接用缓存**，不与预设合并：
+        本机 `/v1/models` 就是权威全集，而预设表注定过期；合并会把"根本没拉取的模型"
+        留在候选里，用户选了就报错——比「少列一个」更糟。
         """
         preset = list(self.provider_details(name)["models"])
         cached = self._cached_models(name)
         if not cached:
             return preset
+        if self._is_keyless(name):
+            return list(cached)
         from logox.providers.discovery import merge_models
 
         return merge_models(cached, preset)
@@ -339,14 +677,70 @@ class Runtime:
         except Exception:  # pragma: no cover - 状态文件坏了不该影响选择器
             return []
 
+    def _is_keyless(self, name: str) -> bool:
+        """该 provider 是否本地免鉴权端点（判据见 `providers.registry.is_keyless`）。"""
+        registry = self.registry
+        if registry is None:
+            return False
+        try:
+            if name not in registry.names():
+                return False
+            from logox.providers.registry import is_keyless
+
+            return bool(is_keyless(registry.spec(name)))
+        except Exception:  # pragma: no cover - 注册表异常时当作普通端点
+            return False
+
+    async def refresh_local_models(self, *, timeout_s: float | None = None) -> list[tuple[str, Any]]:
+        """抓取**所有免鉴权端点**的模型清单，逐个进行、互不影响（D188）。
+
+        两个调用方共用：① 启动时的**后台**任务；② `/model refresh`（显式、要看结果）。
+
+        为什么**逐个**而不是并发：本地端点最多两三个，串行总耗时仍在毫秒级，
+        而并发会引入「同时写 state.toml」的竞争面——不值得为省几毫秒承担那个风险。
+
+        返回 ``[(provider_name, DiscoveryResult), ...]``（**成功与失败都回传**，
+        显式路径据此如实报告，而不是假装刷新成功）。异常不外抛。
+        """
+        if self.registry is None:
+            return []
+        from logox.providers.discovery import LOCAL_TIMEOUT_S
+
+        limit = LOCAL_TIMEOUT_S if timeout_s is None else timeout_s
+        results: list[tuple[str, Any]] = []
+        for name in self._keyless_provider_names():
+            try:
+                result = await self.refresh_models(name, timeout_s=limit)
+            except Exception as exc:  # pragma: no cover - refresh_models 已吞异常，这里是双保险
+                from logox.providers.discovery import DiscoveryResult
+
+                result = DiscoveryResult(error=f"{type(exc).__name__}: {exc}", attempted=True)
+            results.append((name, result))
+        return results
+
+    def _keyless_provider_names(self) -> list[str]:
+        """免鉴权端点名单。
+
+        优先用注册表自己的 ``keyless_names()``；没有这个方法时（测试里的**假注册表**、
+        或将来的其它实现）就地从 ``names()`` + ``spec()`` 算出来 —— 启动路径上的
+        一个 AttributeError 会让整个后台任务报错，不值得为了少写两行而冒这个风险。
+        """
+        registry = self.registry
+        if registry is None:
+            return []
+        fast = getattr(registry, "keyless_names", None)
+        if callable(fast):
+            return list(fast())
+        return [name for name in registry.names() if self._is_keyless(name)]
+
     async def refresh_models(
         self, name: str, *, api_key: str | None = None, timeout_s: float | None = None
     ) -> Any:
         """**向端点抓一次真实模型列表**，成功后写进 `state.toml` 缓存（D65）。
 
-        这是"输入 API 之后自动抓取可用模型"的落点。返回
+        这是「输入 API 之后自动抓取可用模型」的落点。返回
         :class:`~logox.providers.discovery.DiscoveryResult`——**成功与失败都走返回值**，
-        不抛异常：抓不到只是"回退到预设表"，绝不能让登录失败。
+        不抛异常：抓不到只是「回退到预设表」，绝不能让登录失败。
 
         成功时的两个副作用：① 缓存进 `state.toml`（下次 `/model` 零网络就能看到）；
         ② 更新刚构造的那个适配器的本地列表（同一会话里立刻可用）。
@@ -403,13 +797,14 @@ class Runtime:
     def switch_session(self, file_path: Path | str, timeline: Any | None = None) -> int:
         """热切换会话：加载目标会话、重构消息历史、重放进时间线并更新持久化写出器。"""
         from logox.store.replay import (
+            filter_rewound_records,
             load_session_records,
             reconstruct_messages,
             replay_into_timeline,
         )
 
         target_path = Path(file_path).resolve()
-        records = load_session_records(target_path)
+        records = filter_rewound_records(load_session_records(target_path))
 
         count = 0
         if timeline is not None:
@@ -424,18 +819,23 @@ class Runtime:
                 format_args=format_args,
             )
 
+        if self.persistence_writer is not None and hasattr(self.persistence_writer, "switch_target"):
+            self.persistence_writer.switch_target(target_path)
+
         if self.kernel is not None and hasattr(self.kernel, "history"):
             self.kernel.history.clear()
-            messages = reconstruct_messages(records)
+            messages = reconstruct_messages(records, session_dir=target_path.parent)
             self.kernel.history.extend(messages)
+            self.kernel._last_request_usage = None
+            if self.context_builder and hasattr(self.context_builder, "restore_state"):
+                self.context_builder.restore_state(self.kernel.history, records)
             if self.reducer is not None:
                 user_turns = sum(1 for m in messages if m.role == "user")
                 self.reducer.metrics.turn = user_turns + 1
                 if self.context_builder and hasattr(self.context_builder, "estimator"):
-                    self.reducer.metrics.context_tokens = self.context_builder.estimator.estimate_messages(messages)
-
-        if self.persistence_writer is not None and hasattr(self.persistence_writer, "switch_target"):
-            self.persistence_writer.switch_target(target_path)
+                    estimator = getattr(self.context_builder, "estimate_context", None)
+                    self.reducer.metrics.context_tokens = (estimator(self.kernel.history) if callable(estimator)
+                        else self.context_builder.estimator.estimate_messages(messages))
 
         self.resume_file = target_path
         return count
@@ -458,6 +858,9 @@ class Runtime:
 
         if self.kernel is not None and hasattr(self.kernel, "history"):
             self.kernel.history.clear()
+            self.kernel._last_request_usage = None
+        if self.context_builder and hasattr(self.context_builder, "reset"):
+            self.context_builder.reset()
 
         if self.reducer is not None:
             self.reducer.metrics.turn = 1
@@ -634,16 +1037,21 @@ class Runtime:
 
         # 2. 截断内核历史与校准状态栏
         simulated_records = filter_rewound_records(records + [{"type": "session_rewind", "to_turn": to_turn}])
-        new_messages = reconstruct_messages(simulated_records)
+        new_messages = reconstruct_messages(simulated_records, session_dir=log_file.parent)
         if self.kernel is not None and hasattr(self.kernel, "history"):
             self.kernel.history.clear()
             self.kernel.history.extend(new_messages)
+            self.kernel._last_request_usage = None
+        if self.context_builder and hasattr(self.context_builder, "restore_state"):
+            self.context_builder.restore_state(new_messages, simulated_records)
 
         if self.reducer is not None:
             user_turns = sum(1 for m in new_messages if m.role == "user")
             self.reducer.metrics.turn = user_turns + 1
             if self.context_builder and hasattr(self.context_builder, "estimator"):
-                self.reducer.metrics.context_tokens = self.context_builder.estimator.estimate_messages(new_messages)
+                estimator = getattr(self.context_builder, "estimate_context", None)
+                self.reducer.metrics.context_tokens = (estimator(new_messages) if callable(estimator)
+                    else self.context_builder.estimator.estimate_messages(new_messages))
 
         # 3. 截断时间线（若传入 timeline）
         if timeline is not None and hasattr(timeline, "buffer"):
@@ -698,7 +1106,8 @@ def build_runtime(
         name: ProviderSpec(
             name=name,
             **instance.model_dump(
-                include={"kind", "base_url", "api_key_env", "models"}, exclude_unset=True
+                include={"kind", "base_url", "api_key_env", "models", "context_window", "model_windows"},
+                exclude_unset=True,
             ),
         )
         for name, instance in config.providers.items()
@@ -706,7 +1115,7 @@ def build_runtime(
     registry = ProviderRegistry.with_builtins(overrides)
 
     # 体验模式（M4）：**只替换模型响应**，其余全是真的。见 `logox/devsetup.py`。
-    # 它与生产走完全相同的 `prepare_runtime()`，因此连"四类启动检查"都被一起验证。
+    # 它与生产走完全相同的 `prepare_runtime()`，因此连「四类启动检查」都被一起验证。
     from logox.devsetup import BANNER, ENV_FLAG, MODEL_NAME, scripted_provider
 
     dev_mode = os.environ.get(ENV_FLAG) == "1"
@@ -720,7 +1129,7 @@ def build_runtime(
     else:
         try:
             # ★ `allow_missing_key=True`：缺密钥时**不再拒绝启动**，而是给一个
-            # "占位适配器"——它一被调用就返回可行动的错误（"运行 /login"）。
+            # "占位适配器「——它一被调用就返回可行动的错误（」运行 /login"）。
             #
             # 为什么必须这样：`/login` 正是用来配密钥的。若缺密钥就启动失败，
             # 用户**根本没有机会执行 `/login`**——先有鸡还是先有蛋（实测踩到）。
@@ -752,14 +1161,14 @@ def build_runtime(
     # ---- ②b 模型**存在性**提醒（D67 的后续）--------------------------------- #
     #
     # 为什么要有这一步：用户实机验收时，`state.toml` 里存着一个**早就退役的模型名**
-    # （`deepseek-chat`），而当时没人发现——因为"名字格式合法"和"端点认这个名字"
+    # （`deepseek-chat`），而当时没人发现——因为「名字格式合法」和"端点认这个名字"
     # 是两件事，而所有测试都只验证前者。症状是每次请求都失败，但设置看着一切正常。
     #
-    # ⚠️ **只提醒，绝不擅自改**。第一版写的是"不在清单里就回退到默认模型"，
+    # ⚠️ **只提醒，绝不擅自改**。第一版写的是「不在清单里就回退到默认模型」，
     # 那是错的：已知清单**不是**权威清单（实测 `/models` 端点并不返回全部可调用模型，
     # 用户真正在用的多模态模型就不在里面但能调通），自动回退会把用户**有意指定的**
-    # 自建/中转模型名悄悄替换掉——正是这个项目一直在防的"静默改配置"。
-    # 因此这里只把"可疑"这件事说出来，选择权留给用户。
+    # 自建/中转模型名悄悄替换掉——正是这个项目一直在防的「静默改配置」。
+    # 因此这里只把「可疑」这件事说出来，选择权留给用户。
     model_notice = ""
     if config.provider.model:
         known = _known_models(registry, provider_config.name)
@@ -785,7 +1194,7 @@ def build_runtime(
     #
     # ★ D152-c：主题只从**内置目录 + 用户目录 `~/.logox/themes`** 解析。
     #   项目级 `.logox/themes/` 已被**刻意移除**（用户裁定："不要有什么项目级配置覆盖了"）——
-    #   主题是"用户对界面的偏好"，不是"项目对代码的规范"。
+    #   主题是「用户对界面的偏好」，不是「项目对代码的规范」。
     warnings: list[str] = []
     theme_name = config.ui.theme or DEFAULT_THEME
     try:
@@ -800,11 +1209,11 @@ def build_runtime(
     #
     # 为什么要有这一步：`validate_contrast` 此前只被 `tools/gen_themes.py` 使用 ——
     # 也就是**只保护内置主题**。而自定义主题走的是同一条加载路径却完全不做体检，
-    # 于是"用户自己配了一个看不见的输入框框线"会**静默生效**，
+    # 于是「用户自己配了一个看不见的输入框框线」会**静默生效**，
     # 然后再来报一次和这次一模一样的障。
     #
     # 为什么是**警告**而不是拒绝：自定义主题是用户的自由 ——
-    # 他可能故意要一条很淡的框线。拒绝加载会把"我想要的风格"判成"错误"。
+    # 他可能故意要一条很淡的框线。拒绝加载会把「我想要的风格」判成「错误」。
     # 所以口径与既有的 `model_notice` 一致：**说清楚，但不擅自改**。
     try:
         from logox.config.theme import validate_contrast
@@ -822,9 +1231,9 @@ def build_runtime(
 
     # ---- ⑤ 状态写回（只写 state.toml，D30 / D119 / D120） ----
     #
-    # ⚠️ 这一步**在构造内核之前**：权限决策器要用它读"持久允许"的规则，
+    # ⚠️ 这一步**在构造内核之前**：权限决策器要用它读「持久允许」的规则，
     # 而内核要拿决策器。顺序反了就只能先造内核、再想办法把存储塞进去
-    # ——那是"得记得补第二次调用"的老问题（见 `prepare_runtime` 的说明）。
+    # ——那是「得记得补第二次调用」的老问题（见 `prepare_runtime` 的说明）。
     # ★ D120：采用分层状态存储（LayeredStateStore）——
     # 偏好与模型（provider/model/theme）双写全局，保证换项目直接继承；
     # 权限规则（learn_permission）严格单写项目级 state.toml，保证工程间物理隔离。
@@ -875,7 +1284,7 @@ def build_runtime(
     permission_decider.state_store = state_store
     if state_store is not None:
         try:
-            # 载入"持久允许"与权限运行模式 (D130)
+            # 载入「持久允许」与权限运行模式 (D130)
             perms = state_store.read().permissions
             permission_decider.seed_persisted(perms.allow, mode=perms.mode)
             reducer.metrics.permission_mode = perms.mode
@@ -916,6 +1325,9 @@ def build_runtime(
         project_memory_enabled=getattr(ctx_config, "project_memory_enabled", True),
         # ★ D158：κ 按 (provider, model) 分桶 —— 不同分词器的偏差不能互相污染
         model_key=f"{provider_name}/{model}",
+        anamnesis_home=paths.root,
+        anamnesis_enabled=config.anamnesis.memory_enabled,
+        anamnesis_ratio=config.anamnesis.prompt_memory_max_ratio,
     )
 
     # ---- ⑥d 快照对象池 (D102) ----
@@ -1005,7 +1417,7 @@ def build_runtime(
         try:
             from logox.store.replay import replay_session
 
-            replay_session(session_path, kernel_loop=kernel, timeline=None)
+            replay_session(session_path, kernel_loop=kernel, timeline=None, context_builder=context_builder)
 
             def session_replayer(timeline: Any) -> None:
                 from logox.tui.format import format_args, summarize_args
@@ -1022,7 +1434,7 @@ def build_runtime(
                 user_turns = sum(1 for m in kernel.history if m.role == "user")
                 reducer.metrics.turn = user_turns + 1
                 if context_builder and hasattr(context_builder, "estimator"):
-                    reducer.metrics.context_tokens = context_builder.estimator.estimate_messages(kernel.history)
+                    reducer.metrics.context_tokens = context_builder.estimate_context(kernel.history)
         except Exception as exc:  # pragma: no cover
             logger.warning("回放历史会话失败：%s", exc)
 
@@ -1036,7 +1448,7 @@ def build_runtime(
             + "：运行 /login 选择供应商并粘贴 API Key；在那之前发送消息会收到一条提示"
         )
 
-    return Runtime(
+    runtime = Runtime(
         bus=bus,
         kernel=kernel,
         reducer=reducer,
@@ -1065,10 +1477,34 @@ def build_runtime(
         skill_manager=skill_manager,
         # 密钥文件的位置在这里定下来（`/login` 要写它）。
         # ⚠️ 注意：**加载**它是调用方的事（见 `load_env_file_quietly`）——
-        # 装配根只回答"用哪个文件"，不产生 `os.environ` 副作用，
+        # 装配根只回答「用哪个文件」，不产生 `os.environ` 副作用，
         # 否则测试里一个仓库级的 `.logox/.env` 就会悄悄改变所有用例的行为。
         env_file=resolve_env_file(cwd, paths),
     )
+    if hasattr(kernel, "memo_summarizer"):
+        kernel.memo_summarizer = runtime.create_memo_summarizer()
+    from logox.anamnesis.local import make_local_runner
+    from logox.anamnesis.service import AnamesisService
+
+    async def anamnesis_runner(collector):
+        return await make_local_runner(registry, config.anamnesis, collector, permission_decider.engine)
+
+    runtime.anamnesis = AnamesisService(config=config.anamnesis, home=paths.root,
+                                       cwd=cwd, sessions=paths.sessions, runner_factory=anamnesis_runner)
+    def anamnesis_session():
+        path = runtime._get_current_session_file()
+        return path.stem if path is not None else ""
+
+    def link_anamnesis(run_id, owner):
+        writer = runtime.persistence_writer
+        if (writer is not None and owner == anamnesis_session()
+                and writer.write_step(turn=0, step=0, role="", event_type="anamnesis_ref", run_id=run_id,
+                                      submission_ts=runtime.anamnesis._last_submission) is None):
+            raise OSError("无法保存入梦会话引用")
+
+    runtime.anamnesis.current_session = anamnesis_session
+    runtime.anamnesis.on_started = link_anamnesis
+    return runtime
 
 
 class UiPermissionDecider:
@@ -1078,7 +1514,7 @@ class UiPermissionDecider:
     --------------------------------------
 
     内核只认 ``allow`` / ``deny`` / ``ask`` 三个答案——它**不该知道**
-    "ask 之后是谁在问、怎么问、能不能记住"。而"把两条腿接起来"正是装配根
+    "ask 之后是谁在问、怎么问、能不能记住「。而」把两条腿接起来"正是装配根
     存在的理由（B4：``app.py`` 是唯一同时认识 L2–L5 的文件）。
 
     于是这里的职责很窄：**翻译**。
@@ -1088,20 +1524,20 @@ class UiPermissionDecider:
     ``PermissionAsk`` / ``Choice`` 纯数据，界面与内核都只依赖它们（`tui/permission.py`）
     =========================== ==============================================
 
-    三条安全默认（每一条都是"宁可不做，也不能默认放行"）
+    三条安全默认（每一条都是「宁可不做，也不能默认放行」）
     -------------------------------------------------
 
     1. **没有界面在听 → 返回 ``ask``，让调度器按拒绝处理并说明原因**。
        不返回 ``deny`` 是因为那样会**一个事件都不发**，用户只会看到"工具失败"
-       而不知道为什么（调度器那条路径本来就会解释"当前没有权限确认界面"）。
+       而不知道为什么（调度器那条路径本来就会解释「当前没有权限确认界面」）。
     2. **提问过程中出任何异常 → 拒绝**（``except`` 里兜住，绝不冒泡）。
     3. **界面返回意料之外的东西 → 拒绝**（例如 ``None``）。
 
     记忆的粒度（诚实说明）
     --------------------
 
-    "本会话总是允许"与"持久允许"记住的是**工具名**。而 UI-SPEC 里那个选项的
-    本意是"记住这条**规则**"——规则引擎（M5）还没有落地，所以现在能做的只有
+    "本会话总是允许「与」持久允许"记住的是**工具名**。而 UI-SPEC 里那个选项的
+    本意是「记住这条**规则**」——规则引擎（M5）还没有落地，所以现在能做的只有
     工具级记忆，选项标签上也**明写了工具名**（"本会话总是允许 shell"），
     让用户清楚自己允许的范围有多大。
     """
@@ -1168,7 +1604,7 @@ class UiPermissionDecider:
         return res
 
     def _remember_key(self, call: Any, tool: Any) -> str:
-        """记住"什么"：目前是**工具名**（规则引擎落地后换成 rule_id）。"""
+        """记住「什么」：目前是**工具名**（规则引擎落地后换成 rule_id）。"""
         return str(getattr(tool, "spec", None) and tool.spec.name or call.name)
 
     # ------------------------------------------------------------------ #
@@ -1185,7 +1621,7 @@ class UiPermissionDecider:
         # 运行权限引擎五层安全检测（完全由规则引擎按细粒度白名单裁决，严禁裸工具名短路穿透！）
         if self.state_store is not None and self.engine.state_store is None:
             self.engine.state_store = self.state_store
-        evaluation = self.engine.evaluate(key, args)
+        evaluation = self.engine.evaluate(key, args, readonly=bool(tool.spec.readonly))
 
         if evaluation.decision == Decision.ALLOW:
             return Decision.ALLOW
@@ -1319,13 +1755,13 @@ def _format_args(args: Any) -> str:
 def build_tool_registry() -> ToolRegistry:
     """装配**内置工具**注册表（不含安全闸门）。
 
-    为什么单独抽出来：`logox --check-config` 要显示"**实际注册了哪些工具**"，
+    为什么单独抽出来：`logox --check-config` 要显示「**实际注册了哪些工具**」，
     而它跑在装配之前。不抽出来的话，摘要只能显示配置里的 `tools.enabled` ——
     那是一份**愿望清单**，不是事实。
 
     ⚠️ 实测踩到过这个谎：摘要里写着"启用工具：read, write, edit, glob, grep,
     shell, todo"，而当时**只有 `read` 真的注册了**。用户会据此以为 `shell` 能用，
-    然后对着"模型为什么不用 shell"发呆——**产品主动误导用户**，
+    然后对着「模型为什么不用 shell」发呆——**产品主动误导用户**，
     比少显示几行严重得多。
     """
     from logox.tools.fs_edit import build as build_edit_tool
@@ -1361,7 +1797,7 @@ def _known_models(registry: Any, name: str) -> list[str]:
 
 
 def _provider_error(exc: Exception, name: str, paths: LogoxPaths) -> StartupError:
-    """把 Provider 构造失败分类，并在**缺密钥**时补上"还有什么别的选择"。
+    """把 Provider 构造失败分类，并在**缺密钥**时补上「还有什么别的选择」。
 
     **实测发现（M4）**：`providers/registry.py` 自己已经把缺密钥这件事说得很清楚了——
 
@@ -1369,9 +1805,9 @@ def _provider_error(exc: Exception, name: str, paths: LogoxPaths) -> StartupErro
         请在启动 Logox 前导出它，或在 config.toml 里把 [providers.deepseek]
         的 api_key_env 改成实际使用的变量名。
 
-    那是 M3 §10 缺陷 4 的直接产物（本地端点因为"缺密钥"启动失败、报错指向性极差）。
+    那是 M3 §10 缺陷 4 的直接产物（本地端点因为「缺密钥」启动失败、报错指向性极差）。
     因此装配根**不再重复解释一遍**，只做两件事：
-    ① 分类（决定退出码与测试口径）；② 补一句"本地端点不需要密钥"——
+    ① 分类（决定退出码与测试口径）；② 补一句「本地端点不需要密钥」——
     后者是用户此刻最可能想知道的下一步，而适配层无从得知。
     """
     text = str(exc)
@@ -1446,7 +1882,7 @@ def resolve_env_file(cwd: Path, paths: LogoxPaths) -> Path:
 def load_env_file_quietly(path: Path) -> list[str]:
     """把 ``.env`` 并入 ``os.environ``（**不覆盖已有的真实环境变量**）。
 
-    :returns: 实际生效的变量名（供启动摘要与 `/debug` 显示"从文件里读到了几个"）。
+    :returns: 实际生效的变量名（供启动摘要与 `/debug` 显示「从文件里读到了几个」）。
         返回值里**只有变量名，绝不含值**——它可能被打印出去。
     """
     from logox.config.envfile import load_env_file
@@ -1470,10 +1906,10 @@ def prepare_runtime(
 
     为什么要合成一个函数（M4 实测踩到）：`logox --inline` 最初直接调
     ``build_runtime``，**漏掉了加载 ``.env`` 这一步**，于是用户在 `/login` 里
-    存好的密钥完全不生效——启动后显示"尚未登录"，每条消息都失败，
+    存好的密钥完全不生效——启动后显示「尚未登录」，每条消息都失败，
     而设置界面看着一切正常。
 
-    根因是"装配"被拆成了两个必须成对出现的调用（``load_env_file_quietly``
+    根因是「装配」被拆成了两个必须成对出现的调用（``load_env_file_quietly``
     + ``build_runtime``），而**只做对一次是不够的**：任何新增的启动入口都会
     再踩一遍。所以现在只有一个入口，顺序由它保证。
     """
@@ -1527,7 +1963,7 @@ def build_session_start(runtime: Runtime, *, terminal_kind: str = "inline") -> A
 
     为什么放在装配根而不是界面里：这条事件的字段来自**配置与装配结果**
     （provider / model / 工作目录 / 工具清单），界面拿不到全部；
-    而且它是"事件总线内核"的第一条证据——**内核自己不发它**。
+    而且它是「事件总线内核」的第一条证据——**内核自己不发它**。
 
     ``terminal_kind`` 默认 ``"inline"``：界面只有一种（主屏行式渲染，不切备用屏）。
     这一项留在 ``terminal_caps`` 里是为了将来能按终端能力分档。

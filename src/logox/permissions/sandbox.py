@@ -12,10 +12,10 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any
 
+from logox.paths import is_sensitive_path
 from logox.permissions.models import RiskLevel
 
 __all__ = ["PathSandbox"]
@@ -31,7 +31,7 @@ class PathSandbox:
     def __init__(self, workspace_root: Path | str | None = None) -> None:
         self.workspace_root = Path(workspace_root or ".").resolve()
 
-    def audit_path(self, path: Path | str) -> Tuple[RiskLevel, str]:
+    def audit_path(self, path: Path | str) -> tuple[RiskLevel, str]:
         """审计给定的目标路径。
 
         :param path: 待检查的相对或绝对路径
@@ -53,7 +53,7 @@ class PathSandbox:
 
         # 1. 边界检测：是否越出工作区根目录
         try:
-            rel = resolved.relative_to(self.workspace_root)
+            resolved.relative_to(self.workspace_root)
         except (ValueError, RuntimeError):
             return (
                 RiskLevel.HIGH_CROSS_BOUNDARY,
@@ -84,30 +84,23 @@ class PathSandbox:
         return RiskLevel.NORMAL, ""
 
     def audit_tool_args(
-        self, tool_name: str, args: Dict[str, Any]
-    ) -> Tuple[RiskLevel, str]:
+        self, tool_name: str, args: dict[str, Any]
+    ) -> tuple[RiskLevel, str]:
         """从工具参数中提取关键路径并执行沙箱审计。"""
         if not isinstance(args, dict):
             return RiskLevel.NORMAL, ""
 
-        # 常见路径参数名
-        target_path = None
+        # Do not let an ordinary path hide another path or a sensitive command.
         for key in ("path", "file_path", "target_file", "file", "dir", "cwd"):
-            if key in args and args[key]:
-                target_path = args[key]
-                break
+            value = args.get(key)
+            if value:
+                risk, note = self.audit_path(value)
+                if risk != RiskLevel.NORMAL:
+                    return risk, note
 
-        if target_path:
-            return self.audit_path(target_path)
-
-        # 特殊：对 shell 命令做基本敏感路径探测（如包含 .git/ 或 .env）
-        if tool_name == "shell":
-            cmd = str(args.get("command", "") or "")
-            for sensitive in (".git", ".env"):
-                if sensitive in cmd:
-                    return (
-                        RiskLevel.HIGH_SENSITIVE,
-                        f"终端命令文本中包含敏感资源标记 ({sensitive})",
-                    )
-
+        marker_text = str(args.get("command", "") or "") if tool_name == "shell" else ""
+        if tool_name in {"glob", "fs_glob"}:
+            marker_text = str(args.get("pattern", "") or "")
+        if is_sensitive_path(marker_text) or (tool_name == "shell" and any(marker in marker_text.lower() for marker in (".git", ".env"))):
+            return RiskLevel.HIGH_SENSITIVE, "命令或路径模式包含敏感资源标记，需要单次确认"
         return RiskLevel.NORMAL, ""

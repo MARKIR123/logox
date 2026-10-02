@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 from logox.kernel.messages import (
     ContentBlock,
@@ -51,7 +50,7 @@ def estimate_text_tokens(text: str, calibration_factor: float = 1.0) -> int:
     if not text:
         return 0
 
-    cjk_count = len(_CJK_PATTERN.findall(text))
+    cjk_count = 0 if text.isascii() else len(_CJK_PATTERN.findall(text))
     ascii_count = len(text) - cjk_count
 
     raw_tokens = cjk_count * 1.0 + ascii_count * 0.28

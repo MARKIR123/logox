@@ -1,0 +1,2 @@
+{"id":"chatcmpl-8","object":"chat.completion.chunk","created":8,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"开始输出"},"finish_reason":null}]}
+{"error":{"message":"Rate limit reached for gpt-4o-mini","type":"rate_limit_error","code":"rate_limit_exceeded","retry_after":7}}

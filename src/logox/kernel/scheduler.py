@@ -290,14 +290,11 @@ class Scheduler:
                 kind=ERROR_UNKNOWN_TOOL,
             )
 
-        if not tool.spec.requires_permission:
-            return None
-
         decision = await self._decider.decide(call, tool, turn)
-        if decision is Decision.ALLOW:
+        if decision == Decision.ALLOW:
             return None
 
-        if decision is Decision.ASK:
+        if decision == Decision.ASK:
             # M3 没有界面：ASK **降级为 DENY**。
             # 绝不在无人值守时默认放行——这正是 MODULE_kernel_loop §9 第 1 项的裁定。
             await self._bus.publish(
@@ -466,8 +463,8 @@ class Scheduler:
                 if target_file.is_file():
                     before_hash = self._blob_store.put_file(target_file)
             except Exception as exc:
-                logger.debug("写前快照读取跳过：%s", exc)
-                before_hash = None
+                logger.warning("写前快照失败，工具未执行：%s", exc)
+                return ToolResult.failure(ErrorCategory.TOOL_FAILURE, "写前快照保存失败，未执行文件修改", detail=str(exc))
 
         result = await tool.run(args, ctx)
 

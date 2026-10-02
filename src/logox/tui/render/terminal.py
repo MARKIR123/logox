@@ -33,6 +33,8 @@ import threading
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
+from logox.tui.render.ansi import CLEAR_VIEWPORT
+
 __all__ = [
     "FakeTerminal",
     "PosixTerminal",
@@ -127,7 +129,7 @@ class FakeTerminal:
         self.stopped = True
 
     def clear(self) -> None:
-        self.write("\x1b[2J\x1b[H")
+        self.write(CLEAR_VIEWPORT)
 
     # -- 测试辅助 ------------------------------------------------------- #
 
@@ -337,7 +339,7 @@ class Win32Terminal:
         sys.stdout.flush()
 
     def clear(self) -> None:
-        self.write("\x1b[2J\x1b[H")
+        self.write(CLEAR_VIEWPORT)
 
     # -- 模式 ----------------------------------------------------------- #
 
@@ -604,7 +606,7 @@ class PosixTerminal:
         sys.stdout.flush()
 
     def clear(self) -> None:
-        self.write("\x1b[2J\x1b[H")
+        self.write(CLEAR_VIEWPORT)
 
     def start(self, on_input: Callable[[str], None], on_resize: Callable[[], None]) -> None:
         import signal

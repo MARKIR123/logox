@@ -49,6 +49,7 @@ class McpClient:
         self._session: Any | None = None
         self._lock = asyncio.Lock()
         self._pid: int | None = None
+        self._connect_task: asyncio.Task | None = None
 
     def status(self) -> McpServerStatus:
         tool_names = [
@@ -101,13 +102,18 @@ class McpClient:
             if self._session is not None and self.state == McpConnectionState.CONNECTED:
                 return
 
-            await self._cleanup_connection()
-            self.state = McpConnectionState.CONNECTING
-            self.last_error = None
-            await self._publish_state("starting")
-
+            if self.config.transport != "stdio":
+                self.state = McpConnectionState.OFFLINE
+                self.last_error = f"尚未实现 MCP transport={self.config.transport}；请使用 stdio"
+                await self._publish_state("degraded", error=self.last_error)
+                raise RuntimeError(self.last_error)
+            self._connect_task = asyncio.current_task()
             stack = AsyncExitStack()
             try:
+                await self._cleanup_connection()
+                self.state = McpConnectionState.CONNECTING
+                self.last_error = None
+                await self._publish_state("starting")
                 # 动态延迟导入 official mcp SDK（D29 / ARCHITECTURE §1.2）
                 from mcp import ClientSession, StdioServerParameters
                 from mcp.client.stdio import stdio_client
@@ -137,6 +143,15 @@ class McpClient:
                 self.last_error = None
                 await self._publish_state("ready")
                 logger.info("MCP 服务 [%s] 握手成功并已就绪", self.name)
+            except asyncio.CancelledError:
+                try:
+                    await stack.aclose()
+                finally:
+                    self._session = None
+                    self._exit_stack = None
+                    self.state = McpConnectionState.STOPPED
+                    await self._publish_state("stopped")
+                raise
             except Exception as exc:
                 self.state = McpConnectionState.OFFLINE
                 self.last_error = str(exc)
@@ -146,6 +161,8 @@ class McpClient:
                 await self._publish_state("degraded", error=str(exc))
                 logger.warning("MCP 服务 [%s] 连接失败：%s", self.name, exc)
                 raise
+            finally:
+                self._connect_task = None
 
     async def list_tools(self) -> list[Any]:
         """获取该服务暴露的工具列表。"""
@@ -236,6 +253,10 @@ class McpClient:
 
     async def close(self) -> None:
         """优雅退出并清理子进程树。"""
+        connecting = self._connect_task
+        if connecting is not None and connecting is not asyncio.current_task() and not connecting.done():
+            connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
         await self._cleanup_connection()
         if self.state != McpConnectionState.DISABLED:
             self.state = McpConnectionState.STOPPED

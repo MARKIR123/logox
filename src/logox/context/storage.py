@@ -1,18 +1,19 @@
 """会话持久化日志与大对象 (Blob) 换页存储引擎。
 
-实现 WAL (Write-Ahead Log) 式单调追加 JSONL 记录（1 步 1 行，崩溃安全），
-并将超过阈值的巨大工具输出外置落盘至独立日志文件（Out-of-Band Blob Store），
-保证主会话日志始终轻量紧凑。
+追加 JSONL 记录并将工具输出归档到会话隔离目录。成功追加后提交行号，
+写失败后重试先重建物理行号。JSONL 仍保存工具全文；没有 fsync、持久队列
+或整体事务保证，不能承诺断电完整性或主日志始终轻量。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +39,15 @@ class TranscriptLine:
     role: str
     event_type: str
     content: str = ""
-    tool_name: Optional[str] = None
-    call_id: Optional[str] = None
-    blob_file: Optional[str] = None
-    is_error: Optional[bool] = None
-    meta: Optional[Dict[str, Any]] = None
+    tool_name: str | None = None
+    call_id: str | None = None
+    blob_file: str | None = None
+    is_error: bool | None = None
+    meta: dict[str, Any] | None = None
 
 
 class SessionTranscriptWriter:
-    """会话事务日志追加器。"""
+    """会话 JSONL 追加与工具归档写出器。"""
 
     def __init__(
         self,
@@ -79,7 +80,9 @@ class SessionTranscriptWriter:
             self.session_dir = Path(base_dir).resolve() / session_id
             self.log_file = self.session_dir / "transcript.jsonl"
         self.tools_dir = self.session_dir / "tools"
+        self.blob_dir = self.tools_dir / hashlib.sha256(self.log_file.name.encode("utf-8")).hexdigest()[:20]
         self.current_line = 0
+        self._append_failed = False
         #: ``turn -> (该轮首行, 该轮末行)``，**真实行号**（D6）。
         #: 压缩器靠它把归档索引里的行号写成真值，而不是启发式估算。
         self.turn_lines: dict[int, tuple[int, int]] = {}
@@ -95,12 +98,13 @@ class SessionTranscriptWriter:
         self.log_file = Path(log_file).resolve()
         self.session_dir = self.log_file.parent
         self.tools_dir = self.session_dir / "tools"
+        self.blob_dir = self.tools_dir / hashlib.sha256(self.log_file.name.encode("utf-8")).hexdigest()[:20]
         self._ensure_dirs()
         self._init_current_line()
 
     def _ensure_dirs(self) -> None:
         try:
-            self.tools_dir.mkdir(parents=True, exist_ok=True)
+            self.blob_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             logger.warning("创建日志目录失败：%s", exc)
 
@@ -111,14 +115,16 @@ class SessionTranscriptWriter:
         行号仍然是 1-based 且与 ``write_step`` 严格一致。
         """
         self.current_line = 0
+        self._needs_separator = False
         self.turn_lines = {}
         self.collided_turns = set()
         if not self.log_file.is_file():
             return
         try:
-            with open(self.log_file, "r", encoding="utf-8", errors="replace") as f:
+            with open(self.log_file, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     self.current_line += 1
+                    self._needs_separator = not line.endswith("\n")
                     match = _TURN_FIELD_RE.search(line)
                     if match is not None:
                         self._record_turn_line(int(match.group(1)))
@@ -171,18 +177,20 @@ class SessionTranscriptWriter:
         role: str,
         event_type: str,
         content: str = "",
-        tool_name: Optional[str] = None,
-        call_id: Optional[str] = None,
-        blob_file: Optional[str] = None,
-        is_error: Optional[bool] = None,
-        meta: Optional[Dict[str, Any]] = None,
+        tool_name: str | None = None,
+        call_id: str | None = None,
+        blob_file: str | None = None,
+        is_error: bool | None = None,
+        meta: dict[str, Any] | None = None,
         **extra: Any,
-    ) -> int:
-        """追加一行事件到 transcript.jsonl，返回所写入的行号。"""
-        self.current_line += 1
-        self._record_turn_line(turn)
+    ) -> int | None:
+        """追加成功返回行号；失败不提交行号或轮次区间。"""
+        if self._append_failed:
+            self._init_current_line()
+            self._append_failed = False
+        next_line = self.current_line + 1
         record = {
-            "line": self.current_line,
+            "line": next_line,
             "turn": turn,
             "step": step,
             "role": role,
@@ -204,12 +212,18 @@ class SessionTranscriptWriter:
             record.update(extra)
 
         try:
+            needs_separator = self._needs_separator
             with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(("\n" if needs_separator else "") + json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
         except OSError as exc:
             logger.warning("写入 transcript.jsonl 失败：%s", exc)
+            self._append_failed = True
+            return None
 
+        self.current_line = next_line
+        self._needs_separator = False
+        self._record_turn_line(turn)
         return self.current_line
 
     @staticmethod
@@ -218,13 +232,13 @@ class SessionTranscriptWriter:
         return f"tool_{call_id.replace('/', '_').replace(chr(92), '_')}.log"
 
     def blob_path_of(self, call_id: str) -> str | None:
-        """若 ``tools/<call_id>.log`` 已存在则返回其相对路径，否则 ``None``（F-17）。
+        """若当前会话的工具文件已存在则返回其相对路径，否则 ``None``（F-17）。
 
         给压缩器用来**避免重复落盘**：持久化订阅者在工具结束时已经写过一次，
         压缩器只需要"确认它在"，而不是每次折叠都再写一遍。
         """
         filename = self._blob_filename(call_id)
-        return f"tools/{filename}" if (self.tools_dir / filename).is_file() else None
+        return (self.blob_dir / filename).relative_to(self.session_dir).as_posix() if (self.blob_dir / filename).is_file() else None
 
     def save_tool_blob(
         self,
@@ -232,23 +246,22 @@ class SessionTranscriptWriter:
         raw_output: str,
         *,
         force: bool = False,
-    ) -> Optional[str]:
-        """将超大工具输出写入独立文件 tools/<call_id>.log。
+    ) -> str | None:
+        """将工具输出写入 tools/<日志命名空间>/tool_<安全 call_id>.log。
 
         若内容小于阈值且未强制落盘，返回 None 表示无需外置存储。
-        返回相对于 session_dir 的相对路径，如 'tools/call_123.log'。
+        返回相对于 session_dir 的相对路径，如 'tools/<命名空间>/tool_call_123.log'。
         """
         raw_bytes = len(raw_output.encode("utf-8", errors="replace"))
         if not force and raw_bytes < TOOL_BLOB_THRESHOLD_BYTES:
             return None
 
-        blob_path = self.tools_dir / self._blob_filename(call_id)
-        filename = blob_path.name
+        blob_path = self.blob_dir / self._blob_filename(call_id)
 
         try:
             with open(blob_path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(raw_output)
-            return f"tools/{filename}"
+            return blob_path.relative_to(self.session_dir).as_posix()
         except OSError as exc:
             logger.warning("保存工具 Blob 日志失败：%s", exc)
             return None

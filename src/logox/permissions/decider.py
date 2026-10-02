@@ -18,8 +18,9 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
+from logox.permission_types import PermissionAsk, PermissionChoice
 from logox.permissions.engine import PermissionEngine, _normalize_tool_name
 from logox.permissions.models import (
     Decision,
@@ -28,7 +29,6 @@ from logox.permissions.models import (
     RiskLevel,
     RuleScope,
 )
-from logox.permission_types import PermissionAsk, PermissionChoice
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class HierarchicalPermissionDecider:
 
     def __init__(
         self,
-        engine: Optional[PermissionEngine] = None,
+        engine: PermissionEngine | None = None,
         *,
         cwd: Any = None,
         state_store: Any = None,
@@ -54,7 +54,7 @@ class HierarchicalPermissionDecider:
         #: 是否在 headless 模式下挂起等待人工审批
         self.wait_headless = wait_headless
         #: 历史审计追踪：记录每次裁决的 (tool, choice)
-        self.history: List[Tuple[str, str]] = []
+        self.history: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------ #
     # 外部注入接口 (Headless Control)
@@ -107,10 +107,10 @@ class HierarchicalPermissionDecider:
     async def decide(self, call: Any, tool: Any, turn: Any) -> Decision:
         """裁决一次工具调用。返回值必须为 Decision.ALLOW 或 Decision.DENY。"""
         tool_name = str(getattr(tool, "spec", None) and tool.spec.name or call.name)
-        args: Dict[str, Any] = getattr(call, "arguments", None) or getattr(call, "args", None) or {}
+        args: dict[str, Any] = getattr(call, "arguments", None) or getattr(call, "args", None) or {}
 
         # 1. 运行权限引擎五层裁决流水线
-        evaluation: PermissionEvaluation = self.engine.evaluate(tool_name, args)
+        evaluation: PermissionEvaluation = self.engine.evaluate(tool_name, args, readonly=bool(getattr(getattr(tool, "spec", None), "readonly", False)))
 
         if evaluation.decision == Decision.ALLOW:
             return Decision.ALLOW
@@ -155,7 +155,7 @@ class HierarchicalPermissionDecider:
         self,
         call: Any,
         tool_name: str,
-        args: Dict[str, Any],
+        args: dict[str, Any],
         evaluation: PermissionEvaluation,
     ) -> PermissionAsk:
         """组装供 TUI 渲染的纯数据对象 PermissionAsk。"""
@@ -289,8 +289,8 @@ def format_permission_detail(tool_name: str, args: Any, cwd: str = "") -> str:
         lines = [f"path: {target}"]
         if content:
             lines.append("content:")
-            for l in content.splitlines():
-                lines.append(f"  {l}")
+            for line in content.splitlines():
+                lines.append(f"  {line}")
         return "\n".join(lines)
 
     # 3. shell 工具：展示待执行命令与工作目录

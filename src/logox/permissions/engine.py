@@ -17,7 +17,7 @@ import fnmatch
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from logox.permissions.models import (
     Decision,
@@ -101,9 +101,9 @@ class PermissionEngine:
             self.mode = PermissionMode.DEFAULT
 
         #: 内存中的会话级规则
-        self.session_rules: List[PermissionRule] = []
+        self.session_rules: list[PermissionRule] = []
         #: 项目级持久化规则（启动时从 state.toml 加载）
-        self.project_rules: List[PermissionRule] = []
+        self.project_rules: list[PermissionRule] = []
 
     def set_mode(self, mode: PermissionMode | str) -> None:
         """动态调整权限运行模式并同步持久化（D130）。"""
@@ -124,9 +124,9 @@ class PermissionEngine:
 
     def load_persisted(
         self,
-        allow_rules: Optional[List[str]] = None,
-        deny_rules: Optional[List[str]] = None,
-        mode: Optional[str] = None,
+        allow_rules: list[str] | None = None,
+        deny_rules: list[str] | None = None,
+        mode: str | None = None,
     ) -> None:
         """从配置中加载持久化规则列表与运行模式。"""
         if mode:
@@ -134,7 +134,7 @@ class PermissionEngine:
                 self.mode = PermissionMode(mode)
             except Exception:
                 self.mode = PermissionMode.DEFAULT
-        loaded: List[PermissionRule] = []
+        loaded: list[PermissionRule] = []
         for raw in allow_rules or []:
             loaded.append(
                 PermissionRule.from_str(
@@ -210,7 +210,7 @@ class PermissionEngine:
         rule = PermissionRule.from_str(rule_str, scope=scope, decision=decision)
         return self.revoke_rule(rule)
 
-    def get_rules_snapshot(self) -> Dict[str, Any]:
+    def get_rules_snapshot(self) -> dict[str, Any]:
         """获取当前权限与物理沙箱配置快照（D132）。"""
         return {
             "workspace_root": self.workspace_root,
@@ -228,7 +228,7 @@ class PermissionEngine:
         self,
         rule: PermissionRule,
         tool_name: str,
-        args: Dict[str, Any],
+        args: dict[str, Any],
         normalized_prefix: str,
         command_raw: str,
     ) -> bool:
@@ -273,7 +273,7 @@ class PermissionEngine:
     # ------------------------------------------------------------------ #
 
     def evaluate(
-        self, tool_name: str, args: Optional[Dict[str, Any]] = None
+        self, tool_name: str, args: dict[str, Any] | None = None, *, readonly: bool = False
     ) -> PermissionEvaluation:
         """执行五层裁决评估。"""
         args_dict = args or {}
@@ -304,6 +304,19 @@ class PermissionEngine:
         # -------------------------------------------------------------- #
         # 第 3 层：路径沙箱与敏感防护 (Path Sandboxing)
         # -------------------------------------------------------------- #
+        all_rules = self.session_rules + self.project_rules
+
+        # 4.1 显式拒绝规则优先一票否决
+        for rule in all_rules:
+            if rule.decision == Decision.DENY and self._matches_rule(
+                rule, tool_name, args_dict, normalized_prefix, command_raw
+            ):
+                return PermissionEvaluation(
+                    decision=Decision.DENY,
+                    reason=f"命中显式拒绝规则：{rule.to_str()}",
+                    matched_rule=rule,
+                )
+
         risk_level, risk_note = self.sandbox.audit_tool_args(tool_name, args_dict)
         if risk_level != RiskLevel.NORMAL:
             # 用户裁定：越界与敏感操作不直接拒绝，提权直通 HITL 审批！
@@ -339,46 +352,30 @@ class PermissionEngine:
         # -------------------------------------------------------------- #
         # 第 4 层：三层规则引擎匹配 (Rule Engine: Deny > Session > Project > Built-in)
         # -------------------------------------------------------------- #
-        all_rules = self.session_rules + self.project_rules
-
-        # 4.1 显式拒绝规则优先一票否决
-        for rule in all_rules:
-            if rule.decision == Decision.DENY:
-                if self._matches_rule(
-                    rule, tool_name, args_dict, normalized_prefix, command_raw
-                ):
-                    return PermissionEvaluation(
-                        decision=Decision.DENY,
-                        reason=f"命中显式拒绝规则：{rule.to_str()}",
-                        matched_rule=rule,
-                    )
-
         # 4.2 会话级放行规则
         for rule in self.session_rules:
-            if rule.decision == Decision.ALLOW:
-                if self._matches_rule(
-                    rule, tool_name, args_dict, normalized_prefix, command_raw
-                ):
-                    return PermissionEvaluation(
-                        decision=Decision.ALLOW,
-                        reason=f"命中本次会话允许规则：{rule.to_str()}",
-                        matched_rule=rule,
-                    )
+            if rule.decision == Decision.ALLOW and self._matches_rule(
+                rule, tool_name, args_dict, normalized_prefix, command_raw
+            ):
+                return PermissionEvaluation(
+                    decision=Decision.ALLOW,
+                    reason=f"命中本次会话允许规则：{rule.to_str()}",
+                    matched_rule=rule,
+                )
 
         # 4.3 项目级持久化放行规则
         for rule in self.project_rules:
-            if rule.decision == Decision.ALLOW:
-                if self._matches_rule(
-                    rule, tool_name, args_dict, normalized_prefix, command_raw
-                ):
-                    return PermissionEvaluation(
-                        decision=Decision.ALLOW,
-                        reason=f"命中项目持久允许规则：{rule.to_str()}",
-                        matched_rule=rule,
-                    )
+            if rule.decision == Decision.ALLOW and self._matches_rule(
+                rule, tool_name, args_dict, normalized_prefix, command_raw
+            ):
+                return PermissionEvaluation(
+                    decision=Decision.ALLOW,
+                    reason=f"命中项目持久允许规则：{rule.to_str()}",
+                    matched_rule=rule,
+                )
 
         # 4.4 内置只读安全基线 (Built-in Safe Whitelist)
-        if tool_name in {"fs_glob", "fs_grep", "glob", "grep"}:
+        if readonly or tool_name in {"fs_read", "fs_glob", "fs_grep", "read", "glob", "grep"}:
             return PermissionEvaluation(
                 decision=Decision.ALLOW,
                 reason="天然只读安全工具",
@@ -421,7 +418,7 @@ class PermissionEngine:
         )
 
     def _build_suggested_rule(
-        self, tool_name: str, args: Dict[str, Any], normalized_prefix: str
+        self, tool_name: str, args: dict[str, Any], normalized_prefix: str
     ) -> PermissionRule:
         """为当前操作推导推荐记录的细粒度规则。"""
         if tool_name == "shell":
@@ -439,10 +436,7 @@ class PermissionEngine:
             try:
                 rel = Path(target_path).resolve().relative_to(self.workspace_root)
                 parent = str(rel.parent).replace("\\", "/")
-                if parent and parent != ".":
-                    pattern = f"{parent}/*"
-                else:
-                    pattern = rel.name
+                pattern = f"{parent}/*" if parent and parent != "." else rel.name
             except Exception:
                 pattern = target_path.replace("\\", "/")
             return PermissionRule(

@@ -1,0 +1,8 @@
+{"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":200,"output_tokens":1}}}
+{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}
+{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}
+{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"th\": \"src/a.py\""}}
+{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"}"}}
+{"type":"content_block_stop","index":0}
+{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":30}}
+{"type":"message_stop"}

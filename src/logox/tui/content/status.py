@@ -108,7 +108,10 @@ class StatusContext:
     items: StatusItems
     timing_fields: TimingFields
     width: int
-    tool_glyph: str = "⏺"
+    #: 运行中字形（D200：由 `⏺` 改为 `✻`，见 MODULE_03 §5.2）。
+    #: 默认值与 `ThemeGlyphs.running` 必须一致，否则"没写这一项的主题"和
+    #: "写了这一项的主题"会显示成两个不同图标。
+    tool_glyph: str = "✻"
     git_branch: str | None = None
     session_label: str | None = None
     queue_label: str | None = None

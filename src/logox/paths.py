@@ -248,3 +248,11 @@ def ensure_project_initialized(cwd: Path) -> tuple[ProjectPaths, bool]:
         state_path.write_text("# Logox project state\nschema_version = 1\n", encoding="utf-8")
 
     return ProjectPaths.for_root(resolved_cwd), created
+
+
+def is_sensitive_path(path: Path | str) -> bool:
+    """Shared detection for explicit targets and recursive search descendants."""
+    parts = str(path).replace("\\", "/").lower().split("/")
+    return any(part == ".git" or part.startswith(".env") for part in parts) or (
+        ".logox" in parts and any(part in {"config.toml", "permissions.toml"} for part in parts)
+    )

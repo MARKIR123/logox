@@ -27,6 +27,7 @@ from rich.style import Style
 from rich.text import Text
 
 __all__ = [
+    "CLEAR_VIEWPORT",
     "LINE_RESET",
     "slice_styled",
     "split_styled_lines",
@@ -35,6 +36,10 @@ __all__ = [
     "text_to_ansi",
     "visible_width",
 ]
+
+#: Erase in place: ED(2) would archive the old page in Windows Terminal.
+#: Home first, then ED(0); neither adds to nor clears scrollback.
+CLEAR_VIEWPORT = "\x1b[H\x1b[0J"
 
 #: 每一行结尾都要附上的复位串（对齐 Pi 的 ``TUI.SEGMENT_RESET``）。
 #:
@@ -153,19 +158,11 @@ def split_styled_lines(text: Text) -> list[Text]:
     if not plain:
         return []
     if plain.endswith("\n"):
-        plain = plain[:-1]
-        if not plain:
+        text = text[:-1]
+        if not text.plain:
             return []
-    styles = styles_per_char(text)
-    rows: list[Text] = []
-    start = 0
-    for index, char in enumerate(plain):
-        if char != "\n":
-            continue
-        rows.append(slice_styled(plain, styles, start, index))
-        start = index + 1
-    rows.append(slice_styled(plain, styles, start, len(plain)))
-    return rows
+    # Rich 按 span 范围分割并保留叠加样式；无需先为每个字符展开样式。
+    return list(text.split("\n", allow_blank=True))
 
 
 def text_to_ansi(text: Text, *, color_system: ColorSystem = ColorSystem.TRUECOLOR) -> str:

@@ -17,6 +17,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "AnamesisConfig",
     "BUILTIN_PROVIDERS",
     "DEFAULT_ENABLED_TOOLS",
     "STATUS_ITEM_KEYS",
@@ -124,6 +125,16 @@ class ProviderInstanceConfig(BaseModel):
     api_key_env: str = ""
     models: list[str] = Field(default_factory=list)
     api_key: str | None = Field(default=None, exclude=True, repr=False)
+    context_window: int | None = Field(default=None, gt=0)
+    model_windows: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("model_windows")
+    @classmethod
+    def _validate_model_windows(cls, v: dict[str, int]) -> dict[str, int]:
+        for m_id, win in v.items():
+            if win <= 0:
+                raise ValueError(f"模型 {m_id} 的 context_window 必须大于 0，收到 {win}")
+        return v
 
     @model_validator(mode="after")
     def _forbid_plaintext_key(self) -> ProviderInstanceConfig:
@@ -181,6 +192,40 @@ class ContextConfig(BaseModel):
     # ---- 项目记忆 ------------------------------------------------------------ #
     #: 是否读取项目 `LOGOX.md` 长期记忆（关掉则完全不读，也不注入 system）
     project_memory_enabled: bool = True
+
+
+class AnamesisConfig(BaseModel):
+    """Independent, explicitly configured local memory consolidation."""
+
+    model_config = _STRICT
+    enabled: bool = True
+    memory_enabled: bool = True
+    idle_seconds: int = Field(default=1800, gt=0)
+    sleep_start: str = "00:00"
+    sleep_end: str = "08:00"
+    provider: Literal["ollama", "lm-studio"] = "ollama"
+    model: str = ""
+    request_timeout_s: float = Field(default=180.0, gt=0, description="入梦连续无模型数据期限（秒），非请求总时长")
+    nap_max_steps: int = Field(default=4, gt=0)
+    sleep_max_steps: int = Field(default=64, gt=0)
+    user_archive_tokens: int = Field(default=800, gt=0)
+    project_archive_tokens: int = Field(default=1600, gt=0)
+    prompt_memory_max_ratio: float = Field(default=0.05, gt=0, le=0.2)
+
+    @field_validator("sleep_start", "sleep_end")
+    @classmethod
+    def _clock_time(cls, value: str) -> str:
+        import re
+
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            raise ValueError("时段必须是 HH:MM，例如 00:00")
+        return value
+
+    @model_validator(mode="after")
+    def _distinct_times(self) -> AnamesisConfig:
+        if self.sleep_start == self.sleep_end:
+            raise ValueError("长眠开始和结束时刻不能相同")
+        return self
 
 
 class ShellConfig(BaseModel):
@@ -333,7 +378,7 @@ class UiConfig(BaseModel):
     fullscreen: bool = False
     sidebar_width: int = Field(default=32, ge=24, le=48)
     diff_context_lines: int = Field(default=3, ge=0, le=10)
-    stream_fps: int = Field(default=10, ge=5, le=30)
+    stream_fps: int = Field(default=30, ge=5, le=60)
     show_reasoning: Literal["collapsed", "expanded", "hidden"] = "collapsed"
     icon_set: Literal["unicode", "ascii", "nerd"] = "unicode"
     animations: bool = True
@@ -389,6 +434,7 @@ class LogoxConfig(BaseModel):
     providers: dict[str, ProviderInstanceConfig] = Field(default_factory=dict)
     kernel: KernelConfig = Field(default_factory=KernelConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    anamnesis: AnamesisConfig = Field(default_factory=AnamesisConfig)
     shell: ShellConfig = Field(default_factory=ShellConfig)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
@@ -711,7 +757,9 @@ class ThemeGlyphs(BaseModel):
     model_config = _STRICT
 
     set: Literal["unicode", "ascii", "nerd"] = "unicode"
-    running: str = "⏺"
+    #: 运行中字形。D200：原本是 ``⏺``（U+23FA）—— 用户反馈"太丑"，且它属
+    #: emoji-capable 字符（终端可能交给 emoji 字体画）。换成 ``✻``（U+273B）。
+    running: str = "✻"
     success: str = "✓"
     error: str = "✗"
     denied: str = "⊘"

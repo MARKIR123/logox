@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import fnmatch
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import Field
 
 from logox.errors import ErrorCategory
+from logox.paths import is_sensitive_path
 from logox.tools.base import DisplayHint, ToolArgs, ToolContext, ToolResult, ToolSpec
+from logox.tools.fs_read import run_readonly_worker
 
 __all__ = ["GlobArgs", "GlobTool", "build"]
 
@@ -57,9 +60,7 @@ def _matches(rel: str, pattern: str) -> bool:
         return True
     if "/**/" in pattern and fnmatch.fnmatch(rel, pattern.replace("/**/", "/")):
         return True
-    if "/" not in pattern and fnmatch.fnmatch(os.path.basename(rel), pattern):
-        return True
-    return False
+    return "/" not in pattern and fnmatch.fnmatch(os.path.basename(rel), pattern)
 
 
 class GlobArgs(ToolArgs):
@@ -90,7 +91,13 @@ class GlobTool:
         summary_template="查找 {pattern}",
     )
 
+    def __init__(self, *, path_filter: Callable[[Path], bool] | None = None) -> None:
+        self.path_filter = path_filter
+
     async def run(self, args: ToolArgs, ctx: ToolContext) -> ToolResult:
+        return await run_readonly_worker(self._run_sync, args, ctx)
+
+    def _run_sync(self, args: ToolArgs, ctx: ToolContext) -> ToolResult:
         assert isinstance(args, GlobArgs)
         root = _resolve(ctx.cwd, args.path)
 
@@ -107,6 +114,18 @@ class GlobTool:
                 detail="若要检查该文件内容，请使用 read 工具。",
             )
 
+        allow_sensitive = is_sensitive_path(root) or is_sensitive_path(args.pattern)
+
+        def permitted(path: Path) -> bool:
+            if self.path_filter is not None and not self.path_filter(path):
+                return False
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                return False
+            return allow_sensitive or not (is_sensitive_path(path) or is_sensitive_path(resolved))
+
         matches: list[str] = []
 
         try:
@@ -116,7 +135,7 @@ class GlobTool:
                     return ToolResult.failure(ErrorCategory.CANCELLED, "搜索操作已被取消")
 
                 # 剪枝：剔除忽略的目录
-                dirnames[:] = [d for d in dirnames if d not in _DEFAULT_IGNORES and not d.startswith(".tmp")]
+                dirnames[:] = [d for d in dirnames if (d not in _DEFAULT_IGNORES or (allow_sensitive and d in {".git", ".logox"})) and not d.startswith(".tmp") and permitted(Path(dirpath) / d)]
 
                 # 检查目录本身是否匹配（排除根目录自身）
                 if dirpath != str(root):
@@ -127,6 +146,10 @@ class GlobTool:
                 # 检查文件是否匹配
                 for fname in filenames:
                     full_p = os.path.join(dirpath, fname)
+                    if ctx.is_cancelled():
+                        return ToolResult.failure(ErrorCategory.CANCELLED, "搜索操作已被取消")
+                    if not permitted(Path(full_p)):
+                        continue
                     rel_file = os.path.relpath(full_p, root)
                     if _matches(rel_file, args.pattern):
                         matches.append(rel_file.replace("\\", "/"))
