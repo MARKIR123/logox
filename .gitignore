@@ -34,7 +34,7 @@ dist/
 # 仅本机保留、不进版本历史的文件（文件本身留在磁盘上，只是不跟踪）：
 #   AGENTS.md   本机 Agent 协作规范
 #   logox.cmd / install.cmd / logox.ps1   开发期便捷启动器
-#   /tools/    开发期辅助脚本；仅色板生成器及固定色板允许纳入测试发布
+#   /tools/    开发期辅助脚本；仅色板生成器、固定色板及离线 TUI 基准允许纳入测试发布
 # ============================================================================
 AGENTS.md
 logox.cmd
@@ -42,6 +42,7 @@ install.cmd
 logox.ps1
 /tools/*
 !/tools/gen_themes.py
+!/tools/benchmark_tui.py
 !/tools/vendor/
 /tools/vendor/*
 !/tools/vendor/catppuccin-palette.json
@@ -60,6 +61,8 @@ logox.ps1
 !/docs/ANAMNESIS-DESIGN.md
 !/docs/ANAMNESIS-VALIDATION.md
 !/docs/UI-SPEC.md
+!/docs/CLEANUP-DESIGN-2026-10-03.md
+!/docs/CLEANUP-REPORT-2026-10-03.md
 /scratch/
 
 # 会话产物：.logox/runs/ 下是逐次对话的记录（属隐私数据）。
@@ -69,3 +72,6 @@ logox.ps1
 # 开发期工具（如 ruff 二进制）——装到仓库内的固定目录，例如
 # python -m pip install --target .tools ruff（理由见 docs/DEV-ENVIRONMENT.md §4.4）
 .tools/
+
+# 入梦生成的用户/项目背景资料，不发布个人事实；人工 LOGOX.md 仍可跟踪。
+/ANAMNESIS.md

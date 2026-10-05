@@ -295,6 +295,7 @@ class AnamesisService:
                     r.timestamp
                     for r in refs
                     if r.kind == "user_message"
+                    and r.timestamp is not None
                     and r.project_id == self.collector.project_id
                     and (not session_id or r.session_id == session_id)
                 ),

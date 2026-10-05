@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 from logox.context.tokens import estimate_text_tokens
 
@@ -93,7 +92,7 @@ def find_project_memory(cwd: str | Path | None = None) -> ProjectMemory:
     # 1. 向上攀爬收集
     while True:
         # 按优先级探查规范记忆文件
-        found_file: Optional[Path] = None
+        found_file: Path | None = None
         for name in MEMORY_FILENAMES:
             candidate_1 = current / name
             candidate_2 = current / ".logox" / name
@@ -134,7 +133,7 @@ def find_project_memory(cwd: str | Path | None = None) -> ProjectMemory:
 
         # 安全读取并截断
         try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(file_path, encoding="utf-8", errors="replace") as f:
                 content = f.read(MAX_MEMORY_FILE_BYTES)
         except OSError:
             continue

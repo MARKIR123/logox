@@ -113,6 +113,9 @@ class Screen:
         #: 而症状是"屏幕上还是旧内容"——所以 ``ansi_hits`` 这个计数器是给测试用的，
         #: 它让"到底复用了几行"变成可断言的事实，而不是一个假设。
         self._serialized_rows: list[Text] = []
+        self._fit_sources: list[Text] = []
+        self._fit_pieces: list[list[Text]] = []
+        self._fit_width = 0
         #: 上一帧的行（**比较的基准**）
         self._previous: list[str] = []
         self._previous_width = 0
@@ -426,7 +429,7 @@ class Screen:
 
         # ① 组件 → 行（Text），并在这一层**兜底硬切**超宽行
         #    （超宽会让终端折行 → 下面所有行错位，见 component.py 的说明）
-        raw = fit_lines(self.root.render(width), width)
+        raw = self._fit_rows(self.root.render(width), width)
         raw = self._composite_overlays(raw, width, height)
         # ② 找出（并摘掉）IME 光标标记 —— 必须在序列化**之前**做
         self._cursor_pos = self._extract_cursor(raw, height)
@@ -496,6 +499,25 @@ class Screen:
         )
         self._previous = new_lines
         self._previous_width, self._previous_height = width, height
+
+    def _fit_rows(self, rows: list[Text], width: int) -> list[Text]:
+        """未变且已交付的不可变行不用重复检查格宽；只保留当前帧。"""
+        sources, pieces = self._fit_sources, self._fit_pieces
+        same_width = width == self._fit_width
+        current: list[list[Text]] = []
+        out: list[Text] = []
+        for index, row in enumerate(rows):
+            if same_width and index < len(sources) and sources[index] is row:
+                fitted = pieces[index]
+            else:
+                fitted = fit_lines([row], width)
+            current.append(fitted)
+            out.extend(fitted)
+        self._fit_sources = rows
+        self._fit_pieces = current
+        self._fit_width = width
+        # 光标摘除/浮层合成会替换 out 中的行，不可改动缓存里的片段。
+        return out
 
     def _serialize_rows(self, rows: list[Text]) -> list[str]:
         """把行对象序列化成 ANSI 字节，**按身份复用上一帧的结果**（D126）。

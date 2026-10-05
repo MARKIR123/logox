@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import shlex
-from typing import List, Tuple
 
 __all__ = ["is_compound_command", "normalize_shell_command"]
 
@@ -30,7 +29,7 @@ _WRAPPER_EXECUTABLES = {
 }
 
 
-def is_compound_command(tokens: List[str]) -> bool:
+def is_compound_command(tokens: list[str]) -> bool:
     """检测 Token 序列中是否包含复合操作符。
 
     因为 tokens 已经通过 shlex 解析，引号包裹的字面量内部的符号
@@ -51,7 +50,7 @@ def is_compound_command(tokens: List[str]) -> bool:
     return False
 
 
-def normalize_shell_command(command: str) -> Tuple[str, List[str], bool]:
+def normalize_shell_command(command: str) -> tuple[str, list[str], bool]:
     """清洗并规范化 Shell 命令。
 
     :param command: 模型生成的原始命令行字符串
@@ -95,9 +94,8 @@ def normalize_shell_command(command: str) -> Tuple[str, List[str], bool]:
         elif len(clean_tokens) >= 2 and not clean_tokens[1].startswith("-"):
             prefix_parts = [first, clean_tokens[1].lower()]
     # 特殊穿透逻辑 2: git / npm / cargo 等具备核心二级子命令的工具
-    elif first in {"git", "npm", "cargo", "docker", "pnpm", "yarn"}:
-        if len(clean_tokens) >= 2 and not clean_tokens[1].startswith("-"):
-            prefix_parts = [first, clean_tokens[1].lower()]
+    elif first in {"git", "npm", "cargo", "docker", "pnpm", "yarn"} and len(clean_tokens) >= 2 and not clean_tokens[1].startswith("-"):
+        prefix_parts = [first, clean_tokens[1].lower()]
 
     normalized_prefix = " ".join(prefix_parts)
     return normalized_prefix, clean_tokens, is_compound

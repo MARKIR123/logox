@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,8 @@ class SessionTranscriptWriter:
             "step": step,
             "role": role,
             "type": event_type,
+            # 事件记录经 extra 传入原始时刻；内部记录默认使用创建时刻。
+            "timestamp": time.time(),
         }
         if content:
             record["content"] = content

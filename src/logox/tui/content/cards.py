@@ -21,6 +21,7 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from logox.config.schema import ThemePalette
+from logox.difftext import DiffHunk, DiffLineKind, parse_unified_diff
 from logox.kernel.events import ChangeStat
 from logox.tui.format import EMPTY, clip, format_duration, pad_right
 from logox.tui.format import diff_badge as render_diff_badge
@@ -88,7 +89,6 @@ class CardContext:
 # （工具层的生成侧 + 界面层的渲染侧），所以它们的家是**两边之下的中立模块**。
 # 留在本模块会导致 `import logox.tools.*` 顺手把界面层拖进来（F-50）。
 # 老的 `from logox.tui.content.cards import DiffHunk` 写法依然可用 —— 这是**故意**的兼容。
-from logox.difftext import DiffHunk, DiffLineKind, parse_unified_diff
 
 # --------------------------------------------------------------------------- #
 # 纯渲染函数

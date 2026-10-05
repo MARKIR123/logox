@@ -1,8 +1,7 @@
-"""TUI 表现层（D12：Textual 全屏多窗格）。
+"""TUI 表现层：Rich 内容与自研 ANSI 行渲染，支持主屏及备用全屏。
 
-**本模块的 ``__init__`` 刻意不 import textual**——`cli.py` 的 ``--version``
-快速路径会在 import 链上经过它，任何重导入都会破坏 D29 的 300ms 预算。
-真正需要 textual 的地方（``tui.app`` / ``tui.widgets.*``）自行导入。
+包入口不加载 UI、模型 SDK 或配置，保留 CLI 快速路径的惰性导入。
+具体组件、主题与终端仅在对应入口需要时导入。
 """
 
 from __future__ import annotations

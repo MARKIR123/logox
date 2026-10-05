@@ -926,16 +926,6 @@ class Compactor:
         return [memo_msg, *messages[-tail_len:]], folded_from
 
     @staticmethod
-    def _is_index_message(message: Message) -> bool:
-        """这条消息是不是**归档索引**？（委托给 `is_index_message`，单一判据）
-
-        `INDEX_MARKER` 是单一事实来源 —— `_render_index()` 用它渲染、
-        `HierarchicalContextBuilder._folded_head()` 用它认出头部末尾、
-        这里用它把**旧索引**从保留的前缀里剔掉。
-        """
-        return is_index_message(message)
-
-    @staticmethod
     def _is_folded_turn(messages: list[Message], span: tuple[int, int]) -> bool:
         """这一轮是不是**已经折叠过**的（视图里是 ``[user 全文, assistant 摘要]``）？
 

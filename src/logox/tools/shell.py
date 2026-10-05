@@ -154,18 +154,6 @@ def truncate_output(text: str) -> tuple[str, bool]:
     return truncated_text, True
 
 
-def _decode_bytes(raw: bytes) -> str:
-    """自适应解码 bytes 为字符串（utf-8 -> gbk -> latin-1）。"""
-    if not raw:
-        return ""
-    for enc in ("utf-8", "gbk", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
-
-
 class _BoundedOutput:
     def __init__(self):
         self.total = 0

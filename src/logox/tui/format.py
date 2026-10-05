@@ -445,9 +445,7 @@ def _is_token_char(text: str, idx: int) -> bool:
     if _TOKEN_CHAR.match(c) or c == "`":
         return True
     # 数字内部的千分位逗号算作 token 字符
-    if c == "," and idx > 0 and idx < len(text) - 1 and text[idx - 1].isdigit() and text[idx + 1].isdigit():
-        return True
-    return False
+    return c == "," and 0 < idx < len(text) - 1 and text[idx - 1].isdigit() and text[idx + 1].isdigit()
 
 
 def _inside_word(text: str, index: int) -> bool:
@@ -482,9 +480,8 @@ def _is_protected_punct(text: str, index: int) -> bool:
         if index + 1 < len(text) and (text[index + 1].isalnum() or text[index + 1] in "_-"):
             return True
         # 前接通配符或标识符且后接非空白（如 *.md）
-        if index > 0 and (text[index - 1].isalnum() or text[index - 1] in "*_-"):
-            if index + 1 < len(text) and not text[index + 1].isspace():
-                return True
+        if index > 0 and (text[index - 1].isalnum() or text[index - 1] in "*_-") and index + 1 < len(text) and not text[index + 1].isspace():
+            return True
     # ③ 时间与命名空间冒号
     elif char == ":":
         if 0 < index < len(text) - 1 and text[index - 1].isdigit() and text[index + 1].isdigit():
@@ -518,9 +515,8 @@ def _scan_preferred(text: str, spans: list[tuple[int, int, bool]], start: int, h
     floor = max(start + 1, hard - max(8, (hard - start) // 4))
     for index in range(hard - 1, floor - 1, -1):
         char = text[index]
-        if char in _BREAK_AFTER:
-            if not _is_protected_punct(text, index):
-                return index + 1  # 标点留在本行尾部
+        if char in _BREAK_AFTER and not _is_protected_punct(text, index):
+            return index + 1  # 标点留在本行尾部
         if char.isspace():
             return index  # 空白丢掉
     # 没找到优先断点 ⇒ 准备硬断，但**先看看会不会切开标识符**
@@ -570,50 +566,6 @@ def _kinsoku_shori(text: str, start: int, end: int) -> int:
     return end
 
 
-def _prefer_break(line: str) -> tuple[str, str]:
-    """在 ``line`` 里找**最好的断点**，返回 ``(本行, 余下)``。
-
-    找不到合适断点（或回溯会掏空整行）时返回 ``(line, "")``，由调用方按硬断处理。
-
-    为什么要这么做：中文没有空格，逐字硬断会把"（颜色、底色、高亮）"劈成
-    "（颜色、底" + "色、高亮）"——单看完全读不通。断在标点后则至少是完整短语。
-    这也是用户报的"**错误的断句**"的直接对策。
-
-    ``line`` 的长度已经接近预算，所以只需往回看一小段：为了一个远处的标点
-    把整行掏空反而更糟。
-    """
-    floor = max(1, len(line) - max(8, len(line) // 4))
-    for index in range(len(line) - 1, floor - 1, -1):
-        if line[index] in _BREAK_AFTER or line[index].isspace():
-            # ⚠️ 断点字符**必须被本行吃掉**（留在 head 里）或**直接丢掉**。
-            # 早期版本用 ``line[index + 1 :]`` 当 carry，那个字符既不在 head
-            # 也不在 carry —— 而调用方要用 carry 去接续行，于是断点处的字
-            # **既没丢也没留，而是被后续拼接重复了一遍**（实测 ``中 英文``、
-            # 以及 ``word word`` 里多出一个 ``word``）。
-            # 空白本来就是折行处，直接丢弃；标点则跟在本行尾部。
-            head = line[: index + 1].rstrip()
-            carry = line[index + 1 :].lstrip()
-            if head and carry:
-                return head, carry
-    return line, ""
-
-
-def _split_oversized(token: str, budget: int) -> list[str]:
-    """逐字符硬切一个装不下的超长 token。"""
-    pieces: list[str] = []
-    current, used = "", 0
-    for char in token:
-        char_width = cell_len(char)
-        if current and used + char_width > budget:
-            pieces.append(current)
-            current, used = "", 0
-        current += char
-        used += char_width
-    if current:
-        pieces.append(current)
-    return pieces
-
-
 def _tokenize_for_wrap(line: str) -> list[str]:
     """把一行切成可断点单元：**连续的非空白**（词）与**单个空白**。"""
     tokens: list[str] = []
@@ -640,8 +592,8 @@ def clip(text: str, width: int, *, ellipsis: str = "…") -> str:
     用户看到的是"一段莫名其妙的换行 + 内容凭空消失"。
 
     现在的语义是**逐行 clip、换行原样保留**：既不会丢内容，也不会把多行压成一行。
-    需要完整长文本换行（而不是截断）的场合，仍然应当交给 Textual 自己 word-wrap
-    （见 ``render_blocks`` 里 assistant 分支）。
+    需要保留完整长文本的场合，交给 render_markdown 或 wrap 的换行逻辑，
+    不使用 clip 截断正文。
     """
     if width <= 0:
         return ""

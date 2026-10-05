@@ -91,32 +91,12 @@ KITTY_FALLBACK_DELAY_S = 0.15
 
 
 class TimelineComponent:
-    """时间线：把 `TimelineBuffer` 的块渲染成行。
+    """时间线把可变 Block 转成不可变 Rich 行，并复用未变排版。
 
-    **复用**已有的 `TimelineBuffer`（事件 → 显示块的纯状态机）、
-    `render_cached`（D56 前缀缓存）与 `render_blocks`（纯渲染函数）——
-    它们是 M1.5/M4 的资产，一行不用改。
-
-    为什么必须带缓存：主屏下时间线**渲染全部历史**（不裁剪），
-    而流式输出时每一帧都要重新渲染一次。没有缓存的话，
-    "第 500 行的会话里追加一个字"要重算 500 行 Markdown——
-    每帧的代价与**会话长度**成正比，而不是与**变化量**成正比。
-
-    缓存的不变量（D56，踩过坑）：**缓存只覆盖 `blocks[:-1]`**。
-    最后一块随时可能被写入（正文仍在流式、工具卡片仍在运行），
-    缓存它就会渲染出过时的内容——而症状是"内容悄悄不对"，没有任何报错。
-
-    第二层缓存：**已切好的行**（D126）
-    --------------------------------
-    `render_cached` 交给我们的是一段 ``Text``，而帧要的是**行列表**，
-    所以中间还要切一次（`split_styled_lines`）。这一步以前是对**整段文本**做的，
-    于是它的代价与会话长度成正比 —— 实测：40 条消息的会话里，
-    每敲一个字要在这一步花掉约 **28ms**（打字明显跟不上手，且**会话越长越卡**）。
-
-    修法是让这一步也只处理尾部：前缀那一段的行在上一帧已经切好了，**复用**即可。
-    复用的依据是 ``RenderResult.prefix_text`` 的**对象身份**（`render_cached` 返回的是
-    缓存里那个原对象，只要缓存没作废它就是同一个），因此比对是 O(1)，
-    而不是再去比较几万个字符。
+    每帧仍核验所有块的实际显示字段，覆盖老工具完成、原地改正文、展开
+    与主题/宽度变化。核验后复用共同片段前缀、行区间和已切好的行，输入
+    不重新排版历史，流式只重新拼装变化后缀。完整 Text 访问仅作兼容。
+    内容键遍历仍随历史长度增长，不能承诺整帧成本恒定。
     """
 
     def __init__(self, palette: Any, *, max_height: int = 0, glyphs: dict[str, str] | None = None) -> None:
@@ -134,11 +114,13 @@ class TimelineComponent:
         self._prefix_rows: list[Text] = []
         self._prefix_rows_key: Text | None = None
         self._block_rows: dict[int, tuple[Text | list[Text], list[Text]]] = {}
+        self._segments: list[tuple[Block | None, Text | list[Text]]] = []
+        self._segment_offsets: list[int] = [0]
+        self._segment_rows: list[Text] = []
         #: 度量（测试与 /debug 用）：命中次数、作废次数、上一帧耗时
         self.prefix_hits = 0
         self.cache_invalidations = 0
         self.prefix_row_reuses = 0
-        self.last_frame_ms = 0.0
 
     @property
     def is_active(self) -> bool:
@@ -157,6 +139,9 @@ class TimelineComponent:
             self.block_ranges = []
             self._cache = TimelineRenderCache()
             self._block_rows.clear()
+            self._segments = []
+            self._segment_offsets = [0]
+            self._segment_rows = []
             return []
 
         # 缓存的有效性判断与重建**全在 `render_cached` 里**（D126）：
@@ -219,7 +204,7 @@ class TimelineComponent:
             cur = target_block.expanded if target_block.expanded is not None else self.buffer.expand_tools
             target_block.expanded = not cur
 
-        self.invalidate()
+        self.buffer.invalidate(layout=False)
         return True
 
     def _split_rows(self, result: Any) -> list[Text]:
@@ -229,30 +214,53 @@ class TimelineComponent:
         当前缀不是完整换行边界时回退到完整切分，避免断行错误。
         """
         if result.segments is not None:
-            rows: list[Text] = []
-            retained: dict[int, tuple[Text | list[Text], list[Text]]] = {}
-            for block, text in result.segments:
-                if (isinstance(text, list) and not text) or (isinstance(text, Text) and not text.plain):
-                    continue
+            segments = result.segments
+            if segments is self._segments:
+                self.prefix_row_reuses += len(segments)
+                rows = self._segment_rows
+                return [] if len(rows) == 1 and not rows[0].plain else rows
+            common = 0
+            for old, new in zip(self._segments, segments, strict=False):
+                if old[0] is not new[0] or old[1] is not new[1]:
+                    break
+                common += 1
+            rows = self._segment_rows[:self._segment_offsets[common]]
+            offsets = self._segment_offsets[:common + 1]
+            suffix_keys: set[int] = set()
+            self.prefix_row_reuses += common
+            for block, text in segments[common:]:
                 key = id(block) if block is not None else id(text)
+                suffix_keys.add(key)
                 previous = self._block_rows.get(key)
+                if (isinstance(text, list) and not text) or (isinstance(text, Text) and not text.plain):
+                    offsets.append(len(rows))
+                    self._block_rows.pop(key, None)
+                    continue
                 if previous is not None and previous[0] is text:
                     piece_rows = previous[1]
                     self.prefix_row_reuses += 1
                 else:
                     if isinstance(text, list):
-                        piece_rows = list(text)
+                        piece_rows = text
                     else:
                         piece_rows = split_styled_lines(text) if text.plain != "\n" else [Text()]
                     if previous is not None:
                         old_rows = previous[1]
+                        # 新列表可替换相同行；不能原地修改下层缓存拥有的行列表。
+                        piece_rows = list(piece_rows)
                         for index in range(min(len(old_rows), len(piece_rows))):
                             if piece_rows[index] == old_rows[index]:
                                 piece_rows[index] = old_rows[index]
                 rows.extend(piece_rows)
-                retained[key] = (text, piece_rows)
-            self._block_rows = retained
-            # 单独一个换行与旧 split_styled_lines 的空文本语义一致。
+                offsets.append(len(rows))
+                self._block_rows[key] = (text, piece_rows)
+            for block, text in self._segments[common:]:
+                key = id(block) if block is not None else id(text)
+                if key not in suffix_keys:
+                    self._block_rows.pop(key, None)
+            self._segments = segments
+            self._segment_offsets = offsets
+            self._segment_rows = rows
             if len(rows) == 1 and not rows[0].plain:
                 return []
             return rows
@@ -283,7 +291,6 @@ class TimelineComponent:
         """
         if key.ctrl and key.name == "o":
             self.buffer.toggle_expand_tools()
-            self.invalidate()
             return True
         if key.ctrl and key.name == "b":
             # ★ D176：切换**双轨标记**（`▌` / `▎`）—— 要拖选复制干净文本时关掉它。
@@ -294,13 +301,15 @@ class TimelineComponent:
             return True
         if key.ctrl and key.name == "t":
             self.buffer.toggle_expand_reasoning()
-            self.invalidate()
             return True
         return False
 
     def invalidate(self) -> None:
         self._cache = TimelineRenderCache()
         self._block_rows.clear()
+        self._segments = []
+        self._segment_offsets = [0]
+        self._segment_rows = []
         self.cache_invalidations += 1
 
     def step(self) -> bool:
@@ -632,8 +641,6 @@ class InlineApp:
                 self.anamnesis.note_foreground_state(True)
         elif isinstance(event, (ev.ModelRequestStarted, ev.ToolCallRequested)):
             self._busy = True
-        elif isinstance(event, ev.ModelRequestFinished):
-            self._busy = False
         needs_render = self.timeline.ingest(event)
         self._remember_for_debug(event)
         if isinstance(event, ev.UserPromptSubmit):
@@ -1107,7 +1114,6 @@ class InlineApp:
             # D125：`Ctrl+O` 只切**工具卡 + diff**（归一类"动作产物"）；
             # 思考链改用 `Ctrl+T`，见下面那条。
             self.timeline.buffer.toggle_expand_tools()
-            self.timeline.invalidate()
             self.screen.request_render(force=True)
             return
         if key.ctrl and key.name == "b":
@@ -1119,7 +1125,6 @@ class InlineApp:
         if key.ctrl and key.name == "t":
             # 普通思考与工具开关独立；入梦卡片与普通思考共用 Ctrl+T。
             self.timeline.buffer.toggle_expand_reasoning()
-            self.timeline.invalidate()
             self.screen.request_render(force=True)
             return
         # `Esc` 的优先级：**先关浮层，再中断生成**。

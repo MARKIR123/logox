@@ -1,17 +1,7 @@
-"""内置主题的发现、加载与 CSS 变量注入（D17 / D43 / UI-SPEC §8）。
+"""内置/用户主题发现、加载与状态字形覆盖。
 
-职责
-----
-* 把「内置主题目录」与「用户主题目录」按优先级拼成搜索路径
-* 加载主题文件（**复用 ``config/theme.py`` 的机制与校验**，不重复实现）
-* 把 18 个语义 token 转成 Textual CSS 变量，供 ``app.tcss`` 引用
-
-不负责
-------
-不渲染、不定义组件样式（那是 ``app.tcss`` 与各 widget 的职责）。
-
-**硬规则**：组件里只准出现 ``var(--token)``，不准出现字面色值（UI-SPEC §3.1 红线）。
-本模块是这条规则得以成立的前提——它保证了"换主题 = 换一组 CSS 变量"。
+当前 Rich/ANSI 组件直接使用语义配色；palette_css_variables 保留为已导出
+的兼容转换接口，不参与当前 TUI 渲染。主题文件校验复用 config/theme.py。
 """
 
 from __future__ import annotations

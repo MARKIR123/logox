@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import sys
@@ -115,10 +116,8 @@ def _force_utf8_stdio() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:  # 非常规流（已被替换 / 不是 TextIOWrapper）
             continue
-        try:
+        with contextlib.suppress(OSError, ValueError):
             reconfigure(encoding="utf-8", errors="replace")
-        except (OSError, ValueError):  # pragma: no cover - 流已关闭或不可重配置
-            pass
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Record(BaseModel):
@@ -26,7 +27,19 @@ class SourceRef(Record):
     turn: int = 0
     turn_state: str = "unknown"
     offset: int = 0
-    timestamp: float = 0
+    timestamp: float | None = None
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _known_timestamp(cls, value: object) -> float | None:
+        """旧 0 哨兵及无效时刻均为未知，不伪装成 1970 年或当前时间。"""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return stamp if math.isfinite(stamp) and stamp > 0 else None
 
 
 class AnamesisAnalysisRecord(Record):

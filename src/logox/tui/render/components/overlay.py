@@ -46,15 +46,14 @@ from typing import Any
 
 from rich.text import Text
 
+from logox.permission_types import PermissionAsk, PermissionChoice
 from logox.tui.content.overlay import (
-    BOX_WIDTH,
     Choice,
     PickerState,
     render_confirm,
     render_picker,
     render_prompt_form,
 )
-from logox.permission_types import PermissionAsk, PermissionChoice
 from logox.tui.format import clip
 from logox.tui.render.ansi import (
     slice_styled,

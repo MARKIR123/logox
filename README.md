@@ -102,7 +102,15 @@ model = "" # 填写自己安装的本地模型完整名称；留空不会运行
 
 `/anamnesis nap`、`/anamnesis sleep` 手动开始，`/anamnesis stop` 暂停，`/anamnesis status` 查看状态，`/anamnesis history` 查看当前项目全部运行，`/anamnesis report [run_id]` 查看完整分析与晨报，`/anamnesis trace [run_id]` 查看原始过程。记忆按条采纳：合格项保存，证据不足或旧状态留在候选报告中，不因一条拒绝而整批失败。未形成完整提案时保留进度并停止同批自动重试，可手动 `nap`／`sleep` 或等待真实新资料继续；正常批次交接只更新原卡片和剩余数量，不刷暂停通知。卡片用点击或 `Ctrl+T` 展开：实际返回的思考实时显示，阶段结论、档案差异及读取明细可查；新记录绑定启动会话，resume 恢复原卡片。
 
-只整理当前仍打开的项目，每个任务只读自己项目会话和源码。同项目全部窗口空闲超过 30 分钟、前台结束后才自动入梦；项目按最后提交用户指令从新到旧轮转，最近会话承载，本次归属不迁移。用户／项目档案分别为 `~/.logox/ANAMNESIS.md` 和当前目录 `ANAMNESIS.md`，按证据更新并保存版本；前台背景记忆默认最多占窗口 5%。本地窗口取 `[providers.<name>].context_window` 或 `model_windows` 静态配置，未配置模型或足够窗口会说明原因，不转云端、不探测 `/api/ps`。完整配置、恢复与失败边界见 [入梦模块](docs/modules/09_anamnesis.md)。
+只整理当前仍打开的项目，每个任务只读自己项目会话和源码。同项目全部窗口空闲超过 30 分钟、前台结束后才自动入梦；项目按最后提交用户指令从新到旧轮转，最近会话承载，本次归属不迁移。用户／项目档案分别为 `~/.logox/ANAMNESIS.md` 和当前目录 `ANAMNESIS.md`，按证据更新并保存版本；前台背景记忆默认最多占窗口 5%。本地窗口取 `[providers.<name>].context_window` 或 `model_windows` 静态配置，未配置模型或足够窗口会说明原因，不转云端、不探测 `/api/ps`。会话新记录统一保存 Unix 秒 timestamp；旧资料缺失时间在读取时用 null 表示未知，不重写原日志。入梦整理与核验会同时得到当前时间和来源时间，用于判断短期状态时效；明确长期偏好不会只因时间经过自动失效。完整配置、恢复与失败边界见 [入梦模块](docs/modules/09_anamnesis.md)。
+
+### 离线流畅性复测
+
+```powershell
+.venv\Scripts\python.exe tools\benchmark_tui.py --pairs 100 800 3200 --frames 15 --profile
+```
+
+使用假终端和合成历史，输出输入／流式帧耗时 JSON，不启动模型或读取用户配置；结果不代表实际 Windows Terminal 延迟。优化内容、全量测试与剩余问题见 [清理验收](docs/CLEANUP-REPORT-2026-10-03.md)。运行中的 LOGOX 需退出并重启才能加载新的 Python 代码。
 
 ### 开发命令
 

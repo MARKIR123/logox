@@ -1,6 +1,6 @@
 # 07 · 会话持久化、快照与回滚
 
-> 核对日期：2026-09-30。范围：当前工作区源码（含已有未提交改动）。状态：已有实现与已知缺口分别列出；策略设计不得等同于已覆盖的运行路径。
+> 核对日期：2026-10-05。范围：当前工作区源码（含已有未提交改动）。状态：已有实现与已知缺口分别列出；策略设计不得等同于已覆盖的运行路径。
 
 ## 1. 定位与边界
 
@@ -135,3 +135,11 @@ $env:PYTHONPATH = 'src'
 | epochs / working_set | 折叠区间账本与已读取文件节选；恢复后下一 epoch ID 接续 |
 
 状态由上下文构建器在有效变化后写入，不依赖 debug dump 或退出钩子；统计 compaction 事件继续独立保留。普通 build 不重复写状态，写入失败下一次 build 重试；不覆盖／删除旧日志。状态列出来源单元而非内存对象 ID，恢复后重新绑定对象引用。启动 resume、热切换及回滚共用上下文恢复方法，原始消息重建和时间线展示仍保持原有格式。
+
+### 5.5 会话记录时间戳契约（2026-10-05，已实现并通过离线验收）
+
+用户要求助手回复、工具结果、压缩等记录保留时间，缺失历史使用占位符；此处沿用既有 JSONL／事件协议，不引入新模块或迁移真实档案。统一字段 timestamp，数值为 Unix 秒（可含小数），缺失为 JSON null。持久化订阅者对 user_prompt／model_output／tool_result／compaction／checkpoint／session_rewind／turn_finished 显式传 event.ts：分别表示对应事件创建时刻，模型与工具输出为请求／调用完成事件的时间，而非开始时间。duration_ms 保留为耗时，不能代替时刻。
+
+SessionTranscriptWriter.write_step 默认给没有传入时间的内部记录使用当前创建时刻；显式 null 表示未知，不自动伪造。context_state／anamnesis_ref 也由此具备 timestamp。新 session_init 同时保留既有 created_at 并写同值 timestamp。旧日志读取仅在返回记录中补 timestamp（优先旧 ts，否则 null），不覆盖已有明确 null，不修改原 JSONL、mtime、行号或证据摘要；不从会话文件名／文件修改时间推测逐条发生时间。
+
+失败边界：未知时间保留，入梦将非有限值、非正数／旧 0 哨兵等无效时间归为 null；不得当作 1970 年或当前时刻。正常 resume／rewind、压缩状态绑定不受新增元数据影响。验收覆盖所有持久化事件保留 event.ts（延迟写入不改事件时间）、内部写入默认时刻、显式未知、新会话头、旧 ts 兼容与原文件字节不变，以及压缩状态恢复回归。新增时间戳及入梦联动测试 31 项通过；全量 2099 passed / 3215 subtests passed（88.11s），源码及新增测试 Ruff 通过。测试入口 tests/unit/test_record_timestamps.py、tests/anamnesis/test_timestamps.py；证据在 .test-tmp/timestamps-focused.txt 与 timestamps-full.txt。

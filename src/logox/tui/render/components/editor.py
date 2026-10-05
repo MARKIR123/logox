@@ -166,10 +166,7 @@ class Editor:
                     for c_idx, ch in enumerate(segment):
                         w = cell_len(ch)
                         if accumulated + w > col_offset:
-                            if col_offset >= accumulated + (w + 1) // 2:
-                                char_offset = c_idx + 1
-                            else:
-                                char_offset = c_idx
+                            char_offset = c_idx + 1 if col_offset >= accumulated + (w + 1) // 2 else c_idx
                             break
                         accumulated += w
                         char_offset = c_idx + 1
@@ -202,8 +199,8 @@ class Editor:
         indent = line[: len(line) - len(line.lstrip())]
         self._lines[0] = indent + text
         self._col = len(self._lines[0])
-        return True
         self._history_index = None
+        return True
 
     # ------------------------------------------------------------------ #
     # 输入

@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import uuid
 from pathlib import Path
@@ -72,15 +74,9 @@ class WriteTool:
             target.parent.mkdir(parents=True, exist_ok=True)
 
             # 2. 统计写入前的状态
-            existed = target.exists()
-            bytes_before = target.stat().st_size if existed else 0
-            if existed:
-                try:
-                    old_lines = len(target.read_bytes().splitlines())
-                except Exception:
-                    old_lines = 0
-            else:
-                old_lines = 0
+            existed, bytes_before, old_lines = await asyncio.to_thread(self._existing_state, target)
+            if ctx.is_cancelled():
+                return ToolResult.failure(ErrorCategory.CANCELLED, "写入准备后操作已被取消，未写入文件")
 
             new_bytes = args.content.encode("utf-8")
             new_lines = len(args.content.splitlines())
@@ -101,10 +97,8 @@ class WriteTool:
                 os.replace(tmp_file, target)
             finally:
                 if tmp_file.exists():
-                    try:
+                    with contextlib.suppress(Exception):
                         tmp_file.unlink(missing_ok=True)
-                    except Exception:
-                        pass
 
             resolved_cwd = ctx.cwd.resolve()
             try:
@@ -125,6 +119,22 @@ class WriteTool:
                 f"写入文件失败：{target}：{type(exc).__name__}: {exc}",
                 detail="请检查磁盘权限或是否有其他程序独占锁定了该文件。",
             )
+
+
+    @staticmethod
+    def _existing_state(target: Path) -> tuple[bool, int, int]:
+        """仅读取已有文件统计，提交仍在原协程的同步区间完成。"""
+        existed = target.exists()
+        bytes_before = target.stat().st_size if existed else 0
+        if existed:
+            try:
+                old_lines = len(target.read_bytes().splitlines())
+            except Exception:
+                old_lines = 0
+        else:
+            old_lines = 0
+
+        return existed, bytes_before, old_lines
 
 
 def build() -> WriteTool:

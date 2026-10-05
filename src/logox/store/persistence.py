@@ -1,7 +1,8 @@
 """会话实时持久化总线订阅者 (D98)。
 
-将用户输入、大模型响应增量、工具调用与结果实时落盘到该会话的 .jsonl 文件中。
-保证即使用户中途 Ctrl+C 或发生崩溃，过往对话依然 100% 安全落盘。
+用户输入和工具结果随事件追加 JSONL；模型正文/推理增量先存内存，
+在 ModelRequestFinished 时合并写出。内核取消/异常终态会交付已有可见内容，
+进程被强制结束或断电时，当前尚未完成的请求增量仍可能丢失；不承诺断电持久性。
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ class SessionPersistenceSubscriber:
                 step=self._step_counter,
                 role="assistant",
                 event_type="model_output",
+                timestamp=event.ts,
                 content=full_text,
                 meta=meta,
                 **extra,
@@ -93,6 +95,7 @@ class SessionPersistenceSubscriber:
                 step=self._step_counter,
                 role="tool",
                 event_type="tool_result",
+                timestamp=event.ts,
                 content=content_str,
                 tool_name=tool_name,
                 call_id=event.call_id,
@@ -117,6 +120,7 @@ class SessionPersistenceSubscriber:
                 step=self._step_counter,
                 role="system",
                 event_type="compaction",
+                timestamp=event.ts,
                 content="",
                 meta={
                     "strategy": event.strategy,
@@ -135,6 +139,7 @@ class SessionPersistenceSubscriber:
                 step=self._step_counter,
                 role="system",
                 event_type="checkpoint",
+                timestamp=event.ts,
                 content="",
                 path=event.path,
                 before_hash=event.before_hash,
@@ -148,6 +153,7 @@ class SessionPersistenceSubscriber:
                 step=self._step_counter,
                 role="system",
                 event_type="session_rewind",
+                timestamp=event.ts,
                 content="",
                 to_turn=event.to_turn,
                 meta={"restored": event.restored, "deleted": event.deleted, "conflicts": event.conflicts},
@@ -160,6 +166,7 @@ class SessionPersistenceSubscriber:
                     step=self._step_counter,
                     role="system",
                     event_type="turn_finished",
+                    timestamp=event.ts,
                     # ⚠️ 这里**刻意不写** ``content``（用户裁定 · 方案 A）。
                     #
                     # ``TurnFinished`` 事件只有 ``turn_summary``，没有 ``content``

@@ -222,6 +222,9 @@ class FullscreenLayout:
         # 滚动条与对话轮次标尺状态（D183）
         self._show_scrollbar: bool = False
         self._turn_mark_rows: dict[int, int] = {}
+        self._scrollbar_rows: list[tuple[Text, int, str, str, Text]] = []
+        self._mark_ranges: list[tuple[int, int, Any]] | None = None
+        self._mark_geometry: tuple[int, int] = (0, 0)
 
     def _screen_y_to_timeline_line(self, y: int, width: int) -> int | None:
         """把 1-based 终端屏幕行号映射为全量时间线的行下标 (O(1) 纯数学映射)。"""
@@ -384,6 +387,8 @@ class FullscreenLayout:
         if total_tl_rows <= viewport_height or not view_rows:
             self._show_scrollbar = False
             self._turn_mark_rows = {}
+            self._scrollbar_rows = []
+            self._mark_ranges = None
             return view_rows
 
         self._show_scrollbar = True
@@ -404,14 +409,16 @@ class FullscreenLayout:
         else:
             Y8 = max(0, min(travel8, round(top_offset * travel8 / max_scroll)))
 
-        # 2. 提取对话轮次起点映射（User Turn Start Bookmarks）
-        self._turn_mark_rows = {}
-        if hasattr(self.timeline, "block_ranges") and N > 1:
-            for s_l, _e_l, block in self.timeline.block_ranges:
+        # 内容区间与几何未变时，轮次标尺也不需要重新遍历整个会话。
+        ranges = getattr(self.timeline, "block_ranges", [])
+        if self._mark_ranges is not ranges or self._mark_geometry != (N, V):
+            self._turn_mark_rows = {}
+            for s_l, _e_l, block in ranges:
                 if getattr(block, "kind", "") == "user":
                     y_mark = min(V - 1, max(0, round(s_l * (V - 1) / (N - 1))))
-                    if y_mark not in self._turn_mark_rows:
-                        self._turn_mark_rows[y_mark] = s_l
+                    self._turn_mark_rows.setdefault(y_mark, s_l)
+            self._mark_ranges = ranges
+            self._mark_geometry = (N, V)
 
         palette = getattr(self.timeline, "palette", None)
         accent_style = str(getattr(palette, "accent", "#89b4fa") or "#89b4fa")
@@ -423,58 +430,47 @@ class FullscreenLayout:
         target_len = max(0, width - 1)
         lower_blocks = [" ", "▂", "▃", "▄", "▅", "▆", "▇"]
 
+        cached_rows = self._scrollbar_rows
+        current: list[tuple[Text, int, str, str, Text]] = []
         for v_idx, row in enumerate(view_rows):
-            r = row.copy()
-            cur_len = cell_len(r.plain)
-            if cur_len < target_len:
-                r.append(" " * (target_len - cur_len))
-            elif cur_len > target_len:
-                cut = cell_to_char_index(r.plain, target_len, is_end=False)
-                r = r[:cut]
-                pad = max(0, target_len - cell_len(r.plain))
-                if pad > 0:
-                    r.append(" " * pad)
-
-            # 计算当前行 [8*v, 8*v + 7] 与滑块 [Y8, Y8 + H8 - 1] 的重叠
             s = max(8 * v_idx, Y8)
             e = min(8 * v_idx + 7, Y8 + H8 - 1)
             has_mark = v_idx in self._turn_mark_rows
-
-            if s > e:
-                # 完全在滑块之外：导轨或轮次标尺
-                if has_mark:
-                    r.append("│", style=marker_style)
-                else:
-                    r.append("│", style=border_subtle)
-            else:
-                # 位于滑块内或与滑块边缘相交
-                k0 = s - 8 * v_idx
-                k1 = e - 8 * v_idx
+            glyph, style = "│", marker_style if has_mark else border_subtle
+            if s <= e:
+                k0, k1 = s - 8 * v_idx, e - 8 * v_idx
                 covered = k1 - k0 + 1
-
                 if has_mark:
-                    # 轮次标尺在滑块内部贯通高亮显露，永不丢失标记
-                    r.append("│", style=f"{marker_style} on {border_subtle}")
+                    style = f"{marker_style} on {border_subtle}"
                 elif covered == 8:
-                    # 整行填满：实心滑块块（颜色与默认导轨 border_subtle 一致）
-                    r.append("█", style=border_subtle)
+                    glyph = "█"
                 elif k0 > 0 and k1 == 7:
-                    # 滑块上边缘：下方 covered 个微步填充
-                    ch = lower_blocks[covered - 1]
-                    r.append(ch, style=border_subtle)
+                    glyph = lower_blocks[covered - 1]
                 elif k0 == 0 and k1 < 7:
-                    # 滑块下边缘：上方 covered 个微步填充
-                    if covered == 4:
-                        r.append("▀", style=border_subtle)
-                    elif bg_base:
-                        ch = lower_blocks[8 - covered - 1]
-                        r.append(ch, style=f"{bg_base} on {border_subtle}")
+                    if covered == 4 or not bg_base:
+                        glyph = "▀"
                     else:
-                        r.append("▀", style=border_subtle)
+                        glyph, style = lower_blocks[8 - covered - 1], f"{bg_base} on {border_subtle}"
                 else:
-                    r.append("█", style=border_subtle)
-
+                    glyph = "█"
+            previous = cached_rows[v_idx] if v_idx < len(cached_rows) else None
+            if previous is not None and previous[0] is row and previous[1:4] == (width, glyph, style):
+                r = previous[4]
+            else:
+                r = row.copy()
+                cur_len = cell_len(r.plain)
+                if cur_len < target_len:
+                    r.append(" " * (target_len - cur_len))
+                elif cur_len > target_len:
+                    cut = cell_to_char_index(r.plain, target_len, is_end=False)
+                    r = r[:cut]
+                    pad = max(0, target_len - cell_len(r.plain))
+                    if pad:
+                        r.append(" " * pad)
+                r.append(glyph, style=style)
+            current.append((row, width, glyph, style, r))
             result.append(r)
+        self._scrollbar_rows = current
 
         return result
 
@@ -922,7 +918,6 @@ class FullscreenApp(InlineApp):
                 self.timeline.buffer.toggle_expand_tools()
             else:
                 self.timeline.buffer.toggle_expand_reasoning()
-            self.timeline.invalidate()
             self.root.restore_viewport_anchor(anchor_block, intra_offset, self.terminal.columns)
             self.screen.request_render(force=True)
             return

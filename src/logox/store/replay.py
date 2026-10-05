@@ -34,7 +34,7 @@ __all__ = [
 
 
 def load_session_records(file_path: Path | str) -> list[dict[str, Any]]:
-    """读取指定会话 .jsonl 文件中的所有有效记录。"""
+    """读取有效记录；旧记录的未知时间只在读视图补 null，不改原文件。"""
     path = Path(file_path)
     if not path.is_file():
         return []
@@ -49,6 +49,7 @@ def load_session_records(file_path: Path | str) -> list[dict[str, Any]]:
                 try:
                     data = json.loads(line)
                     if isinstance(data, dict):
+                        data.setdefault("timestamp", data.get("ts"))
                         records.append(data)
                 except json.JSONDecodeError:
                     continue

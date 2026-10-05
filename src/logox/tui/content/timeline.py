@@ -463,6 +463,9 @@ class TimelineRenderCache:
     width: int = 0
     block_ranges: list[tuple[int, int, Block]] = field(default_factory=list)
     newline_count: int = 0
+    segments: list[tuple[Block | None, Text | list[Text]]] = field(default_factory=list)
+    line_offsets: list[int] = field(default_factory=lambda: [0])
+    range_offsets: list[int] = field(default_factory=lambda: [0])
 
     @property
     def covers(self) -> int:
@@ -499,14 +502,18 @@ class TimelineRenderCache:
         )
 
 
-def _block_render_key(block: Block, prev: Block | None) -> tuple[Any, ...]:
+def _block_render_key(
+    block: Block, prev: Block | None, *, expand_tools: bool, expand_reasoning: bool,
+) -> tuple[Any, ...]:
     # 字符串保留引用，未变时比较不会扫描整段正文。统计与 DiffHunk 是冻结值。
     return (
         block.kind, block.text, block.token, block.name, block.args_summary,
         block.args_text, block.state, block.duration_ms, block.error_kind,
         block.change_stat, block.payload, block.path, tuple(block.hunks),
         block.expanded, prev.kind if prev is not None else None,
-        getattr(block.card, "revision", 0),
+        getattr(block.card, "revision", 0), block.card,
+        expand_tools if block.kind in {"tool", "diff"} and block.expanded is None else None,
+        expand_reasoning if block.kind in {"reasoning", "anamnesis"} and block.expanded is None else None,
     )
 
 
@@ -530,22 +537,37 @@ def render_cached(
     默认保留完整 Text 的兼容入口；缓存只拥有当前块，不累积已删除历史。
     """
     params = (
-        context.width, expand_tools, expand_reasoning, show_track,
+        context.width, show_track,
         tuple(vars(context.palette).items()), tuple(sorted(context.glyphs.items())),
-        context.diff_context_lines,
+        context.diff_context_lines, segmented,
     )
-    previous_entries = cache.entries if cache.params == params else {}
-    entries: dict[int, _BlockRenderEntry] = {}
-    segments: list[tuple[Block | None, Text | list[Text]]] = []
-    ranges: list[tuple[int, int, Block]] = []
-    offset = 0
+    same_params = cache.params == params
+    entries = cache.entries if same_params else {}
+    segments = cache.segments
+    ranges = cache.block_ranges
+    line_offsets = cache.line_offsets
+    range_offsets = cache.range_offsets
+    rebuilding = False
+    structure_changed = len(cache.blocks) != len(blocks)
     misses = 0
     rendered_chars = 0
     prev: Block | None = None
-    for block in blocks:
-        key = _block_render_key(block, prev)
-        entry = previous_entries.get(id(block))
-        if entry is None or entry.block is not block or entry.key != key:
+    for index, block in enumerate(blocks):
+        key = _block_render_key(block, prev, expand_tools=expand_tools, expand_reasoning=expand_reasoning)
+        entry = entries.get(id(block))
+        changed = entry is None or entry.block is not block or entry.key != key
+        same_position = index < len(cache.blocks) and cache.blocks[index] is block
+        structure_changed |= not same_position
+        if not rebuilding and (changed or not same_position or not same_params):
+            # 保留已核验的前缀；变化后的区间才重新计算。旧列表不原地修改。
+            segments = segments[:index]
+            ranges = ranges[:range_offsets[index]]
+            line_offsets = line_offsets[:index + 1]
+            range_offsets = range_offsets[:index + 1]
+            rebuilding = True
+        if changed:
+            if block.kind != "assistant":
+                cache.markdown.pop(id(block), None)
             local_ranges: list[tuple[int, int, Block]] = []
             assistant_rows = [] if segmented and block.kind == "assistant" else None
             text = render_blocks(
@@ -561,25 +583,41 @@ def render_cached(
                 text[:-1] if text.plain.endswith("\n") else text,
                 assistant_rows, assistant_rows[:-1] if assistant_rows is not None else None,
             )
+            entries[id(block)] = entry
             misses += 1
             rendered_chars += len(text.plain) if assistant_rows is None else sum(len(row.plain) + 1 for row in assistant_rows)
-        entries[id(block)] = entry
-        segments.append((block, entry.rows if entry.rows is not None else entry.text))
-        ranges.extend((s + offset, e + offset, b) for s, e, b in entry.ranges)
-        offset += entry.newline_count
+        if rebuilding:
+            offset = line_offsets[-1]
+            segments.append((block, entry.rows if entry.rows is not None else entry.text))
+            ranges.extend((s + offset, e + offset, b) for s, e, b in entry.ranges)
+            line_offsets.append(offset + entry.newline_count)
+            range_offsets.append(len(ranges))
         prev = block
 
-    if misses or len(cache.blocks) != len(blocks) or any(a is not b for a, b in zip(cache.blocks, blocks, strict=False)):
+    if len(segments) > len(blocks):
+        # 删除/折叠尾部也要释放旧片段，即使留下的块全部命中。
+        segments = segments[:len(blocks)]
+        ranges = ranges[:range_offsets[len(blocks)]]
+        line_offsets = line_offsets[:len(blocks) + 1]
+        range_offsets = range_offsets[:len(blocks) + 1]
+        rebuilding = True
+    if rebuilding or structure_changed or not same_params:
         cache.text = None
+    if structure_changed or not same_params:
+        retained = {id(b) for b in blocks}
+        entries = {key: entry for key, entry in entries.items() if key in retained}
+        cache.markdown = {key: value for key, value in cache.markdown.items() if key in retained}
+        cache.blocks = list(blocks)
     cache.entries = entries
-    cache.markdown = {id(b): cache.markdown[id(b)] for b in blocks if b.kind == "assistant" and id(b) in cache.markdown}
-    cache.blocks = list(blocks)
+    cache.segments = segments
+    cache.line_offsets = line_offsets
+    cache.range_offsets = range_offsets
     cache.params = params
     cache.width = context.width
     cache.expand_tools = expand_tools
     cache.expand_reasoning = expand_reasoning
     cache.show_track = show_track
-    cache.newline_count = offset
+    cache.newline_count = line_offsets[-1]
     cache.block_ranges = ranges
 
     head = Text()
@@ -591,6 +629,7 @@ def render_cached(
     tail = Text()
     trimmed = False
     if active_status is not None:
+        segments = list(segments)
         suffix = ""
         for _block, piece in reversed(segments):
             ending = (
@@ -618,13 +657,13 @@ def render_cached(
             show_track=show_track, now=now,
         )
     head_lines = head.plain.count("\n")
-    all_ranges = [(s + head_lines, e + head_lines, b) for s, e, b in ranges]
+    all_ranges = [(s + head_lines, e + head_lines, b) for s, e, b in ranges] if head_lines else ranges
     prefix = None if segmented else cache.text
     if trimmed and prefix is not None:
         prefix = prefix[:-1]
     if segmented:
         if head.plain:
-            segments.insert(0, (None, head))
+            segments = [(None, head), *segments]
         if tail.plain:
             segments.append((None, tail))
     return RenderResult(
@@ -683,12 +722,6 @@ class TimelineBuffer:
         self.show_track = True
         self.expand_reasoning = False
         self.smoother = StreamSmoother()
-        self._pending_delta: list[str] = []
-        #: 推理增量缓冲（M4 新增）：真实模型一次思考有几百个片段，
-        #: 逐个覆盖推理块文本是 O(n²)，因此与正文一样只在帧级合并（D56）
-        self._pending_reasoning: list[str] = []
-        #: 工具调用名（``ToolCallStarted`` 只带 call_id）
-        self._call_names: dict[str, str] = {}
         #: 是否有结构性变化（块的增删、既有块被改）需要重绘
         self._dirty = False
         #: 结构性变化是否需要**重算布局**（块数变了才需要；正文变长不需要）
@@ -717,8 +750,6 @@ class TimelineBuffer:
         """本帧是否有东西要渲染（含"只改了显示状态"的情况与平滑器未释出字符）。"""
         return (
             self._dirty
-            or bool(self._pending_delta)
-            or bool(self._pending_reasoning)
             or self.smoother.has_pending()
         )
 
@@ -798,9 +829,6 @@ class TimelineBuffer:
         """
         self.flush_reasoning()
         text = self.smoother.flush_all_text()
-        if not text and self._pending_delta:
-            text = "".join(self._pending_delta)
-            self._pending_delta.clear()
         if not text:
             return None
         last = self.blocks[-1] if self.blocks else None
@@ -814,9 +842,6 @@ class TimelineBuffer:
     def flush_reasoning(self) -> Block | None:
         """把缓冲的推理增量全部**累加**进当前推理块（终态瞬时排空）。"""
         added = self.smoother.flush_all_reasoning()
-        if not added and self._pending_reasoning:
-            added = "".join(self._pending_reasoning)
-            self._pending_reasoning.clear()
         if not added:
             return None
         block = self._last_of("reasoning")
@@ -870,7 +895,6 @@ class TimelineBuffer:
         args_summary: str = "",
         args_text: str = "",
     ) -> Block:
-        self._call_names[call_id] = name
         block = Block(
             kind="tool",
             name=name,

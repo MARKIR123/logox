@@ -54,9 +54,7 @@ def is_completion_context(text: str, *, row: int, col: int) -> bool:
         return False
     if any(ch.isspace() for ch in stripped):
         return False
-    if stripped.count("/") > 1:
-        return False
-    return True
+    return stripped.count("/") <= 1
 
 
 def completion_for(

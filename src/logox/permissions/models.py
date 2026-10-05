@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 __all__ = [
     "Decision",
@@ -126,5 +125,5 @@ class PermissionEvaluation:
     decision: Decision
     reason: str
     risk_level: RiskLevel = RiskLevel.NORMAL
-    matched_rule: Optional[PermissionRule] = None
-    suggested_rule: Optional[PermissionRule] = None
+    matched_rule: PermissionRule | None = None
+    suggested_rule: PermissionRule | None = None

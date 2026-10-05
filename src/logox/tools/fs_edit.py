@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import difflib
 import os
 import uuid
@@ -27,12 +29,12 @@ from pathlib import Path
 
 from pydantic import Field
 
+# ★ D140 / F-50：解析函数住在**中立模块**，不再从界面层拿 ——
+#   工具层反向依赖界面层会让「没有界面也能用工具」（headless）这条能力失效。
+from logox.difftext import DiffHunk, parse_unified_diff
 from logox.errors import ErrorCategory
 from logox.kernel.events import ChangeStat
 from logox.tools.base import DisplayHint, ToolArgs, ToolContext, ToolResult, ToolSpec
-# ★ D140 / F-50：解析函数住在**中立模块**，不再从界面层拿 ——
-#   工具层反向依赖界面层会让「没有界面也能用工具」（headless）这条能力失效。
-from logox.difftext import parse_unified_diff
 
 __all__ = ["EditArgs", "EditTool", "build"]
 
@@ -91,6 +93,57 @@ class EditTool:
         if ctx.is_cancelled():
             return ToolResult.failure(ErrorCategory.CANCELLED, "编辑前操作已被取消")
 
+        prepared = await asyncio.to_thread(self._prepare, target, args)
+        if isinstance(prepared, ToolResult):
+            return prepared
+        if ctx.is_cancelled():
+            return ToolResult.failure(ErrorCategory.CANCELLED, "编辑准备后操作已被取消，未写入文件")
+        original_bytes, final_bytes, stat, hunks, applied_note = prepared
+        if target.read_bytes() != original_bytes:
+            return ToolResult.failure(
+                ErrorCategory.BAD_REQUEST,
+                f"文件在编辑准备期间发生变化，未覆盖外部修改：{target}",
+                detail="请重新 read 当前文件，再根据最新内容调用 edit。",
+            )
+
+        tmp_name = f".{target.name}.tmp_{uuid.uuid4().hex[:8]}"
+        tmp_file = target.parent / tmp_name
+        try:
+            tmp_file.write_bytes(final_bytes)
+            os.replace(tmp_file, target)
+        except Exception as exc:
+            return ToolResult.failure(
+                ErrorCategory.TOOL_FAILURE,
+                f"原子写回文件失败：{target}：{type(exc).__name__}: {exc}",
+            )
+        finally:
+            if tmp_file.exists():
+                with contextlib.suppress(Exception):
+                    tmp_file.unlink(missing_ok=True)
+
+        resolved_cwd = ctx.cwd.resolve()
+        try:
+            rel = target.relative_to(resolved_cwd)
+        except ValueError:
+            rel = target
+
+        summary = f"已成功编辑文件 {rel}（+{stat.added} -{stat.removed} 行）{applied_note}"
+        return ToolResult(
+            ok=True,
+            content=summary,
+            change_stat=stat,
+            display=DisplayHint(
+                kind="diff",
+                payload={
+                    "path": str(rel),
+                    "hunks": [asdict(h) for h in hunks],
+                    "stat": stat.model_dump(),
+                },
+            ),
+        )
+
+    def _prepare(self, target: Path, args: EditArgs) -> ToolResult | tuple[bytes, bytes, ChangeStat, list[DiffHunk], str]:
+        """后台只读准备；取消 await 后本方法也不能继续修改源文件。"""
         # 1. 读取原始字节与二进制判定
         raw = target.read_bytes()
         if b"\x00" in raw[:_BINARY_PROBE_BYTES]:
@@ -149,11 +202,7 @@ class EditTool:
         removed_lines = sum(h.removed for h in hunks)
 
         # 6. 还原换行符与 BOM，原子写回磁盘
-        if is_crlf:
-            # 还原为 \r\n
-            final_text = new_content.replace("\n", "\r\n")
-        else:
-            final_text = new_content
+        final_text = new_content.replace("\n", "\r\n") if is_crlf else new_content
 
         final_bytes = final_text.encode(encoding)
         if has_bom:
@@ -167,43 +216,7 @@ class EditTool:
             bytes_after=len(final_bytes),
         )
 
-        tmp_name = f".{target.name}.tmp_{uuid.uuid4().hex[:8]}"
-        tmp_file = target.parent / tmp_name
-        try:
-            tmp_file.write_bytes(final_bytes)
-            os.replace(tmp_file, target)
-        except Exception as exc:
-            return ToolResult.failure(
-                ErrorCategory.TOOL_FAILURE,
-                f"原子写回文件失败：{target}：{type(exc).__name__}: {exc}",
-            )
-        finally:
-            if tmp_file.exists():
-                try:
-                    tmp_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        resolved_cwd = ctx.cwd.resolve()
-        try:
-            rel = target.relative_to(resolved_cwd)
-        except ValueError:
-            rel = target
-
-        summary = f"已成功编辑文件 {rel}（+{added_lines} -{removed_lines} 行）{applied_note}"
-        return ToolResult(
-            ok=True,
-            content=summary,
-            change_stat=stat,
-            display=DisplayHint(
-                kind="diff",
-                payload={
-                    "path": str(rel),
-                    "hunks": [asdict(h) for h in hunks],
-                    "stat": stat.model_dump(),
-                },
-            ),
-        )
+        return raw, final_bytes, stat, hunks, applied_note
 
     def _apply_matching_ladder(
         self,
@@ -315,7 +328,7 @@ class EditTool:
             if ratio > best_ratio and ratio > 0.4:
                 best_ratio = ratio
                 best_line = i + 1
-                best_snippet = "\n".join(f"  {ln}: {l}" for ln, l in enumerate(candidate, best_line))
+                best_snippet = "\n".join(f"  {line_number}: {line}" for line_number, line in enumerate(candidate, best_line))
 
         return best_line, best_snippet
 

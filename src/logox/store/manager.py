@@ -138,6 +138,7 @@ class SessionManager:
                 "session_id": session_id,
                 "cwd": str(cwd),
                 "created_at": now_ts,
+                "timestamp": now_ts,
                 "type": "session_init",
                 "title": initial_title or "",
             }

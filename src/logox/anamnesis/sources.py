@@ -82,6 +82,7 @@ class SourceCollector:
                 for ref in self.sources.values()
                 if ref.project_id == self.project_id
                 and ref.kind != "assistant_statement"
+                and ref.timestamp is not None
                 and math.isfinite(ref.timestamp)
                 and ref.timestamp > 0
             ),
@@ -94,7 +95,10 @@ class SourceCollector:
         dated = [
             ref.timestamp
             for ref in refs
-            if ref.kind != "assistant_statement" and math.isfinite(ref.timestamp) and ref.timestamp > 0
+            if ref.kind != "assistant_statement"
+            and ref.timestamp is not None
+            and math.isfinite(ref.timestamp)
+            and ref.timestamp > 0
         ]
         if not dated:
             return "项目证据时间不明确，不能据此更新当前状态；保留候选"
@@ -120,9 +124,9 @@ class SourceCollector:
                 try:
                     record = json.loads(raw)
                     if isinstance(record, dict) and record.get("role") == "user":
-                        latest = max(latest, _timestamp(record.get("timestamp", record.get("ts", 0))))
+                        latest = max(latest, _timestamp(record.get("timestamp", record.get("ts"))) or 0)
                     elif isinstance(record, dict) and record.get("type") == "anamnesis_ref":
-                        latest = max(latest, _timestamp(record.get("submission_ts", 0)))
+                        latest = max(latest, _timestamp(record.get("submission_ts")) or 0)
                 except (ValueError, TypeError, UnicodeError):
                     continue
         return latest
@@ -206,7 +210,7 @@ class SourceCollector:
                         turn=int(record.get("turn", 0)),
                         turn_state=states.get(record.get("turn", 0), "unfinished"),
                         offset=offset,
-                        timestamp=_timestamp(record.get("timestamp", record.get("ts", 0))),
+                        timestamp=_timestamp(record.get("timestamp", record.get("ts"))),
                     )
                 )
         return refs, issues
@@ -285,11 +289,14 @@ def permitted_code_path(path: Path, cwd: Path) -> bool:
     )
 
 
-def _timestamp(value) -> float:
+def _timestamp(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        stamp = float(value)
+    except (TypeError, ValueError, OverflowError):
         try:
-            return datetime.fromisoformat(str(value)).timestamp()
-        except ValueError:
-            return 0.0
+            stamp = datetime.fromisoformat(str(value)).timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
+    return stamp if math.isfinite(stamp) and stamp > 0 else None
