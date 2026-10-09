@@ -24,6 +24,7 @@ from logox.kernel import events as ev
 from logox.providers.base import DeltaEvent, StopEvent
 from logox.store.manager import SessionManager
 from logox.store.persistence import SessionPersistenceSubscriber
+from tests.anamnesis.support import research
 
 
 @pytest.fixture
@@ -164,11 +165,16 @@ async def _verify_request_times(project_history):
     provider = RecordingProvider()
     runner = AnamesisRunner(provider, "local-test", 32768, collector)
     with patch("logox.anamnesis.runner.time.time", return_value=1800000000.25):
-        proposal = await runner.run(
-            mode="nap",
-            steps=2, sources=refs, snapshots={}, stop=threading.Event(), emit=noop, operation=noop
+        proposal = await runner.run_segment(
+            research_state=research(refs),
+            state_event=noop,
+            sources=refs,
+            snapshots={},
+            stop=threading.Event(),
+            emit=noop,
+            operation=noop,
         )
-    assert proposal.complete
+    assert proposal.proposal.complete
     analysis = AnamesisAnalysisRecord(
         record_id="a",
         stage_id="review",
@@ -188,7 +194,9 @@ async def _verify_request_times(project_history):
         status="explicit",
     )
     with patch("logox.anamnesis.runner.time.time", return_value=1800000001.5):
-        accepted, reasons = await runner.validate(MemoryProposal(analyses=[analysis], changes=[change]), {})
+        accepted, reasons = await runner.validate(
+            MemoryProposal(complete=True, analyses=[analysis], changes=[change]), {}
+        )
     assert accepted == [change]
     assert reasons == {}
     assert len(provider.requests) == 2

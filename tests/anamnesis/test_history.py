@@ -23,6 +23,7 @@ from logox.tui.content.anamnesis import AnamesisCard
 from logox.tui.render.app import InlineApp
 from logox.tui.render.fullscreen import FullscreenApp
 from logox.tui.render.terminal import FakeTerminal
+from tests.anamnesis.support import finish_calls
 from tests.anamnesis.test_runtime import ProposalProvider, TempCase
 
 
@@ -73,7 +74,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
                 observed.set()
 
         service.on_event = receive
-        await service.start("nap")
+        await service.start()
         await asyncio.wait_for(observed.wait(), 5)
         self.assertTrue(service.is_active)
         self.assertFalse((self.home / "ANAMNESIS.md").exists())
@@ -102,7 +103,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
         service.on_started = lambda run_id, owner: writer.write_step(
             turn=0, step=0, role="", event_type="anamnesis_ref", run_id=run_id
         )
-        await service.start("nap")
+        await service.start()
         await service._task
         writer.write_step(turn=2, step=0, role="user", event_type="user_prompt", content="后续任务")
         records = load_session_records(self.transcript)
@@ -127,7 +128,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
         service = self.service()
         owner = ["chat"]
         service.current_session = lambda: owner[0]
-        await service.start("nap")
+        await service.start()
         await service._task
         app = self.app(service)
         owner[0] = "new-chat"
@@ -200,12 +201,12 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
         service = self.service(provider)
         owner = ["chat"]
         service.current_session = lambda: owner[0]
-        await service.start("nap")
+        await service.start()
         await service._task
         original = service.status().run_id
         owner[0] = "new-chat"
         service.note_submission()
-        await service.start("nap")
+        await service.start()
         await service._task
         self.assertNotEqual(service.status().run_id, original)
         self.assertEqual((await service.history("chat"))[0]["run_id"], original)
@@ -220,15 +221,32 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
             async def stream(self, request):
                 self.requests += 1
                 if self.requests == 1:
-                    yield ToolCallEvent(call_id="read1", name="read", arguments={"path": "code.py"})
-                    yield ToolCallEvent(call_id="read2", name="read", arguments={"path": "missing.py"})
-                else:
-                    yield DeltaEvent(
-                        kind="text",
-                        text=MemoryProposal(
-                            review_findings=["有重复分支，收益尚未测试"], next_plan=["比较两个实现再安排测试"]
-                        ).model_dump_json(),
+                    yield ToolCallEvent(
+                        call_id="read1",
+                        name="read",
+                        arguments={
+                            "path": "code.py",
+                            "item_id": json.loads(request.messages[0].text)["current_item"]["item_id"],
+                        },
                     )
+                    yield ToolCallEvent(
+                        call_id="read2",
+                        name="read",
+                        arguments={
+                            "path": "missing.py",
+                            "item_id": json.loads(request.messages[0].text)["current_item"]["item_id"],
+                        },
+                    )
+                else:
+                    for call in finish_calls(
+                        json.loads(request.messages[0].text),
+                        MemoryProposal(
+                            complete=True,
+                            review_findings=["有重复分支，收益尚未测试"],
+                            next_plan=["比较两个实现再安排测试"],
+                        ).model_dump(),
+                    ):
+                        yield call
                 yield StopEvent(stop_reason="end_turn")
 
         (self.project / "code.py").write_text("pass", encoding="utf-8")
@@ -239,7 +257,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
             events.append(event)
 
         service.on_event = receive
-        await service.start("sleep")
+        await service.start()
         await service._task
         self.assertEqual(service.status().phase, "completed", service.status().reason)
         operations = [e.operation for e in events if e.operation]
@@ -334,7 +352,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
             raise TimeoutError()
 
         service.runner_factory = fail
-        await service.start("nap")
+        await service.start()
         await service._task
         self.assertIn("TimeoutError", service.status().reason)
         self.assertIn("未提供详细说明", await service.latest_report())
@@ -351,7 +369,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
     async def test_history_report_and_trace_commands_select_run_without_model_requests(self):
         provider = ProposalProvider()
         service = self.service(provider)
-        await service.start("nap")
+        await service.start()
         await service._task
         run_id = service.status().run_id
         app = self.app(service)
@@ -376,7 +394,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
         sibling = AnamesisCoordinator(self.home / "anamnesis", self.project, window_id="busy")
         sibling.update(eligible=False, idle=False, busy=True, last_submission=2)
         with patch.object(service.collector, "collect", side_effect=AssertionError("must not scan")):
-            self.assertNotEqual(await service.start("nap"), "已开始入梦")
+            self.assertNotEqual(await service.start(), "已开始入梦")
         self.assertIsNone(service._task)
         sibling.unregister()
         await service.aclose()
@@ -388,10 +406,10 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
         ready = self.service()
         ready.clock = lambda: 100000
         ready._last_activity = ready._last_end = 0
-        self.assertNotEqual(await ready.start("nap", manual=False), "已开始入梦")
+        self.assertNotEqual(await ready.start(manual=False), "已开始入梦")
         self.assertIsNone(ready._task)
         await inactive.aclose()
-        self.assertEqual(await ready.start("nap", manual=False), "已开始入梦")
+        self.assertEqual(await ready.start(manual=False), "已开始入梦")
         await ready._task
         await ready.aclose()
 
@@ -406,7 +424,7 @@ class HistoryTests(TempCase, unittest.IsolatedAsyncioTestCase):
                 seen.set()
 
         owner.on_event = receive
-        await owner.start("nap")
+        await owner.start()
         await asyncio.wait_for(seen.wait(), 5)
         other.note_activity("submit")
         other.note_submission()

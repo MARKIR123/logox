@@ -1,104 +1,53 @@
-# 06 · 权限决策、路径审计与审批
+# 权限决策与路径审计
 
-> 核对日期：2026-09-29。范围：当前工作区源码（含已有未提交改动）。状态：已有实现与已知缺口分别列出；策略设计不得等同于已覆盖的运行路径。
+核对日期：2026-10-09。本模块提供应用策略和人工审批，不提供操作系统进程隔离。
 
-## 1. 定位与安全边界
+## 职责与边界
 
-Agent 的文件操作和 Shell 命令可能超出用户意图。权限系统在执行前判断允许、拒绝或询问，让用户能看清授权范围。人在回路（human in the loop, HITL）指遇到需要人裁决的动作时等待用户选择，解决的是模型不能替用户确认风险的问题。
+模型读写和运行命令可能超出用户意图。权限系统在执行前判断允许、拒绝或询问，并记录范围规则。人在回路（human in the loop, HITL）使有风险的请求等待用户裁决，而非由模型自行确认。
 
-本模块实现策略审计与学习规则；调度入口由 [01](01_kernel.md) 控制，弹窗与等待桥接由 [03](03_tui.md) / [08](08_app_and_collaboration.md) 实现。`PathSandbox` 是应用级路径审计，不是操作系统级进程沙箱（sandbox）：已获准的 Shell 进程仍拥有用户账户的操作系统权限。
+正常运行的 Scheduler 对全部工具调用决策器，普通工作区只读可静默允许。界面负责提示和等待，策略负责规则。开发调试显式绕过权限的装配不具备此保证，不能用于安全能力证明。
 
-**Scheduler 的全部注册工具都进入权限决策，readonly 只影响调度。普通工作区只读自动允许；敏感或越界目标需要确认。`requires_permission=False` 不再构成跳过审计的入口。**
+## 判定顺序
 
-## 2. 源码地图与契约归属
+1. Shell 词法归一化，识别命令前缀和复合操作符。
+2. 命中已有自毁黑名单则直接拒绝。
+3. 显式 deny 规则优先拒绝。
+4. 检查所有路径参数与敏感命令/模式；风险目标进入人工单次确认。
+5. default 模式的复合 Shell 命令先询问。
+6. 匹配会话允许、项目允许或普通只读/内置基线。
+7. 剩余普通操作：creative 自动允许，default 询问。
 
-| 文件 | 真实符号 | 职责 |
-|---|---|---|
-| [engine.py](../../src/logox/permissions/engine.py) | `PermissionEngine` | 五层判定、规则学习、撤销、状态快照 |
-| [sandbox.py](../../src/logox/permissions/sandbox.py) | `PathSandbox` | 路径解析、工作区边界与敏感标记 |
-| [normalizer.py](../../src/logox/permissions/normalizer.py) | `normalize_shell_command` | 命令前缀、词法切分与复合操作符 |
-| [models.py](../../src/logox/permissions/models.py) | `Decision`, `PermissionMode`, `RiskLevel`, `PermissionRule`, `PermissionEvaluation` | 策略数据与枚举 |
-| [decider.py](../../src/logox/permissions/decider.py) | `HierarchicalPermissionDecider`, `format_permission_detail` | 层级决策与参数说明实现 |
-| [app.py](../../src/logox/app.py) | `UiPermissionDecider` | 当前装配路径的决策与交互桥接 |
-| [permission_types.py](../../src/logox/permission_types.py) | `PermissionAsk`, `PermissionChoice` 等 | 无界面依赖的询问数据 |
-| [kernel/scheduler.py](../../src/logox/kernel/scheduler.py) | `PermissionDecider` 协议、调度侧 `Decision` | 内核授权注入点 |
+允许规则不覆盖黑名单、显式拒绝或已识别高风险。default 不是每次写入都询问，已有合法允许规则可生效；creative 也不是关闭防护。
 
-策略侧与调度侧都定义 Decision，桥接时必须转换到调度器预期枚举；不能只凭字符串相同推断枚举身份相同。
+路径按工作区根解析，resolve 处理 .. 和现有符号链接；审计 path、file_path、target_file、file、dir、cwd 等所有存在字段，正常 cwd 不能掩盖敏感 command。敏感资源包括 .git、以 .env 开头的片段，以及 .logox 中的配置与权限文件。越界或敏感为 ASK，允许明确裁决，不直接等同永久 DENY。
 
-## 3. 实际决策流程
+递归 grep/glob 还过滤敏感子路径和逃出搜索根的结果。文件扫描边界由 [工具模块](05_tools.md) 配合，不是权限引擎单独实现所有过滤。
 
-```mermaid
-flowchart TD
-    A[全部工具请求] --> B[归一化命令与参数]
-    B --> C{自毁黑名单或显式拒绝?}
-    C -- 是 --> N[DENY]
-    C -- 否 --> D{全部路径 / 敏感命令或 glob 模式风险?}
-    D -- 是 --> Q[ASK 单次高风险确认]
-    D -- 否 --> E{DEFAULT 下复合 Shell?}
-    E -- 是 --> Q
-    E -- 否 --> F[会话规则 / 项目规则 / 普通只读与内置基线]
-    F --> G{允许规则或安全基线?}
-    G -- 是 --> Y[ALLOW]
-    G -- 否 --> H{CREATIVE?}
-    H -- 是 --> Y
-    H -- 否 --> Q
-```
+## 规则、审批与保存
 
-`DEFAULT` 对没有匹配规则的请求询问；保存的允许规则或内置基线可以静默放行，并非“每次写都问”。`CREATIVE` 对常规未匹配动作自动允许，仍保留命中黑名单的拒绝与被识别高风险的人工询问。复合命令在 DEFAULT 下会询问，在 CREATIVE 下不统一强制询问。
+PermissionRule 描述工具、模式、决策和作用域。会话规则在内存；项目规则通过当前项目状态存储持久化，不能跨项目误用。学习和撤销采用明确入口，保存失败需要诊断，不能声称已经永久授权。
 
-路径审计相对工作区解析目标，通过 `resolve()` 处理 `..` 与现有符号链接。敏感检测关注 `.git`、以 `.env` 开头的路径片段及 `.logox/config.toml`、`permissions.toml`；高风险结果为 ASK，允许用户明确授权，不是绝对 DENY。
+`PermissionEvaluation` 包含 decision、reason、risk_level、matched_rule 和 suggested_rule。策略枚举与调度枚举在桥接处转换；相同字符串不意味着可直接混用类型。
 
-`audit_tool_args()` 检查所有 `path / file_path / target_file / file / dir / cwd` 字段，任一风险都会影响结果；正常 cwd 不能遮住敏感 Shell 文本。显式敏感 glob 模式也需确认。普通递归搜索跳过敏感子路径，且解析后的文件不得逃出本次搜索根目录；经审批的显式敏感根目录或模式可搜索指定范围。任意脚本的内部行为也无法靠命令文本完整识别；例如一个名称看似只读的测试命令仍能运行用户代码。
+Runtime 通过 PermissionAsk 与待完成结果 Future 暂停该工具协程；其他输入仍可运行。取消、关闭或无法询问时不默许执行，返回拒绝/取消结果。无人值守入梦的 ASK 直接拒绝，不出现等待人工的浮层。
 
-规则顺序是拒绝优先、会话允许、项目允许、内置基线。显式拒绝优先于高风险确认，高风险与复合命令检查发生在允许规则之前。“始终允许”保存的是具体范围规则，不能写成无条件忽略一切风险。配置由状态仓保存；跨项目隔离取决于 Runtime 选择正确的项目状态目录。
+用户操作见 [权限与恢复](../user/safety-and-recovery.md)。
 
-## 4. 接口、失败与验证
+## 源码入口
 
-真实入口如下：
+| 源码 | 职责 |
+|---|---|
+| [engine.py](../../src/logox/permissions/engine.py) | PermissionEngine.evaluate、learn_rule、revoke_rule、规则快照 |
+| [sandbox.py](../../src/logox/permissions/sandbox.py) | PathSandbox，路径解析与风险标记 |
+| [normalizer.py](../../src/logox/permissions/normalizer.py) | Shell 词法、前缀和复合操作符 |
+| [models.py](../../src/logox/permissions/models.py) | Decision、PermissionMode、RiskLevel、PermissionRule |
+| [decider.py](../../src/logox/permissions/decider.py)、[app.py](../../src/logox/app.py) | 层级与界面决策桥接 |
+| [permission_types.py](../../src/logox/permission_types.py) | 不依赖界面的审批数据 |
+| [scheduler.py](../../src/logox/kernel/scheduler.py) | 内核注入接口与执行前裁决 |
 
-```python
-# PermissionEngine.evaluate
-def evaluate(self, tool_name: str, args: dict[str, Any] | None=None, *, readonly: bool=False) -> PermissionEvaluation: ...
+## 安全限制与验证
 
-# PermissionEngine.learn_rule
-def learn_rule(self, rule: PermissionRule) -> None: ...
+应用不能完整理解任意脚本内部行为；pytest 等基线命令也能执行项目代码。resolve 检查后文件或链接仍可能被外部进程替换，即检查到使用之间的竞争（TOCTOU）。已允许的 Shell 拥有用户账户权限；没有容器、受限令牌或系统级隔离。
 
-# PermissionEngine.revoke_rule
-def revoke_rule(self, rule: PermissionRule) -> bool: ...
-
-# PermissionEngine.get_rules_snapshot
-def get_rules_snapshot(self) -> dict[str, Any]: ...
-```
-
-`PermissionEvaluation` 返回 decision / reason / risk_level / matched_rule / suggested_rule。`PermissionRule` 描述工具名、匹配模式、决策与作用域。无界面或询问失败时不允许执行，调度器把 ASK 转成拒绝结果并向模型说明。
-
-| 场景 | 当前预期 | 测试 |
-|---|---|---|
-| 自毁命令 | 被已有模式识别则直接 DENY | `test_permissions.py` |
-| 越界路径、敏感文件、符号链接 | 审计产生高风险 ASK | `test_permissions.py` |
-| 复合命令 / 引号内普通文本 | 词法识别后按运行模式处理 | `test_permissions.py`, `test_permission_mode.py` |
-| 保存 / 撤销允许规则 | 生效范围与状态持久化一致 | `test_permissions_command.py`, `test_permission_mode.py` |
-| 弹窗取消、无界面、异常 | 工具不得默认执行 | `test_permission_decider.py`, `test_permission_flow.py` |
-
-`test_audit_a_choices.py` 增加真实 Scheduler → 权限引擎 → 文件工具的贯通用例，覆盖普通读取、敏感读取拒绝、递归搜索过滤、敏感 glob、带正常 cwd 的敏感 Shell，以及显式拒绝优先。
-
-```powershell
-$env:PYTHONPATH = 'src'
-.venv\Scripts\python.exe -m pytest -q tests/unit/test_permissions.py tests/unit/test_permission_mode.py tests/unit/test_permissions_command.py tests/tui/test_permission_decider.py tests/tui/test_permission_flow.py
-```
-
-## 5. 权衡、限制与下一步
-
-已按用户 A 方案将审计与询问分开：所有工具做基础审计，工作区普通只读静默放行，敏感或越界再确认。未采用“每次只读都询问”，因为正常阅读会被频繁打断。CREATIVE 对普通未匹配操作的行为保持既有契约。
-
-**这是面试常考的：检查时与使用时的竞争（time of check to time of use, TOCTOU）。** 路径刚审计完、真正打开前，符号链接或文件仍可能被另一进程替换；面试官会问 resolve 为何不能构成操作系统隔离。应说明本项目提供应用策略与人工审批，尚无容器/受限令牌等系统隔离。
-
-当前通用验收见 [A 方案回归](../../tests/unit/test_audit_a_choices.py) 与对应模块测试；当前接手状态见 [架构入口](../ARCHITECTURE.md)。
-
-### 5.1 已确认 A：所有工具做审计，普通只读静默放行（已实现）
-
-Scheduler 不跳过权限决策。PermissionEngine.evaluate 增加只读提示参数，用于普通工具默认放行；该提示仅在路径风险与显式拒绝检查之后生效，不能让 deny 失效。read/grep/glob 的已知名称兼容直接引擎调用。
-
-PathSandbox.audit_tool_args 检查所有存在的路径字段，并单独检查 Shell command；普通 cwd 不能遮盖敏感 command。grep/glob 扫描可能遇到敏感子路径，应根据搜索范围/显式模式识别风险，普通工作区扫描默认不泄露敏感文件，显式敏感范围可通过审批访问。具体过滤与审批范围同时验证，不把应用审计宣称为 OS 沙箱。
-
-测试必须经过真实 Scheduler：普通 read 不问、敏感 read/grep/glob 询问或拒绝、deny 优先、多个路径、正常 cwd+敏感 command、越界与符号链接。
+测试需要走真实 Scheduler，而非只调用引擎。验证普通只读、敏感和越界、多个路径、符号链接、显式拒绝优先、保存撤销、审批取消与无界面拒绝。入口：[规则](../../tests/unit/test_permissions.py)、[模式](../../tests/unit/test_permission_mode.py)、[管理命令](../../tests/unit/test_permissions_command.py)、[审批流程](../../tests/tui/test_permission_flow.py)、[贯通边界](../../tests/unit/test_audit_a_choices.py)。方法见 [测试指南](../development/TESTING.md)。

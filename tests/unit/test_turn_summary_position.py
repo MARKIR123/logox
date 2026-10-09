@@ -326,9 +326,9 @@ class KernelPositionContractTests(unittest.IsolatedAsyncioTestCase):
         **不进历史**（历史长度只多了这一轮该有的那几条）。
         """
         script = [
-            chunks(*tool_chunks([("c1", "read", {})])[:-1], usage_chunk(100, 10)),
-            chunks(*text_chunks("好")[:-1], usage_chunk(200, 20)),  # 太短 ⇒ 不合规
-            chunks(*text_chunks(SUMMARY)[:-1], usage_chunk(30, 8)),  # ← 补写请求的脚本
+            chunks(*tool_chunks([("c1", "read", {})]), usage_chunk(100, 10)),
+            chunks(*text_chunks("好"), usage_chunk(200, 20)),  # 太短 ⇒ 不合规
+            chunks(*text_chunks(SUMMARY), usage_chunk(30, 8)),  # ← 补写请求的脚本
         ]
         env = install(script, tools=[StubTool()], model_summary_fallback=True)
         turn = await env.kernel.submit("读一下")
@@ -363,9 +363,9 @@ class KernelPositionContractTests(unittest.IsolatedAsyncioTestCase):
         """
         # 末尾是表格行 ⇒ L1 拒（structural）；用了工具 ⇒ L2 触发；补写太短 ⇒ l2_rejected
         script = [
-            chunks(*tool_chunks([("c1", "read", {})])[:-1], usage_chunk(100, 10)),
-            chunks(*text_chunks("表格如下：\n\n| 项 | 值 |")[:-1], usage_chunk(200, 20)),
-            chunks(*text_chunks("好")[:-1], usage_chunk(30, 8)),  # ← 补写太短 ⇒ 被校验拒
+            chunks(*tool_chunks([("c1", "read", {})]), usage_chunk(100, 10)),
+            chunks(*text_chunks("表格如下：\n\n| 项 | 值 |"), usage_chunk(200, 20)),
+            chunks(*text_chunks("好"), usage_chunk(30, 8)),  # ← 补写太短 ⇒ 被校验拒
         ]
         env = install(script, tools=[StubTool()], model_summary_fallback=True)
         turn = await env.kernel.submit("读一下")
@@ -379,9 +379,9 @@ class KernelPositionContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_reason_chain_records_a_timeout(self) -> None:
         """补写抛异常 ⇒ 链路里要写明异常类型（而不是静默降级）。"""
         script = [
-            chunks(*tool_chunks([("c1", "read", {})])[:-1], usage_chunk(100, 10)),
+            chunks(*tool_chunks([("c1", "read", {})]), usage_chunk(100, 10)),
             # ★ CHANGE-052：用**结构行**（表格）触发 L1 拒绝；超长已不再被拒
-            chunks(*text_chunks("表格如下：\n\n| 项 | 值 |")[:-1], usage_chunk(200, 20)),
+            chunks(*text_chunks("表格如下：\n\n| 项 | 值 |"), usage_chunk(200, 20)),
             [RuntimeError("provider 挂了")],
         ]
         env = install(script, tools=[StubTool()], model_summary_fallback=True)
@@ -412,8 +412,8 @@ class KernelPositionContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_deterministic_fallback_when_the_retry_also_fails(self) -> None:
         """★ 第 3 层：连补写都失败（这里让补写请求抛错）⇒ 本地生成，**回合仍然成功**。"""
         script = [
-            chunks(*tool_chunks([("c1", "read", {})])[:-1], usage_chunk(100, 10)),
-            chunks(*text_chunks("好")[:-1], usage_chunk(200, 20)),
+            chunks(*tool_chunks([("c1", "read", {})]), usage_chunk(100, 10)),
+            chunks(*text_chunks("好"), usage_chunk(200, 20)),
             [RuntimeError("provider 挂了")],  # ← 补写请求失败
         ]
         env = install(script, tools=[StubTool()], model_summary_fallback=True)

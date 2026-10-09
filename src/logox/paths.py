@@ -16,7 +16,7 @@
     ~/.logox/config.toml        用户手写，永久只读
     ~/.logox/state.toml         程序生成，可写
     ~/.logox/permissions.toml   用户手写，永久只读
-    ~/.logox/LOGOX.md           记忆文件（D21：只认这一个名字）
+    ~/.logox/LOGOX.md           用户级人设（D21：只认这一个名字）。存在则作为系统提示第一段注入
     ~/.logox/themes/*.toml      主题（UI-SPEC §8）
     ~/.logox/plugins/*.py       L2 插件
     ~/.logox/sessions/<sid>/    会话 JSONL
@@ -28,7 +28,7 @@
     <dir>/.logox/config.toml        用户手写，永久只读
     <dir>/.logox/state.toml         程序生成，可写（项目级学习到的权限规则）
     <dir>/.logox/permissions.toml   用户手写，永久只读
-    <dir>/.logox/LOGOX.md           记忆文件
+    <dir>/.logox/LOGOX.md           人工项目规范（与用户级同名文件是两回事，按层发现）
 
 缓存目录跟随平台约定（Windows 为 ``%LOCALAPPDATA%\\logox\\Cache``）。
 """

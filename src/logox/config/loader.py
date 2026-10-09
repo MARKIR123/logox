@@ -360,6 +360,8 @@ def _apply_state_overlay(
         (("provider", "model"), state.last.model),
         (("provider", "thinking_effort"), state.last.effort),
         (("ui", "theme"), state.last.theme),
+        (("anamnesis", "provider"), state.last.anamnesis_provider),
+        (("anamnesis", "model"), state.last.anamnesis_model),
     )
     applied = False
     for path, value in pairs:
@@ -601,6 +603,8 @@ def _humanize(error: Mapping[str, Any]) -> str:
     if etype == "missing":
         return "缺少必填项"
     if etype == "extra_forbidden":
+        if location[:1] == ("anamnesis",) and leaf in {"sleep_start", "sleep_end", "nap_max_steps", "sleep_max_steps"}:
+            return f"入梦已统一，配置 {leaf} 已废止，请从 [anamnesis] 删除；不再按昼夜或固定步骤数停止"
         return f"未知字段（拼写错误？）：{leaf}"
     if etype == "literal_error":
         expected = ctx.get("expected") or "允许的取值之一"

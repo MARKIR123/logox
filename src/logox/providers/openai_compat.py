@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
+from ipaddress import ip_address
 from typing import Any
+from urllib.parse import urlparse
 
 from logox.errors import ErrorCategory
 from logox.kernel.errors import classify_exception
@@ -77,6 +79,22 @@ _THINKING_MODELS = (
 
 #: OpenAI 请求体里**不接受**的字段（把它们列出来是为了显式剔除，而不是靠记忆）
 _UNSUPPORTED_FIELDS = ("reasoning", "thinking")
+
+
+def _is_loopback_url(url: str) -> bool:
+    """本机服务固定直连；远端和局域网端点保留环境代理。"""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.hostname
+    if host == "localhost":
+        return True
+    if not host:
+        return False
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def usage_from_openai(raw: Mapping[str, Any] | None) -> Usage | None:
@@ -401,7 +419,7 @@ class OpenAICompatProvider:
                 yield finalized
             else:
                 base_msg = str(finalized.get("error", "工具调用装配失败"))
-                is_truncated = stop_raw in ("length", "max_tokens")
+                is_truncated = stop_raw in ("length", "max_tokens", "model_context_window_exceeded")
                 if is_truncated:
                     msg = f"{base_msg}（输出已达到 Token 上限并被截断，请简化操作或分批写入）"
                 else:
@@ -417,7 +435,7 @@ class OpenAICompatProvider:
         if usage is not None:
             yield UsageEvent(usage=usage)
 
-        yield StopEvent(stop_reason=normalize_stop_reason(stop_raw), model=model)
+        yield StopEvent(stop_reason=normalize_stop_reason(stop_raw), raw_stop_reason=stop_raw, model=model)
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -455,9 +473,14 @@ class OpenAICompatProvider:
             return self._client
         if not self.api_key:
             raise ValueError("未配置 API Key（请在 config.toml 里设置 api_key_env 指向的环境变量）")
-        from openai import AsyncOpenAI  # 延迟导入
+        from openai import AsyncOpenAI, DefaultAsyncHttpxClient  # 延迟导入
 
-        self._client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        options: dict[str, Any] = {"api_key": self.api_key, "base_url": self.base_url}
+        if _is_loopback_url(self.base_url):
+            # 本机推理不应被环境代理转发；也避免无关的 SOCKS 依赖阻止客户端启动。
+            # 用 SDK 自带客户端，保留其默认连接/超时策略并兼容 SDK 的传输类型。
+            options["http_client"] = DefaultAsyncHttpxClient(trust_env=False)
+        self._client = AsyncOpenAI(**options)
         return self._client
 
     # ------------------------------------------------------------------ #

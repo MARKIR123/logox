@@ -16,18 +16,39 @@ def build_report(
     plan: list[str],
     remaining: int,
     sources: dict | None = None,
+    items: list | None = None,
+    self_checks: list[dict] | None = None,
+    reason: str = "",
 ) -> str:
     saved = sum(c["result"] == "已保存" for c in changes)
     candidates = sum(c.get("status") == "candidate" for c in changes)
     parts = [
-        f"# Anamnesis 晨报 · {'长眠' if mode == 'sleep' else '小憩'}",
+        "# Anamnesis 报告" + ({"sleep": " · 历史长眠", "nap": " · 历史小憩"}.get(mode, "")),
         "",
         f"状态：{outcome}；剩余会话片段：{remaining}",
+        f"说明：{reason or '见事项结果与覆盖记录'}",
         f"整理结果：已保存 {saved} 条；候选（未入档）{candidates} 条。",
         "本次为只读整理／研究，未修改源码或执行测试。",
         "",
-        "## 阶段分析",
+        "## 研究事项",
     ]
+    for item in items or []:
+        parts.extend(
+            [
+                f"### {item.item_id} · {item.status} · {item.question}",
+                f"纳入原因：{item.reason}",
+                f"结论：{item.conclusion or '尚未形成'}",
+                f"缺失依据：{item.missing_evidence or '无额外说明'}",
+                f"分析：{', '.join(item.analysis_ids)}；来源：{', '.join(item.source_ids)}",
+                f"必要前置关系：{', '.join(item.parent_item_ids)}；{item.dependency_reason}",
+            ]
+        )
+    parts.extend(["", "## 停滞自检（提醒不代表已自愈）"])
+    for check in self_checks or []:
+        parts.append(
+            f"- 事项 {check['item_id']}；提醒 {check['attempt']}；暂停 {check['paused']}；进展版本 {check['progress_epoch']}\n  {check['prompt']}"
+        )
+    parts.extend(["", "## 阶段分析"])
     for a in analyses:
         parts.extend(
             [

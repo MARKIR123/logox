@@ -1033,22 +1033,27 @@ class CommandRunner:
             self.host.notice("当前运行时没有入梦服务", token="warning")
             return
         parts = argument.strip().split()
-        action = parts[0].lower() if parts else "auto"
+        action = parts[0].lower() if parts else "start"
+        if action == "model":
+            await self._cmd_anamnesis_model(" ".join(parts[1:]))
+            return
         run_id = parts[1] if len(parts) == 2 else ""
         if len(parts) > 2 or (run_id and action not in {"report", "trace"}):
-            self.host.notice("用法：/anamnesis [nap|sleep|stop|status|history|report [run_id]|trace [run_id]]", token="warning")
+            self.host.notice("用法：/anamnesis [stop|status|history|report [run_id]|trace [run_id]|model [名称|refresh]]（不带参数开始）", token="warning")
             return
         if action == "stop":
             service.note_activity("input")
             service.request_wake("用户停止入梦")
             self.host.notice("已请求暂停入梦；已完成分析会保留", token="text_faint")
-        elif action in {"auto", "nap", "sleep"}:
+        elif action == "start" and not parts:
             service.note_submission()
-            self.host.notice(await service.start(action), token="text_faint")
+            self.host.notice(await service.start(), token="text_faint")
+        elif action in {"nap", "sleep", "auto"}:
+            self.host.notice("入梦已统一，旧模式参数已移除；使用 /anamnesis 开始。", token="warning")
         elif action in {"status", "report", "history", "trace"}:
             if action == "status":
                 status = service.status()
-                text = (f"Anamnesis · {status.mode or '待机'} · {status.phase}\n"
+                text = (f"Anamnesis · {status.phase}\n"
                         f"模型：{status.model or '尚未配置'}\n问题：{status.question or '—'}\n"
                         f"原因：{status.reason or '—'}\n剩余资料：{status.remaining}\n"
                         "空闲超过配置阈值后自动开始；发送消息或 /anamnesis stop 暂停当前窗口。")
@@ -1058,7 +1063,7 @@ class CommandRunner:
             elif action == "history":
                 history = await service.history()
                 text = "Anamnesis · 当前项目入梦历史\n\n" + ("\n".join(
-                    f"{item['run_id']} · {item.get('mode', '旧记录')} · {item.get('phase', '未知')}\n"
+                    f"{item['run_id']} · {item.get('mode') or '统一入梦'} · {item.get('phase', '未知')}\n"
                     f"  会话：{item.get('session_id') or '旧记录未绑定会话'}\n"
                     f"  {item.get('error') or item.get('question', '')}"
                     for item in reversed(history)) or "尚无入梦记录")
@@ -1076,7 +1081,41 @@ class CommandRunner:
             await self.host.push_overlay(PanelComponent(Text(text), palette=self._palette(),
                                                         max_rows=self._panel_rows(), footer="↑↓ 滚动浏览 · Esc 关闭"))
         else:
-            self.host.notice("用法：/anamnesis [nap|sleep|stop|status|history|report [run_id]|trace [run_id]]", token="warning")
+            self.host.notice("用法：/anamnesis [stop|status|history|report [run_id]|trace [run_id]|model [名称|refresh]]（不带参数开始）", token="warning")
+
+    async def _cmd_anamnesis_model(self, argument: str) -> None:
+        runtime = self._runtime
+        service = runtime.anamnesis
+        provider = service.config.provider
+        wanted = argument.strip()
+        try:
+            if provider not in {"ollama", "lm-studio"}:
+                raise ValueError("入梦只支持 Ollama／LM Studio 本地模型")
+            if wanted.lower() == "refresh":
+                result = await runtime.refresh_anamnesis_models()
+                self.host.notice(f"入梦模型清单 · {provider} · {result.summary()}",
+                                 token="text_faint" if result.ok else "warning")
+                return
+            if not wanted:
+                models = runtime.list_models(provider)
+                if not models:
+                    self.host.notice("本地模型清单为空；先 /anamnesis model refresh", token="warning")
+                    return
+                current = service.config.model
+                choices = [Choice(value=name, label=name, hint="当前入梦模型" if name == current else "")
+                           for name in models]
+                picked = await self._pick(self._state(f"选择入梦模型 · {provider}", choices, current=current))
+                if picked is None:
+                    self.host.notice("已取消（入梦模型未变）", token="text_faint")
+                    return
+                wanted = picked.value
+            window = await runtime.apply_anamnesis_model(wanted)
+        except Exception as exc:
+            self.host.notice(f"无法切换入梦模型：{exc}", token="warning")
+            return
+        self.host.notice(f"入梦模型：{provider}/{wanted} · 窗口 {window:,} tokens；已保存，后续入梦生效。交流模型保持不变。",
+                         token="accent")
+        self.host.refresh_status()
 
     async def _cmd_summary(self, argument: str) -> None:
         """查看当前会话演进脉络与用量大盘（/summary）。"""

@@ -4,7 +4,7 @@
 1. 拿到本轮消息（由注入的 ``ContextBuilder`` 组装，内核不生产上下文）
 2. 调 Provider，把 ``ProviderEvent`` 翻译成总线事件，并按 D52 的边界决定是否重试
 3. 把模型要的工具交给 ``Scheduler`` 执行，结果回灌
-4. 直到模型不再要工具为止
+4. 根据结束原因区分正常答复、截断续写与异常收尾
 
 三条最容易写错的地方（都有专门用例盯着）
 --------------------------------------
@@ -37,8 +37,8 @@ from logox.kernel.messages import (
     MessageMeta,
     ReasoningBlock,
     TextBlock,
-    ToolResultBlock,
     ToolUseBlock,
+    complete_tool_results,
 )
 from logox.kernel.registry import ToolRegistry
 from logox.kernel.scheduler import AllowAllDecider, BlobStoreProtocol, PermissionDecider, Scheduler
@@ -236,6 +236,8 @@ class _ModelOutcome(BaseModel):
     reasoning_signature: str | None = None
     tool_calls: list[ToolCallEvent] = Field(default_factory=list)
     stop_reason: str = "unknown"
+    raw_stop_reason: str | None = None
+    truncation_detail: str | None = None
     usage: ev.Usage | None = None
     #: 模型请求本身成功（不代表模型没报错）——失败时整个回合已经结束了
     ok: bool = True
@@ -263,13 +265,18 @@ class _Accumulator:
     def empty(self) -> bool:
         return not (self.text or self.reasoning or self.tool_calls)
 
-    def outcome(self, *, stop_reason: str, usage: ev.Usage | None) -> _ModelOutcome:
+    def outcome(
+        self, *, stop_reason: str, usage: ev.Usage | None,
+        raw_stop_reason: str | None = None, truncation_detail: str | None = None,
+    ) -> _ModelOutcome:
         return _ModelOutcome(
             text="".join(self.text),
             reasoning="".join(self.reasoning),
             reasoning_signature=self.signature,
             tool_calls=list(self.tool_calls),
             stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
+            truncation_detail=truncation_detail,
             usage=usage,
         )
 
@@ -285,11 +292,6 @@ class _ProviderFailure(Exception):
     @property
     def category(self) -> ErrorCategory:
         return self.event.category
-
-    @property
-    def is_truncated(self) -> bool:
-        return bool(getattr(self.event, "is_truncated", False)) or ("Token 上限" in self.event.message)
-
 
 # --------------------------------------------------------------------------- #
 # 内核循环
@@ -621,10 +623,7 @@ class KernelLoop:
         #: 本轮的请求消息视图：随模型响应与工具结果增长
         messages: list[Message] = list(bundle.messages)
 
-        continuation_count = 0
-        max_continuations = 1
-        truncation_healing_count = 0
-        max_truncation_healings = 1
+        pending_continuation: Message | None = None
 
         iteration = 0
         current_limit = self._max_iterations
@@ -644,81 +643,59 @@ class KernelLoop:
             if iteration > 1:
                 bundle = await self._build_context(turn)
                 messages = list(bundle.messages)
-            try:
-                produced = await self._model_phase(turn, messages, bundle)
-            except _ProviderFailure as failure:
-                # ★ D121：工具参数因 Token 上限截断的自愈闭环（Self-Healing via Error Feedback）
-                if failure.is_truncated and truncation_healing_count < max_truncation_healings:
-                    truncation_healing_count += 1
-                    # 1. 刚才已产出的部分消息同步进请求视图
-                    if turn.history and turn.history[-1] not in messages:
-                        messages.append(turn.history[-1])
-
-                    # 2. 注入自愈纠偏系统指引
-                    healing_prompt = (
-                        "[系统提示：刚才发起的工具参数因达到单次输出 Token 上限被截断，目标文件未被修改。\n"
-                        "【铁律】：严禁使用 write 工具全量覆盖重写已有大文件！\n"
-                        "请立即改用 edit 工具进行精确局部替换（只输出需改动的几行/几块代码），或分批完成。]"
-                    )
-                    healing_msg = Message(role="user", blocks=[TextBlock(text=healing_prompt)])
-                    messages.append(healing_msg)
-                    self.history.append(healing_msg)
-
-                    # 3. 发布提示通知用户/界面，说明正在自动回灌自愈
-                    await self._bus.publish(
-                        ev.ModelDelta(
-                            session_id=self._bus.session_id,
-                            turn=turn.turn_index,
-                            kind="text",
-                            delta="\n[!] 工具参数由于达到单次输出 Token 上限被截断，已自动回灌模型使用 edit 工具自愈...\n",
-                            request_index=turn.request_index,
-                        )
-                    )
-                    continue
-
-                raise
+            if pending_continuation is not None:
+                # 只在本次请求视图中添加控制指引，不能冒充新的用户输入写回历史。
+                messages.append(pending_continuation)
+                pending_continuation = None
+            produced = await self._model_phase(turn, messages, bundle)
 
             messages.append(produced.assistant_message)
             self.history.append(produced.assistant_message)
 
-            if not produced.tool_calls:
-                has_text = any(
-                    isinstance(b, TextBlock) and bool(b.text and b.text.strip())
-                    for b in produced.assistant_message.blocks
+            is_truncated = (
+                produced.stop_reason in {"max_tokens", "context_limit"}
+                or produced.truncation_detail is not None
+            )
+            if is_truncated:
+                results = await self._scheduler.reject_batch(
+                    turn, produced.tool_calls,
+                    content="模型输出被截断，本批工具均未执行；请重新发出完整调用。",
+                    error_kind="truncated",
                 )
-                has_reasoning = any(
-                    isinstance(b, ReasoningBlock) and bool(b.text and b.text.strip())
-                    for b in produced.assistant_message.blocks
-                )
-                is_truncated = produced.stop_reason == "max_tokens"
-
-                # 场景 1（D118 铁律）：大思考未输出正文，或被 Token 上限截断
-                if (has_reasoning or is_truncated) and not has_text and turn.tool_call_count == 0:
-                    # 纯思考绝不算有效对话完成，严禁提取与兜底生成摘要！
-                    turn.turn_summary = None
-
-                    # 若在续写预算内：自动发起静默续写接力
-                    if continuation_count < max_continuations:
-                        continuation_count += 1
-                        continuation_msg = Message(
-                            role="user",
-                            blocks=[
-                                TextBlock(
-                                    text="[系统提示：思考已结束或单次输出已达上限，请立即直接输出正文答复或调用工具。]"
-                                )
-                            ],
-                        )
-                        messages.append(continuation_msg)
-                        self.history.append(continuation_msg)
-                        continue
-
-                    # 续写已达上限依然没有任何交付物：标记为未完结失败，绝不发 completed
-                    turn.status = TurnStatus.FAILED
-                    turn.turn_summary = interrupted_summary(text, "本轮无有效输出")
-                    await self._emit_turn_finished(turn, "error")
+                if results:
+                    self.history.append(Message(role="tool", blocks=list(results)))
+                if produced.truncation_detail is not None:
+                    prompt = (
+                        "[系统提示：上一响应达到输出限制，工具参数被截断，本批工具均未执行。"
+                        "请重新生成完整工具调用，不要拼接残缺 JSON。修改已有大文件请用 edit 局部替换，"
+                        "或拆成较小批次。保留已有进展，不要重复已完成的操作。]"
+                    )
+                else:
+                    prompt = (
+                        "[系统提示：上一响应达到输出或上下文限制，尚未正常结束。"
+                        "请接着已有进展继续，不要重复已输出的内容或已完成的操作。"
+                        "上一响应中的工具均未执行，如需要请重新发出完整调用。"
+                        "请输出正文答复或调用工具。]"
+                    )
+                pending_continuation = _user_message(prompt)
+            elif produced.stop_reason not in {"end_turn", "stop_sequence", "tool_use"}:
+                explanations = {
+                    "refusal": "模型拒绝了请求",
+                    "content_filter": "模型响应被内容过滤终止",
+                    "pause_turn": "模型暂停了响应，当前不支持服务端工具暂停恢复",
+                }
+                message = explanations.get(produced.stop_reason, "未能确认模型正常结束")
+                await self._fail_response(turn, text, message, produced.raw_stop_reason)
+                return
+            elif not produced.tool_calls:
+                has_text = bool(produced.assistant_message.text.strip())
+                if produced.stop_reason == "tool_use":
+                    await self._fail_response(turn, text, "模型声明工具调用结束，但没有给出完整工具调用")
                     return
-
-                # 场景 2：正常结束（有正文交付物、或已执行过工具、或非思考模型的普通停机）
+                if not has_text:
+                    await self._fail_response(turn, text, "模型结束响应，但没有给出正文答复")
+                    return
+                # 仅已确认的自然结束且有正文，才进入成功摘要与收尾。
                 turn.status = TurnStatus.DONE
                 clean_msg = produced.assistant_message
 
@@ -783,13 +760,9 @@ class KernelLoop:
                 await self._emit_turn_finished(turn, "completed")
                 return
 
-            results = await self._scheduler.run_batch(turn, produced.tool_calls)
-            tool_message = Message(
-                role="tool",
-                blocks=[ToolResultBlock(id=item.id, ok=item.ok, content=item.content) for item in results],
-            )
-            messages.append(tool_message)
-            self.history.append(tool_message)
+            else:
+                results = await self._scheduler.run_batch(turn, produced.tool_calls)
+                self.history.append(Message(role="tool", blocks=list(results)))
 
             if iteration >= current_limit and await self._request_continuation(turn, iteration):
                 # 尝试人在回路 (HITL) 轮次续期
@@ -802,7 +775,7 @@ class KernelLoop:
                 session_id=self._bus.session_id,
                 turn=turn.turn_index,
                 category=ErrorCategory.BAD_REQUEST.value,
-                message=f"连续 {iteration} 轮都在请求工具，已停止本回合。",
+                message=f"已达到 {iteration} 步模型请求上限，响应尚未正常结束，已停止本回合。",
                 retryable=False,
                 detail="若任务确实需要更多轮次，请在配置里调大 kernel.max_iterations 或在续期弹窗中允许继续运行。",
             )
@@ -812,8 +785,21 @@ class KernelLoop:
             turn.turn_summary = interrupted_summary(text, f"超过最大迭代限制（{iteration} 轮）")
         await self._emit_turn_finished(turn, "error")
 
+    async def _fail_response(
+        self, turn: Turn, text: str, message: str, detail: str | None = None
+    ) -> None:
+        await self._bus.publish(ev.ErrorOccurred(
+            session_id=self._bus.session_id, turn=turn.turn_index,
+            category=ErrorCategory.BAD_REQUEST.value, message=message,
+            retryable=False, detail=detail,
+        ))
+        turn.status = TurnStatus.FAILED
+        self._complete_history(turn)
+        turn.turn_summary = interrupted_summary(text, message)
+        await self._emit_turn_finished(turn, "error")
+
     async def _request_continuation(self, turn: Turn, iteration: int) -> bool:
-        """询问是否允许继续运行工具轮次（类 Claude Code 的 HITL 续期）。"""
+        """询问是否允许增加一段模型请求步数预算。"""
         if hasattr(self._decider, "ask_continuation"):
             try:
                 return bool(await self._decider.ask_continuation(turn, iteration))
@@ -875,9 +861,6 @@ class KernelLoop:
             except _ProviderFailure as failure:
                 # 同一条原则：厂商把连接断了，但用户已经看到的那部分仍然是真实发生过的
                 self._commit_partial(turn, acc)
-                # ★ D121：若是因 Token 截断导致的工具参数不完整，直接向上抛出给自愈状态机
-                if failure.is_truncated:
-                    raise
                 # `first_token_ms is not None` 就是"已经吐过内容"的判据：
                 # 只有真正可见的文本/推理增量才会 mark()。
                 next_attempt = await self._handle_failure(
@@ -903,6 +886,8 @@ class KernelLoop:
         """读一个完整的模型流，把增量即时翻译成总线事件并累积进 ``acc``。"""
         usage: ev.Usage | None = None
         stop_reason = "unknown"
+        raw_stop_reason: str | None = None
+        truncation_details: list[str] = []
 
         async for event in self._provider.stream(request):
             if isinstance(event, DeltaEvent):
@@ -956,11 +941,18 @@ class KernelLoop:
                 usage = event.usage
             elif isinstance(event, StopEvent):
                 stop_reason = event.stop_reason
+                raw_stop_reason = event.raw_stop_reason
             elif isinstance(event, ProviderErrorEvent):
+                if event.is_truncated and event.category == ErrorCategory.BAD_REQUEST:
+                    truncation_details.append(event.detail or event.message)
+                    continue  # 参数截断后还要收集用量和结束原因。
                 raise _ProviderFailure(event, acc=acc)
             # ProviderEvent 是封闭联合；新增类型时这里会静默忽略——见 base.py 的 __all__
 
-        return acc.outcome(stop_reason=stop_reason, usage=usage)
+        return acc.outcome(
+            stop_reason=stop_reason, usage=usage, raw_stop_reason=raw_stop_reason,
+            truncation_detail="\n".join(truncation_details) if truncation_details else None,
+        )
 
     def _commit_partial(self, turn: Turn, acc: _Accumulator) -> None:
         """把中断/失败前已产出的内容落成一条 assistant 消息（D51）。
@@ -1070,6 +1062,7 @@ class KernelLoop:
                 duration_ms=watch.elapsed_ms,
                 first_token_ms=watch.first_token_ms,
                 stop_reason=outcome.stop_reason,
+                raw_stop_reason=outcome.raw_stop_reason,
                 cost_usd=cost,
                 # 厂商没上报用量 → 状态栏显示 `—`，而不是把 0 当成"真的没消耗"
                 usage_reported=outcome.usage is not None,
@@ -1189,34 +1182,8 @@ class KernelLoop:
         少一条下一轮请求就被 400——而这条历史会一直留在会话里，
         于是"按一次 Esc"会让本次会话**再也发不出任何请求**。
         """
-        pending: list[str] = []
-        last_tool_message: int | None = None
-        for index, message in enumerate(turn.history):
-            for block in message.blocks:
-                if isinstance(block, ToolUseBlock):
-                    pending.append(block.id)
-                elif isinstance(block, ToolResultBlock) and block.id in pending:
-                    pending.remove(block.id)
-            if message.role == "tool":
-                last_tool_message = index
-
-        if not pending:
-            return
-
-        def synthetic(call_id: str) -> ToolResultBlock:
-            return ToolResultBlock(id=call_id, ok=False, content=INTERRUPTED_TOOL_CONTENT)
-
-        if last_tool_message is not None:
-            # 并入最后一条 tool 消息，而不是再追加一条：连续两条同角色消息会让
-            # Anthropic 的"角色必须交替"校验失败。
-            existing = turn.history[last_tool_message]
-            turn.history[last_tool_message] = Message(
-                role="tool",
-                blocks=[*existing.blocks, *(synthetic(cid) for cid in pending)],
-                meta=existing.meta,
-            )
-        else:
-            turn.history.append(Message(role="tool", blocks=[synthetic(cid) for cid in pending]))
+        # 保留列表引用；结果只能补到所属批次，不能并入历史中的旧工具消息。
+        turn.history[:] = complete_tool_results(turn.history, missing_content=INTERRUPTED_TOOL_CONTENT)
 
 
 # --------------------------------------------------------------------------- #
@@ -1241,6 +1208,8 @@ class _ModelProduced(BaseModel):
     assistant_message: Message
     tool_calls: list[ToolCallEvent] = Field(default_factory=list)
     stop_reason: str = "unknown"
+    raw_stop_reason: str | None = None
+    truncation_detail: str | None = None
 
     @classmethod
     def from_outcome(cls, outcome: _ModelOutcome) -> _ModelProduced:
@@ -1260,6 +1229,8 @@ class _ModelProduced(BaseModel):
             assistant_message=Message(role="assistant", blocks=blocks, meta=meta),
             tool_calls=list(outcome.tool_calls),
             stop_reason=outcome.stop_reason,
+            raw_stop_reason=outcome.raw_stop_reason,
+            truncation_detail=outcome.truncation_detail,
         )
 
 

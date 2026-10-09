@@ -182,7 +182,7 @@ class ExpansionTests(TempCase, unittest.IsolatedAsyncioTestCase):
             app = self.app(service, app_type)
             app._loop = asyncio.get_running_loop()
             try:
-                await service.start("nap")
+                await service.start()
                 await asyncio.wait_for(provider.entered.wait(), 2)
                 generation = service._generation
                 for key in (
@@ -244,7 +244,7 @@ class ExpansionTests(TempCase, unittest.IsolatedAsyncioTestCase):
 
             app.runtime.kernel.start = start
             try:
-                await service.start("nap")
+                await service.start()
                 await asyncio.wait_for(provider.entered.wait(), 2)
                 app._dispatch(Key("paste", char="新的用户指令"))
                 self.assertTrue(service.is_active)
@@ -266,7 +266,7 @@ class ExpansionTests(TempCase, unittest.IsolatedAsyncioTestCase):
             service = self.service(provider)
             app = self.app(service, app_type)
             try:
-                await service.start("nap")
+                await service.start()
                 await asyncio.wait_for(provider.entered.wait(), 2)
                 await app.submit("/anamnesis stop")
                 await asyncio.wait_for(service._task, 2)
@@ -302,7 +302,7 @@ class ExpansionTests(TempCase, unittest.IsolatedAsyncioTestCase):
             service = self.service(provider)
             app = self.app(service, app_type)
             try:
-                self.assertEqual(await service.start("nap"), "已开始入梦")
+                self.assertEqual(await service.start(), "已开始入梦")
                 await asyncio.wait_for(provider.entered.wait(), 2)
                 generation = service._generation
                 app._dispatch(Key("paste", char="想好了再发送"))

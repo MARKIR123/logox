@@ -34,8 +34,8 @@ READ_A_PY = tool_chunks([("call_1", "read", {"path": "a.py"})])
 def read_script(answer: str = ANSWER) -> list[list[object]]:
     """两轮脚本：先读文件，再依据读到的内容回答。"""
     return [
-        [*READ_A_PY[:-1], usage_chunk(120, 30, cached=96)],
-        [*text_chunks(answer)[:-1], usage_chunk(400, 60, cached=350)],
+        [*READ_A_PY, usage_chunk(120, 30, cached=96)],
+        [*text_chunks(answer), usage_chunk(400, 60, cached=350)],
     ]
 
 

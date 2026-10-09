@@ -38,8 +38,8 @@ def _read_script(answer: str = ANSWER) -> list[list[object]]:
     """两轮脚本：先请求 read，再依据读到的内容回答。"""
     read = tool_chunks([("call_1", "read", {"path": "a.py"})])
     return [
-        [*read[:-1], usage_chunk(120, 30, cached=96)],
-        [*text_chunks(answer)[:-1], usage_chunk(400, 60, cached=350)],
+        [*read, usage_chunk(120, 30, cached=96)],
+        [*text_chunks(answer), usage_chunk(400, 60, cached=350)],
     ]
 
 
@@ -194,7 +194,7 @@ class InlineEndToEndTests(unittest.IsolatedAsyncioTestCase):
         """
         script = [
             *_pause_script("半句", "完整"),
-            [*text_chunks("第二轮回答")[:-1], usage_chunk(50, 10)],
+            [*text_chunks("第二轮回答"), usage_chunk(50, 10)],
         ]
         harness = build_inline(script, tools=[build_read_tool()], cwd=self.root)
         start_runtime(harness)

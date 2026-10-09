@@ -43,6 +43,7 @@ class SourceRef(Record):
 
 
 class AnamesisAnalysisRecord(Record):
+    item_id: str = ""  # Empty only for historical records.
     record_id: str = Field(min_length=1, max_length=120)
     stage_id: str = Field(min_length=1, max_length=120)
     question: str = Field(min_length=1, max_length=2000)
@@ -83,7 +84,46 @@ class MemoryProposal(Record):
     changes: list[MemoryChange] = Field(default_factory=list, max_length=50)
     review_findings: list[str] = Field(default_factory=list, max_length=30)
     next_plan: list[str] = Field(default_factory=list, max_length=30)
-    complete: bool = True
+    complete: bool
+
+
+class AnamesisResearchItem(Record):
+    item_id: str = Field(min_length=1, max_length=120, pattern=r"^[\w.-]+$")
+    question: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(min_length=1, max_length=6000)
+    scope: Literal["user", "project", "research"] = "project"
+    origin_kind: Literal["source_review", "code_change", "dependency"] = "source_review"
+    origin_source_ids: list[str] = Field(default_factory=list, max_length=100)
+    code_snapshot_id: str = ""
+    parent_item_ids: list[str] = Field(default_factory=list, max_length=50)
+    dependency_reason: str = ""
+    status: Literal["pending", "active", "resolved", "waiting_evidence"] = "pending"
+    version: int = Field(default=0, ge=0)
+    analysis_ids: list[str] = Field(default_factory=list)
+    source_ids: list[str] = Field(default_factory=list)
+    conclusion: str = ""
+    missing_evidence: str = ""
+
+
+class AnamesisResearchUpdate(Record):
+    item_id: str
+    expected_version: int = Field(ge=0)
+    status: Literal["active", "resolved", "waiting_evidence"]
+    analysis_ids: list[str] = Field(default_factory=list, max_length=100)
+    source_ids: list[str] = Field(default_factory=list, max_length=100)
+    conclusion: str = Field(default="", max_length=6000)
+    missing_evidence: str = Field(default="", max_length=6000)
+
+
+class AnamesisResearchPlan(Record):
+    items: list[AnamesisResearchItem] = Field(min_length=1, max_length=50)
+
+
+class AnamesisSegmentResult(Record):
+    kind: Literal["proposal", "checkpoint", "finished", "paused"]
+    reason: str = ""
+    proposal: MemoryProposal | None = None
+    state_version: int = 0
 
 
 class ArchiveSnapshot(Record):
@@ -109,6 +149,7 @@ class AnamesisStatus(Record):
 
 
 class AnamesisEvent(Record):
+    schema_version: int = 1
     kind: str
     run_id: str
     mode: str = ""
@@ -127,6 +168,9 @@ class AnamesisEvent(Record):
     operation: dict | None = None
     findings: list[str] = Field(default_factory=list)
     plan: list[str] = Field(default_factory=list)
+    item: AnamesisResearchItem | None = None
+    research_state: dict | None = None
+    self_check: dict | None = None
 
 
 def digest_text(text: str) -> str:

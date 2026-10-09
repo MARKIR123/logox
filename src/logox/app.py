@@ -375,7 +375,29 @@ class Runtime:
             with contextlib.suppress(Exception):
                 before = builder.system_prompt_snapshot()
 
-        # ---- ① 项目记忆（LOGOX.md / AGENTS.md，D119） ----
+        # ---- ① 用户级人设（~/.logox/LOGOX.md） ----
+        if builder is None:
+            items.append(ReloadItem("人设", error="当前运行时没有接上下文构建器"))
+        else:
+            try:
+                persona = builder.refresh_persona()
+                if persona.loaded:
+                    items.append(
+                        ReloadItem(
+                            "人设",
+                            detail=f"{Path(str(persona.path)).name} · "
+                            f"{estimate_text_tokens(persona.block):,} tokens",
+                        )
+                    )
+                elif persona.skipped:
+                    items.append(ReloadItem("人设", error=persona.skipped))
+                else:
+                    items.append(ReloadItem("人设", detail="未提供，沿用内置基础人设"))
+            except Exception as exc:  # noqa: BLE001 - 一项失败不影响其他项
+                logger.warning("重读人设失败：%s", exc)
+                items.append(ReloadItem("人设", error=f"{type(exc).__name__}: {exc}"))
+
+        # ---- ② 项目记忆（LOGOX.md / AGENTS.md，D119） ----
         if builder is None:
             items.append(ReloadItem("项目记忆", error="当前运行时没有接上下文构建器"))
         else:
@@ -394,7 +416,7 @@ class Runtime:
                 logger.warning("重扫项目记忆失败：%s", exc)
                 items.append(ReloadItem("项目记忆", error=f"{type(exc).__name__}: {exc}"))
 
-        # ---- ② 技能包（M10 / D113） ----
+        # ---- ③ 技能包（M10 / D113） ----
         skills = self.skill_manager
         if skills is None:
             items.append(ReloadItem("技能包", detail="未启用"))
@@ -406,7 +428,7 @@ class Runtime:
                 logger.warning("重扫技能包失败：%s", exc)
                 items.append(ReloadItem("技能包", error=f"{type(exc).__name__}: {exc}"))
 
-        # ---- ③ 模板命令（M10 / D112） ----
+        # ---- ④ 模板命令（M10 / D112） ----
         manager = self.command_manager
         if manager is None:
             items.append(ReloadItem("模板命令", detail="未启用"))
@@ -418,10 +440,10 @@ class Runtime:
                 logger.warning("重扫模板命令失败：%s", exc)
                 items.append(ReloadItem("模板命令", error=f"{type(exc).__name__}: {exc}"))
 
-        # ---- ④ 配置：**只校验，不替换** ----
+        # ---- ⑤ 配置：**只校验，不替换** ----
         items.append(self._check_config_on_reload())
 
-        # ---- ⑤ 前缀代价（记忆与技能索引都在系统提示里） ----
+        # ---- ⑥ 前缀代价（记忆与技能索引都在系统提示里） ----
         after = ""
         if builder is not None and hasattr(builder, "system_prompt_snapshot"):
             with contextlib.suppress(Exception):
@@ -646,6 +668,50 @@ class Runtime:
         if self.registry is None:
             return ""
         return self.registry.default_model(name) or ""
+
+    async def refresh_anamnesis_models(self) -> Any:
+        """Refresh the sleep endpoint only after verifying it is local."""
+        from logox.anamnesis.local import local_base_url
+
+        if self.anamnesis is None or self.registry is None:
+            raise ValueError("当前运行时没有入梦服务或模型注册表")
+        provider = self.anamnesis.config.provider
+        if provider not in {"ollama", "lm-studio"}:
+            raise ValueError("入梦只支持 Ollama／LM Studio 本地模型")
+        spec = self.registry.spec(provider)
+        if spec.kind != "openai_compat":
+            raise ValueError("入梦端点必须使用本地 OpenAI 兼容协议")
+        local_base_url(spec.base_url)
+        return await self.refresh_models(provider, timeout_s=3.0)
+
+    async def apply_anamnesis_model(self, model: str) -> int:
+        """Validate/persist a local sleep model without touching the foreground kernel."""
+        import asyncio
+        from logox.anamnesis.local import local_base_url
+
+        service = self.anamnesis
+        if service is None or self.registry is None:
+            raise ValueError("当前运行时没有入梦服务或模型注册表")
+        provider = service.config.provider
+        if provider not in {"ollama", "lm-studio"}:
+            raise ValueError("入梦只支持 Ollama／LM Studio 本地模型")
+        spec = self.registry.spec(provider)
+        if spec.kind != "openai_compat":
+            raise ValueError("入梦端点必须使用本地 OpenAI 兼容协议")
+        local_base_url(spec.base_url)
+        if model not in self.list_models(provider):
+            raise ValueError("该模型不在本地清单中；先 /anamnesis model refresh")
+        window = spec.window_for(model)
+        if not isinstance(window, int) or window < 4096:
+            raise ValueError("请为入梦模型配置至少 4096 tokens 的 context_window 或 model_windows")
+        if self.state_store is None:
+            raise ValueError("当前运行时没有可写的模型选择状态")
+
+        async def persist() -> None:
+            await asyncio.to_thread(self.state_store.set_last_anamnesis_model, provider=provider, model=model)
+
+        await service.set_model(model, persist=persist)
+        return window
 
     def list_models(self, name: str, *, api_key: str | None = None) -> list[str]:
         """列举一个 provider 可用的模型 id（**纯本地、零网络**）。
@@ -1323,6 +1389,9 @@ def build_runtime(
         rehydrate_files=getattr(ctx_config, "rehydrate_files", 5),
         rehydrate_max_chars=getattr(ctx_config, "rehydrate_max_chars", 2000),
         project_memory_enabled=getattr(ctx_config, "project_memory_enabled", True),
+        # ★ 用户级人设：`paths.memory` 以前是**死字段**（定义了没人读），
+        #   于是"改了 ~/.logox/LOGOX.md 却没反应"。现在它是 system 的第一段。
+        persona_path=getattr(paths, "memory", None),
         # ★ D158：κ 按 (provider, model) 分桶 —— 不同分词器的偏差不能互相污染
         model_key=f"{provider_name}/{model}",
         anamnesis_home=paths.root,
@@ -1981,7 +2050,9 @@ def build_session_start(runtime: Runtime, *, terminal_kind: str = "inline") -> A
     memory_sources: list[str] = []
     if getattr(runtime, "context_builder", None) is not None:
         with contextlib.suppress(Exception):
-            memory_sources = [str(s.path) for s in runtime.context_builder.memory.sources]
+            # ★ 用 builder 的统一入口：以前这里只列**项目规范**，于是会话开始
+            #   显示"记忆文件 1 份"，而实际请求里还有用户级人设与背景记忆。
+            memory_sources = runtime.context_builder.memory_source_paths()
 
     win = getattr(runtime.context_builder, "window_capacity", None)
     if not win and getattr(runtime, "reducer", None):

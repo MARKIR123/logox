@@ -15,8 +15,8 @@ dist/
 .logox/state.toml.tmp
 .logox/state.toml.bak
 
-# API Key（D59）：用户级与项目级都排除。
-# **这是"密钥不落盘"底线能成立的关键**——一旦提交，密钥就进了版本历史，无法撤回。
+# API Key：用户级与项目级的凭据文件均排除。
+# 凭据可按用户选择保存在本机；忽略规则用于避免将它们写入 Git 历史。
 # 唯一会被提交的是 `.env.example`（只有占位符，没有真实值）。
 .env
 .env.tmp
@@ -48,29 +48,40 @@ logox.ps1
 !/tools/vendor/catppuccin-palette.json
 
 # ============================================================================
-# 通用模块说明、架构、界面契约与离线测试允许纳入 Git。
-# 私人决策、复盘、审计原始证据和历史材料仍保留本地；这不自动 stage 或发布。
-# tools 忽略仅作用根目录，不能误匹配 src/logox/tools 的新增工具。
+# 正式用户指南、当前实现说明和精选开发记录允许纳入 Git。
+# legacy、审计原文和个人运行资料继续本地保存；不会自动 stage 或发布。
 # ============================================================================
 /docs/*
+!/docs/README.md
+!/docs/PRD.md
+!/docs/ARCHITECTURE.md
+!/docs/UI-SPEC.md
+!/docs/user/
 !/docs/modules/
 /docs/modules/*
 !/docs/modules/[0-9][0-9]_*.md
 !/docs/modules/README.md
-!/docs/ARCHITECTURE.md
-!/docs/ANAMNESIS-DESIGN.md
-!/docs/ANAMNESIS-VALIDATION.md
-!/docs/UI-SPEC.md
-!/docs/CLEANUP-DESIGN-2026-10-03.md
-!/docs/CLEANUP-REPORT-2026-10-03.md
+!/docs/development/
+/docs/development/*
+!/docs/development/WORKFLOW.md
+!/docs/development/TESTING.md
+!/docs/development/STATUS.md
+!/docs/development/designs/
+!/docs/development/decisions/
+!/docs/development/reviews/
+!/docs/development/research/
+/docs/legacy/
+/docs/modules/legacy/
+/docs/audits/
 /scratch/
+/notes/documentation-archive/
 
 # 会话产物：.logox/runs/ 下是逐次对话的记录（属隐私数据）。
 # `.logox/.gitignore` 已单独忽略它，这里再钉一道保险。
 .logox/runs/
 
 # 开发期工具（如 ruff 二进制）——装到仓库内的固定目录，例如
-# python -m pip install --target .tools ruff（理由见 docs/DEV-ENVIRONMENT.md §4.4）
+# 该目录属于本地环境，不作为正式安装或验收入口。
 .tools/
 
 # 入梦生成的用户/项目背景资料，不发布个人事实；人工 LOGOX.md 仍可跟踪。

@@ -267,12 +267,19 @@ class SourceCollector:
         return files
 
     def code_fingerprint(self, stop: threading.Event | None = None) -> str:
-        return digest_text(
-            "\n".join(
-                f"{p.relative_to(self.cwd)}:{p.stat().st_mtime_ns}:{p.stat().st_size}"
-                for p in self.code_files(stop)
-            )
-        )
+        return self.code_snapshot(stop)["fingerprint"]
+
+    def code_snapshot(self, stop: threading.Event | None = None) -> dict:
+        files = {}
+        for path in self.code_files(stop):
+            stat = path.stat()
+            files[str(path.relative_to(self.cwd))] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        return {
+            "fingerprint": digest_text(
+                "\n".join(f"{path}:{value['mtime_ns']}:{value['size']}" for path, value in files.items())
+            ),
+            "files": files,
+        }
 
 
 def permitted_code_path(path: Path, cwd: Path) -> bool:

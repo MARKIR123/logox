@@ -30,6 +30,7 @@ from logox.tui.render.app import InlineApp
 from logox.tui.render.fullscreen import FullscreenApp
 from logox.tui.render.keys import Key
 from logox.tui.render.terminal import FakeTerminal
+from tests.anamnesis.support import finish_calls, noop, research
 from tests.unit.support import make_temp_dir, remove_temp_dir
 
 
@@ -72,6 +73,7 @@ class ProposalProvider:
             else:
                 ref = payload["sources"][0]
                 analysis = AnamesisAnalysisRecord(
+                    item_id=payload["current_item"]["item_id"],
                     record_id="learning",
                     stage_id="portrait",
                     question="当前学习方向是什么？",
@@ -96,7 +98,54 @@ class ProposalProvider:
                 response = MemoryProposal(
                     analyses=[analysis], changes=[] if entries else [change], complete=self.complete
                 ).model_dump()
-            yield DeltaEvent(kind="text", text=json.dumps(response, ensure_ascii=False))
+            if "changes" not in payload:
+                current = payload.get("current_item")
+                if current and response["complete"]:
+                    yield ToolCallEvent(call_id="a", name="record_analysis", arguments=analysis.model_dump())
+                    yield ToolCallEvent(
+                        call_id="u",
+                        name="update_research",
+                        arguments={
+                            "item_id": current["item_id"],
+                            "expected_version": current["version"],
+                            "status": "resolved",
+                            "analysis_ids": [analysis.record_id],
+                            "source_ids": analysis.source_ids,
+                            "conclusion": analysis.conclusion,
+                        },
+                    )
+                    for item in payload.get("research_items", []):
+                        if item["item_id"] == current["item_id"]:
+                            continue
+                        code_analysis = analysis.model_copy(
+                            update={
+                                "record_id": "code.analysis",
+                                "item_id": item["item_id"],
+                                "scope": "research",
+                                "conclusion": "代码尚未核查，留待真实资料",
+                                "source_ids": [],
+                            }
+                        )
+                        yield ToolCallEvent(
+                            call_id="ca", name="record_analysis", arguments=code_analysis.model_dump()
+                        )
+                        yield ToolCallEvent(
+                            call_id="cu",
+                            name="update_research",
+                            arguments={
+                                "item_id": item["item_id"],
+                                "expected_version": item["version"],
+                                "status": "waiting_evidence",
+                                "analysis_ids": [code_analysis.record_id],
+                                "missing_evidence": "离线测试不研究代码",
+                            },
+                        )
+                    response["analyses"] = []
+                    yield ToolCallEvent(call_id="p", name="propose_memory", arguments=response)
+                else:
+                    yield DeltaEvent(kind="text", text=json.dumps(response, ensure_ascii=False))
+            else:
+                yield DeltaEvent(kind="text", text=json.dumps(response, ensure_ascii=False))
             yield StopEvent(stop_reason="end_turn")
         finally:
             self.closed = True
@@ -125,13 +174,13 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
             events.append(event)
 
         service.on_event = emit
-        self.assertEqual(await service.start("nap"), "已开始入梦")
+        self.assertEqual(await service.start(), "已开始入梦")
         await service._task
         self.assertEqual(service.status().phase, "completed")
         self.assertIn("目前学习 AI Agent", (self.home / "ANAMNESIS.md").read_text(encoding="utf-8"))
         self.assertFalse((self.project / "ANAMNESIS.md").exists())
         self.assertEqual(len(provider.requests), 2)  # Independent semantic review.
-        self.assertEqual(await service.start("nap"), "无可整理内容")
+        self.assertEqual(await service.start(), "无可整理内容")
         report = await service.latest_report()
         self.assertIn("用户明确说", report)
         self.assertIn("已保存", report)
@@ -143,7 +192,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
     async def test_submission_cancels_stream_and_preserves_same_run_on_resume(self):
         provider = ProposalProvider(wait=True)
         service = self.make_service(provider)
-        await service.start("sleep")
+        await service.start()
         await provider.entered.wait()
         run_id = service.status().run_id
         service.note_activity("view")
@@ -155,9 +204,9 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.home / "ANAMNESIS.md").exists())
         self.assertEqual(service.status().phase, "paused")
         provider.wait = False
-        await service.start("sleep")
+        await service.start()
         await service._task
-        self.assertEqual(service.status().run_id, run_id)
+        self.assertNotEqual(service.status().run_id, run_id)
         self.assertEqual(service.status().phase, "completed")
         await service.aclose()
 
@@ -175,13 +224,13 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(service.eligible())
         now[0] = 3801
         self.assertTrue(service.eligible())
-        self.assertEqual(service.current_mode(), "sleep")
+        self.assertFalse(hasattr(service, "current_mode"))
         await service.start()
         await provider.entered.wait()
         local[0] = datetime(2026, 9, 30, 9)
-        self.assertEqual(service.current_mode(), "nap")
+        self.assertEqual(service.status().mode, "")
         self.assertTrue(service.is_active)
-        self.assertEqual(service.status().mode, "sleep")
+        self.assertEqual(service.status().mode, "")
         await service.aclose()
         self.assertFalse(service.is_active)
         self.assertIsNone(service.coordinator._lease)
@@ -189,7 +238,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_start_and_terminal_close_release_run(self):
         provider = ProposalProvider(wait=True)
         service = self.make_service(provider)
-        results = await asyncio.gather(service.start("nap"), service.start("nap"))
+        results = await asyncio.gather(service.start(), service.start())
         self.assertEqual(results.count("已开始入梦"), 1)
         await provider.entered.wait()
         await service.aclose()
@@ -204,7 +253,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
 
         service = self.make_service(ProposalProvider())
         service.runner_factory = factory
-        await service.start("nap")
+        await service.start()
         await service._task
         self.assertEqual(service.status().phase, "failed")
         self.assertEqual(service.store.global_processed(), set())
@@ -214,18 +263,21 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
 
     async def test_step_checkpoint_keeps_unprocessed_sources(self):
         service = self.make_service(ProposalProvider(complete=False))
-        await service.start("nap")
+        await service.start()
         await service._task
         self.assertEqual(service.status().phase, "paused")
         self.assertEqual(service.store.global_processed(), set())
         self.assertTrue(service._checkpoint_path.exists())
         await service.aclose()
 
-    async def test_automatic_sleep_continuation_survives_daybreak(self):
+    async def test_automatic_unified_continuation_has_no_daybreak_boundary(self):
         class BatchProvider(ProposalProvider):
             async def stream(self, request):
                 self.requests.append(request)
-                yield DeltaEvent(kind="text", text=MemoryProposal().model_dump_json())
+                for call in finish_calls(
+                    json.loads(request.messages[0].text), MemoryProposal(complete=True).model_dump()
+                ):
+                    yield call
                 yield StopEvent(stop_reason="end_turn")
 
         for turn, text in ((2, "甲" * 600), (3, "乙" * 600)):
@@ -239,7 +291,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         service = self.make_service(provider, wall_clock=lambda: local[0], clock=lambda: clock[0])
 
         async def factory(collector):
-            return AnamesisRunner(provider, "test-local", 8000, collector)
+            return AnamesisRunner(provider, "test-local", 10000, collector)
 
         service.runner_factory = factory
         self.addAsyncCleanup(service.aclose)
@@ -251,9 +303,13 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         local[0] = datetime(2026, 9, 30, 9)
         await service.start(manual=False)
         await service._task
-        self.assertEqual(service.status().mode, "sleep")
+        self.assertEqual(service.status().mode, "")
         self.assertEqual(service.status().run_id, run_id)
-        self.assertEqual(service.status().phase, "completed", service.status().reason)
+        for _ in range(4):
+            if service.status().phase == "completed":
+                break
+            await service.start(manual=False)
+            await service._task
         self.assertEqual(len(service.store.global_processed()), 3)
 
     async def test_wake_during_commit_worker_keeps_lock_until_worker_stops(self):
@@ -269,7 +325,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
             return original(*args, **kwargs)
 
         service.store.commit = delayed
-        await service.start("nap")
+        await service.start()
         await asyncio.wait_for(entered.wait(), 5)
         service.note_activity("submit")
         contender = AnamesisCoordinator(self.home / "anamnesis", self.root)
@@ -285,7 +341,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_before_task_first_instruction_releases_lease(self):
         service = self.make_service(ProposalProvider(wait=True))
-        await service.start("nap")
+        await service.start()
         service.note_activity("submit")
         await asyncio.gather(service._task, return_exceptions=True)
         self.assertIsNone(service.coordinator._lease)
@@ -303,7 +359,7 @@ class ServiceTests(TempCase, unittest.IsolatedAsyncioTestCase):
             sessions=self.home / "sessions",
             runner_factory=None,
         )
-        await owner.start("nap")
+        await owner.start()
         await provider.entered.wait()
         other.note_activity("submit")
         self.assertTrue(owner.is_active)
@@ -322,19 +378,18 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
         runner = self.runner()
         path = self.project / "code.py"
         path.write_text("value = 1\n", encoding="utf-8")
-        result = json.loads(await runner._read_tool("read", {"path": "code.py"}, "sleep", threading.Event()))
+        result = json.loads(await runner._read_tool("read", {"path": "code.py"}, threading.Event()))
         self.assertTrue(runner.collector.verify(result["source_id"]))
         path.write_text("value = 2\n", encoding="utf-8")
         self.assertFalse(runner.collector.verify(result["source_id"]))
-        for name, args, mode in (
-            ("shell", {"command": "echo hello"}, "sleep"),
-            ("read", {"path": "code.py"}, "nap"),
-            ("read", {"path": "../home/x"}, "sleep"),
-            ("read", {"path": "docs/modules/LEGACY/x.md"}, "sleep"),
-            ("read", {"path": ".env"}, "sleep"),
+        for name, args in (
+            ("shell", {"command": "echo hello"}),
+            ("read", {"path": "../home/x"}),
+            ("read", {"path": "docs/modules/LEGACY/x.md"}),
+            ("read", {"path": ".env"}),
         ):
             with self.assertRaises(ValueError):
-                await runner._read_tool(name, args, mode, threading.Event())
+                await runner._read_tool(name, args, threading.Event())
 
     async def test_ask_permission_is_denied_without_prompt(self):
         permission = SimpleNamespace(
@@ -343,7 +398,7 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
         runner = self.runner(permission=permission)
         (self.project / "code.py").write_text("pass", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "无人值守"):
-            await runner._read_tool("read", {"path": "code.py"}, "sleep", threading.Event())
+            await runner._read_tool("read", {"path": "code.py"}, threading.Event())
 
     async def test_grep_and_glob_hide_legacy_and_generated_archive(self):
         runner = self.runner()
@@ -351,8 +406,8 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
         legacy.mkdir(parents=True)
         for path in (legacy / "old.py", self.project / "ANAMNESIS.md", self.project / "valid.py"):
             path.write_text("needle\n", encoding="utf-8")
-        glob = await runner._read_tool("glob", {"pattern": "**/*"}, "sleep", threading.Event())
-        grep = await runner._read_tool("grep", {"pattern": "needle"}, "sleep", threading.Event())
+        glob = await runner._read_tool("glob", {"pattern": "**/*"}, threading.Event())
+        grep = await runner._read_tool("grep", {"pattern": "needle"}, threading.Event())
         for result in (glob, grep):
             self.assertIn("valid.py", result)
             self.assertNotIn("old.py", result)
@@ -386,7 +441,9 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
                 status="observed",
             ),
         ]
-        accepted, rejected = await runner.validate(MemoryProposal(analyses=[analysis], changes=changes), {})
+        accepted, rejected = await runner.validate(
+            MemoryProposal(analyses=[analysis], changes=changes, complete=True), {}
+        )
         self.assertFalse(accepted)
         self.assertEqual(set(rejected), {"user.job", "project.other"})
         self.assertFalse(runner.provider.requests)
@@ -394,6 +451,7 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
     async def test_tool_protocol_records_explicit_analysis_before_proposal(self):
         runner = self.runner()
         analysis = AnamesisAnalysisRecord(
+            item_id="review",
             record_id="a",
             stage_id="s",
             question="要不要新增？",
@@ -404,7 +462,7 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
         class Tools:
             async def stream(self, request):
                 yield ToolCallEvent(call_id="1", name="record_analysis", arguments=analysis.model_dump())
-                yield ToolCallEvent(call_id="2", name="propose_memory", arguments={})
+                yield ToolCallEvent(call_id="2", name="propose_memory", arguments={"complete": True})
                 yield StopEvent(stop_reason="tool_use")
 
         runner.provider = Tools()
@@ -414,17 +472,17 @@ class RunnerTests(TempCase, unittest.IsolatedAsyncioTestCase):
             records.append(value)
 
         store = ArchiveStore(self.home, self.project)
-        result = await runner.run(
-            mode="nap",
+        result = await runner.run_segment(
+            research_state=research(list(runner.collector.sources.values())),
+            state_event=noop,
             sources=[],
             snapshots={k: store.load(k) for k in ("user", "project")},
-            steps=4,
             stop=threading.Event(),
             emit=emit,
             operation=emit,
         )
         self.assertEqual(records, [analysis])
-        self.assertEqual(result.analyses, [analysis])
+        self.assertEqual(result.proposal.analyses, [analysis])
 
 
 class MemoryAndQueueTests(TempCase):
@@ -666,10 +724,20 @@ class LocalTransportTests(TempCase, unittest.IsolatedAsyncioTestCase):
                     rationale="明确原话",
                     status="explicit",
                 )
-                answer = MemoryProposal(analyses=[analysis], changes=[change]).model_dump()
+                answer = MemoryProposal(complete=True, analyses=[analysis], changes=[change]).model_dump()
+                calls = list(finish_calls(data, answer))
                 self.assertEqual(
                     {t["function"]["name"] for t in payload["tools"]},
-                    {"record_analysis", "propose_memory", "source"},
+                    {
+                        "plan_research",
+                        "update_research",
+                        "record_analysis",
+                        "propose_memory",
+                        "source",
+                        "read",
+                        "glob",
+                        "grep",
+                    },
                 )
             data = {
                 "choices": [
@@ -680,6 +748,21 @@ class LocalTransportTests(TempCase, unittest.IsolatedAsyncioTestCase):
                     }
                 ]
             }
+            if "独立核查" not in payload["messages"][0]["content"]:
+                data["choices"][0]["delta"] = {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for index, call in enumerate(calls)
+                    ]
+                }
             thought_field = (
                 "reasoning_content" if "独立核查" in payload["messages"][0]["content"] else "reasoning"
             )
@@ -711,7 +794,7 @@ class LocalTransportTests(TempCase, unittest.IsolatedAsyncioTestCase):
             "httpx.AsyncClient",
             side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs),
         ):
-            await service.start("nap")
+            await service.start()
             await service._task
         self.assertEqual(service.status().phase, "completed", service.status().reason)
         self.assertEqual(len(requests), 2)

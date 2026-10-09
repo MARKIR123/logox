@@ -1,145 +1,72 @@
-# 07 · 会话持久化、快照与回滚
+# 会话存储、快照与恢复
 
-> 核对日期：2026-10-05。范围：当前工作区源码（含已有未提交改动）。状态：已有实现与已知缺口分别列出；策略设计不得等同于已覆盖的运行路径。
+核对日期：2026-10-09。对话、压缩状态、工具原文和文件快照有不同用途。
 
-## 1. 定位与边界
+## 职责与布局
 
-会话记录让用户关闭程序后继续任务；文件快照让错误修改有恢复依据。只恢复文件而不处理对话历史，会让模型继续相信已经被撤销的改动；直接覆盖文件又可能破坏用户在编辑器里的新修改。本模块负责日志、会话选择、历史回放、检查点与文件回滚。
+本模块保存会话、列出历史、回放有效分支、管理文件检查点与回滚。resume 重建对话；rewind 撤销目标轮次及之后的受支持文件修改，并在成功后更新历史。它不撤销任意 Shell、MCP 或外部服务的副作用。
 
-恢复（resume）重建历史；回滚（rewind）撤销目标轮次及之后的修改。文件级原子替换（atomic replace）解决单个文件写到一半被看到的问题；多文件恢复、日志与内存更新并没有整体事务保证。本模块不提供任意 Shell 或外部服务副作用的一键撤销。
-
-## 2. 源码地图与存储布局
-
-| 文件 | 实际符号 | 职责 |
-|---|---|---|
-| [manager.py](../../src/logox/store/manager.py) | `SessionManager`, `SessionInfo` | 工作区分桶、创建、列表、最近会话、软删除 |
-| [slug.py](../../src/logox/store/slug.py) | `slugify_cwd`, `unslug_cwd_hint` | 路径名及短哈希分桶 |
-| [persistence.py](../../src/logox/store/persistence.py) | `SessionPersistenceSubscriber` | 模型步骤、工具结果、摘要与检查点记录 |
-| [replay.py](../../src/logox/store/replay.py) | `load_session_records`, `filter_rewound_records`, `reconstruct_messages`, `replay_into_timeline`, `replay_session` | 有效记录读取与确定性回放 |
-| [checkpoint.py](../../src/logox/store/checkpoint.py) | `CheckpointTracker`, `FileSnapshot`, `TurnCheckpoint`, `ConflictInfo`, `RewindResult` | 轮次检查点与结果模型 |
-| [blob.py](../../src/logox/store/blob.py) | `BlobStore` | SHA-256 内容寻址存储与单文件恢复 |
-| [rewind.py](../../src/logox/store/rewind.py) | `check_conflicts`, `execute_rewind` | 外部修改检查与区间恢复 |
-| [context/storage.py](../../src/logox/context/storage.py) | `SessionTranscriptWriter` | 会话 JSONL、工具输出文件与行号 |
-
-默认数据来自 `LogoxPaths` 的用户目录（通常 `~/.logox`）：
+默认用户目录由 LogoxPaths 给出：
 
 ```text
-sessions/<workspace-slug>/<session-id>.jsonl    对话步骤与会话元数据
-sessions/<workspace-slug>/tools/<session-hash>/tool_<id>.log  会话隔离的工具输出
-blobs/<hash前2位>/<其余哈希>                  内容寻址文件快照
-logs/...                                     独立诊断事件日志
+~/.logox/
+  sessions/<workspace-slug>/<session-id>.jsonl
+  sessions/<workspace-slug>/tools/<session-hash>/tool_<id>.log
+  blobs/<hash前2位>/<其余哈希>
+  logs/
+  anamnesis/
 ```
 
-工具输出 Blob 与内容寻址快照是两套用途不同的存储。前者按调用 ID 命名，后者按文件内容哈希去重；不能混为“所有日志都按内容去重”。工具输出使用会话文件名哈希划分命名空间，避免不同会话的相同调用 ID 覆盖。
+工具日志按会话命名空间避免相同调用 ID 覆盖；文件快照用 SHA-256 内容寻址（CAS）去重。诊断事件日志和入梦过程不是对话消息正文。
 
-## 3. 持久化与恢复机制
+## 会话记录与时间
 
-`SessionPersistenceSubscriber` 接收增量时在内存积累，到 `ModelRequestFinished` 才写该请求的正文、推理和调用；不是每个 token 都实时落盘。异常关闭可能丢掉尚未结束的模型请求。`SessionTranscriptWriter` 以 JSONL 追加并 `flush()`，当前没有 `fsync()` 的断电持久性保证，追加成功后才提交行号与轮次区间，失败 warning 并返回 None。失败后的再次追加先重新核对实际文件行数；已有损坏尾行没有换行时补分隔，使后续 JSON 不接到坏行里。读侧仍会忽略无效记录，这不是自动修复损坏内容。
+持久化订阅者在内存积累流式正文/推理，到 ModelRequestFinished 写 model_output，保存工具调用、用量、耗时及统一/原始停止原因。ToolCallFinished 写工具结果及展示提示。新 turn_finished 用 turn_summary 保存摘要；读取兼容旧 content 回退。
 
-持久化订阅者对每条工具结果强制另存文件（直接调用 writer 时仍支持阈值），当前 JSONL 仍保留 content，外置文件并不自动消除主日志的全文重复。读侧忽略无效 JSON 行；重建工具调用与结果配对，并将回合摘要来源、真实记录行号写回消息 meta。回滚标记过滤掉已经撤销的历史分支。启动恢复和热切换均将过滤后的记录交给上下文构建器恢复 `context_state`；时间线继续回放全部有效原始对话。
+主要事件记录用 `timestamp` 保存 Unix 秒，可有小数；模型和工具结果表示对应完成事件的时间，不是开始时间。内部记录未指定时间时取创建时刻，显式 null 表示未知。新 session_init 保留 created_at 并保存同值 timestamp。
 
-检查点由 Scheduler 围绕支持的 `write / edit` 操作保存前后内容哈希。内容寻址存储（content-addressed storage, CAS）按 SHA-256 命名，同样内容不重复写；避免每轮复制整个工程。任意 Shell 修改、远程 MCP 修改或手工编辑不自动拥有这些快照。
+读旧日志优先保留 timestamp，其次兼容 ts，否则内存补 null；不改原文件、mtime、行号或内容摘要值。duration_ms 是耗时，不能代替发生时刻，不能从文件名推测逐条时间。
+
+JSONL 追加后 flush，成功才提交物理行号和轮次范围；失败 warning 返回 None。再次写入核对行数，损坏尾行无换行时补分隔，读侧忽略非法行。当前没有每条 fsync 的断电持久保证；请求结束前的增量仍在内存，异常关闭可能丢失。
+
+每个工具结果另存原文文件，主 JSONL 仍保存全文；外置不等于已消除重复。读取 JSONL 按真实换行处理，不能用 Unicode splitlines 拆开合法字符串内的分隔字符。
+
+## 回放与上下文恢复
+
+load_session_records → 过滤回滚分支 → reconstruct_messages → replay_into_timeline。工具调用和结果双向配对：结果缺调用时补调用，调用缺结果时按所属批次补失败结果。已完成结果保留；未开始、已中断或未保存结果的调用不会重新执行，也不补成成功。恢复只改内存视图，不改原始 JSONL；新增合成消息不冒充真实记录行号。摘要来源及真实记录行号写回 meta，工具 display 恢复 Diff 与错误详情。
+
+压缩统计 compaction 与可恢复 context_state 分开。恢复状态必须匹配有效原始分支及归档文件；启动 resume、热切换和 rewind 共用 [上下文模块](02_context.md) 的校验。时间线仍显示完整有效原始对话，模型请求使用恢复后的折叠视图。
+
+入梦会话只记录无模型角色的 anamnesis_ref，独立过程和报告从 Anamnesis 存储加载；不把后台思考污染前台模型消息。会话归属见 [入梦模块](09_anamnesis.md)。
+
+## 文件回滚
+
+Scheduler 围绕支持的 write/edit 保存 before_hash 和 after_hash。to_turn=N 表示撤销 N 轮及之后，不是保留到该轮结束。
 
 ```mermaid
 flowchart TD
-    A[请求 rewind 至 N 轮] --> B[读取有效检查点 turn >= N]
-    B --> V[全部路径 / 哈希 / 快照内容预检]
-    V --> C[当前哈希对比 after 或已恢复 before]
-    C --> D{有冲突且未 force?}
-    D -- 是 --> E[返回冲突，不执行恢复]
-    D -- 否 --> F[选择区间最早 before_hash]
-    F --> G[还原旧文件 / 删除该区间新建文件]
-    G --> S{所有文件成功?}
-    S -- 否 --> X[报告部分执行，不提交对话回滚]
-    S -- 是 --> H[Runtime 记录回滚并重建内核与时间线]
+    A[选择回滚区间] --> B[全部路径 / 哈希 / 快照内容预检]
+    B --> C{当前文件有外部漂移?}
+    C -- 未确认覆盖 --> D[报告冲突 / 不执行]
+    C -- 无冲突或明确 force --> E[逐文件恢复最早 before / 删除区间新建文件]
+    E --> F{全部成功?}
+    F -- 是 --> G[记录回滚 / 重建会话和时间线]
+    F -- 否 --> H[列出部分结果 / 不提交对话回滚]
 ```
 
-`to_turn=N` 表示撤销 N 轮及之后，不是“保留到 N 轮结束”。外部漂移（external drift）是当前文件与 Agent 最后记录的版本不同；默认阻止覆盖，`force=True` 会覆盖用户修改，属于需要明确理解的已有操作。
+预检拒绝越界、非法哈希及缺失/损坏快照。执行中仍可能部分成功；重试识别已恢复 before 版本，避免误判为外部改动。单文件临时替换原子，多文件、日志与内存没有整体事务和自动补偿保证。force 会覆盖外部手改，界面先显示冲突选择。
 
-## 4. 接口、失败与验证
+操作说明见 [权限与恢复](../user/safety-and-recovery.md)。
 
-源码接口：
+## 接口与验证入口
 
-```python
-# SessionManager.list_sessions
-def list_sessions(self, cwd: Path | str) -> list[SessionInfo]: ...
-
-# SessionManager.find_most_recent
-def find_most_recent(self, cwd: Path | str) -> SessionInfo | None: ...
-
-# SessionManager.scan_session_metadata
-def scan_session_metadata(self, file_path: Path, cwd: str='') -> SessionInfo | None: ...
-
-# execute_rewind
-def execute_rewind(records: list[dict[str, Any]], to_turn: int, cwd: Path, blob_store: BlobStore, *, force: bool=False) -> RewindResult: ...
-```
-
-`SessionInfo` 包含 session_id / file_path / cwd / created_at / updated_at / turn_count / title_summary / total_tokens。`FileSnapshot` 使用 path / before_hash / after_hash；`RewindResult` 有 success / to_turn / restored_files / deleted_files / conflicts / message。
-
-| 场景 | 当前行为或限制 | 测试 |
-|---|---|---|
-| 无会话、空会话、坏 JSON 行 | 列表/回放容错，不把坏行当有效消息 | `test_store.py` |
-| 摘要、推理、工具展示恢复 | 消息与时间线恢复应一致 | `test_resume_fidelity.py`, `test_store.py` |
-| 压缩状态跨进程、热切换与回滚 | 绑定有效分支，恢复摘要与工具归档，按有效视图计量 | `test_context_state_resume.py` |
-| 多次回滚与继续新轮次 | 过滤已经撤销的记录，避免轮次错配 | `test_rewind.py`, `test_turn_summary_position.py` |
-| 外部文件被编辑或删除 | 默认返回冲突 | `test_rewind.py` |
-| 快照不存在 / 恢复失败 | 预检缺失快照；失败返回 success=False，不推进历史 | `test_audit_regressions.py` |
-| 磁盘满 | 警告并继续，不能宣称所有文本已保存 | 本轮环境失败与故障注入 |
-
-```powershell
-$env:PYTHONPATH = 'src'
-.venv\Scripts\python.exe -m pytest -q tests/unit/test_store.py tests/unit/test_rewind.py tests/unit/test_resume_fidelity.py tests/unit/test_transcript_paths.py
-```
-
-生产使用应保留会话与快照备份，磁盘空间与写入失败需要可见诊断。把快照缺失、恢复中途失败和损坏尾行分开验证，不能只测正常恢复哈希一致。
-
-## 5. 本轮优化设计与权衡
-
-`find_most_recent()` 原来调用 `list_sessions()`，为恢复一份最新会话解析了全部历史日志。本轮只按文件修改时间稳定排序候选，解析最新可读文件；若被删除或读取失败，继续下一份。仍保持列表方法的全量元数据统计、相同时间的稳定顺序与无会话返回 None。不引入需要失效管理的持久索引缓存。
-
-**这是面试常考的：原子性（atomicity）与事务（transaction）。** 单文件 replace 让读者看到旧或新版本；多个文件加日志和内存要一起成功，才算整体事务。当前 rewind 是逐文件恢复，遇到中途失败可能出现部分成功，不能用“时空穿梭”文案替代这个边界。已完成路径、哈希与快照内容预检，并识别已恢复版本以支持重试；完整事务日志和自动补偿未实现。
-
-当前通用验收见 [A 方案回归](../../tests/unit/test_audit_a_choices.py) 与对应模块测试；当前接手状态见 [架构入口](../ARCHITECTURE.md)。
-
-### 5.1 本轮回滚结果修复设计
-
-旧代码在快照缺失或删除失败后仍返回 success=True，Runtime 据此撤销对话历史，导致磁盘与历史不一致。本轮在写文件前预检需要的快照是否存在；缺失时返回失败并保留文件。执行中失败捕获并返回 success=False，结果继续包含已经成功恢复/删除的路径，message 明确可能部分执行。Runtime 的现有 success 检查会阻止提交回滚记录和截断历史。
-
-此修复只使结果诚实并减少可提前发现的失败，不承诺多个文件同时恢复成功。已追加快照完整性与路径校验；检查后并发文件变化和失败后的整体补偿仍不保证。验收覆盖缺失快照、恢复返回 False、写入抛 OSError、删除失败、正常区间回滚。
-
-### 5.2 已确认 A：完整预检、诚实失败与兼容日志（已实现）
-
-回滚修改前解析所有路径，限制工作区内、拒绝无目标及非法哈希，验证快照存在和内容哈希；一项不合格则完全不执行。执行中仍可能部分成功，返回成功路径和失败信息；重试已恢复的文件时需识别目标 before 版本，避免把已成功恢复当作用户冲突。保留现有 RewindResult 与 JSONL 格式，不引入事务日志。
-
-写日志成功后才提交行号与 turn_lines，失败返回 None；持久化调用方不把 None 写成 transcript_line。工具输出路径采用每会话命名空间，新日志记录准确指针，读侧兼容旧 tools/tool_id.log。主日志全文重复属于格式迁移问题，本次 A 保持旧 JSONL 内容兼容，不实施 B 的新持久队列。
-
-验收路径穿越/绝对越界/符号链接、非法或损坏快照、先成功后失败与重试、失败写入不推进行号、相同 call_id 跨会话不覆盖、旧会话回放。
-
-### 5.3 入梦证据与档案存储
-
-入梦复用会话分桶和有效回滚视图，物理行号／内容摘要值／片段偏移由自身资料收集器登记，不把 JSONL 列表下标当物理行号。档案、准备记录、反向版本、处理游标、代码依据索引和晨报放在独立受限存储；不改原 JSONL 格式、源码快照或 `/undo` 语义。用户／项目档案分开提交，部分成功如实报告。具体恢复与写入边界见 [09 入梦](09_anamnesis.md)。
-
-### 5.4 上下文状态记录（2026-09-30）
-
-`compaction` 为统计审计记录，不能代表可恢复上下文。新增 `context_state` 为同文件、版本 1 的压缩状态记录；角色 system，独立 state 字段，界面不显示为聊天消息，完整原始历史不改。恢复必须先应用 rewind，再校验绑定历史内容与数量；不得只按 tokens_after 恢复。详细接口、失败与测试见 [02 §5.3](02_context.md#53-压缩状态跨进程恢复修复2026-09-30)。
-
-状态：已实现，新增 18 项跨恢复用例，全量 1949 项／3212 子用例通过。记录的 state 结构如下：
-
-| 字段 | 格式与约束 |
+| 源码 | 职责 |
 |---|---|
-| version | 整数 1；不支持版本告警并尝试更早状态 |
-| history_count / covered | 来源单元数量／覆盖边界；单个工具结果为一单元，不能切开原始工具批次 |
-| history_digest | 原始角色、正文与工具内容的 SHA-256；排除推理及回放元数据，绑定快照之前的有效分支 |
-| prefix | 通过 Message 校验的折叠前缀，包含逐轮摘要／归档索引或全局备忘录 |
-| tools | 尾部来源单元下标及已归档工具块；调用 ID 必须匹配，归档必须存在 |
-| epochs / working_set | 折叠区间账本与已读取文件节选；恢复后下一 epoch ID 接续 |
+| [manager.py](../../src/logox/store/manager.py)、[slug.py](../../src/logox/store/slug.py) | 工作区分桶、会话元数据、最近会话、软删除 |
+| [persistence.py](../../src/logox/store/persistence.py) | 事件落盘 |
+| [replay.py](../../src/logox/store/replay.py) | 旧格式兼容、有效分支、消息与界面回放 |
+| [context/storage.py](../../src/logox/context/storage.py) | 追加、行号、工具原文 |
+| [blob.py](../../src/logox/store/blob.py)、[checkpoint.py](../../src/logox/store/checkpoint.py) | 内容快照、检查点与结果模型 |
+| [rewind.py](../../src/logox/store/rewind.py) | 冲突、预检、恢复和诚实失败 |
 
-状态由上下文构建器在有效变化后写入，不依赖 debug dump 或退出钩子；统计 compaction 事件继续独立保留。普通 build 不重复写状态，写入失败下一次 build 重试；不覆盖／删除旧日志。状态列出来源单元而非内存对象 ID，恢复后重新绑定对象引用。启动 resume、热切换及回滚共用上下文恢复方法，原始消息重建和时间线展示仍保持原有格式。
-
-### 5.5 会话记录时间戳契约（2026-10-05，已实现并通过离线验收）
-
-用户要求助手回复、工具结果、压缩等记录保留时间，缺失历史使用占位符；此处沿用既有 JSONL／事件协议，不引入新模块或迁移真实档案。统一字段 timestamp，数值为 Unix 秒（可含小数），缺失为 JSON null。持久化订阅者对 user_prompt／model_output／tool_result／compaction／checkpoint／session_rewind／turn_finished 显式传 event.ts：分别表示对应事件创建时刻，模型与工具输出为请求／调用完成事件的时间，而非开始时间。duration_ms 保留为耗时，不能代替时刻。
-
-SessionTranscriptWriter.write_step 默认给没有传入时间的内部记录使用当前创建时刻；显式 null 表示未知，不自动伪造。context_state／anamnesis_ref 也由此具备 timestamp。新 session_init 同时保留既有 created_at 并写同值 timestamp。旧日志读取仅在返回记录中补 timestamp（优先旧 ts，否则 null），不覆盖已有明确 null，不修改原 JSONL、mtime、行号或证据摘要；不从会话文件名／文件修改时间推测逐条发生时间。
-
-失败边界：未知时间保留，入梦将非有限值、非正数／旧 0 哨兵等无效时间归为 null；不得当作 1970 年或当前时刻。正常 resume／rewind、压缩状态绑定不受新增元数据影响。验收覆盖所有持久化事件保留 event.ts（延迟写入不改事件时间）、内部写入默认时刻、显式未知、新会话头、旧 ts 兼容与原文件字节不变，以及压缩状态恢复回归。新增时间戳及入梦联动测试 31 项通过；全量 2099 passed / 3215 subtests passed（88.11s），源码及新增测试 Ruff 通过。测试入口 tests/unit/test_record_timestamps.py、tests/anamnesis/test_timestamps.py；证据在 .test-tmp/timestamps-focused.txt 与 timestamps-full.txt。
+验证新旧日志、损坏尾行、相同调用 ID 隔离、摘要/Diff 恢复、压缩→退出→resume、外部漂移、预检不写入和部分恢复失败。入口：[存储](../../tests/unit/test_store.py)、[回滚](../../tests/unit/test_rewind.py)、[回放一致性](../../tests/unit/test_resume_fidelity.py)、[中断后配对恢复](../../tests/unit/test_tool_pairing_recovery.py)、[时间戳](../../tests/unit/test_record_timestamps.py)、[压缩状态](../../tests/unit/test_context_state_resume.py)。磁盘失败需要诊断，不把“会话继续运行”写成“数据已经保存”。

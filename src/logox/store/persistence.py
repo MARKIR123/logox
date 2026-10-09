@@ -59,6 +59,8 @@ class SessionPersistenceSubscriber:
                 "input_tokens": event.usage.input_tokens,
                 "output_tokens": event.usage.output_tokens,
                 "duration_ms": event.duration_ms,
+                "stop_reason": event.stop_reason,
+                "raw_stop_reason": event.raw_stop_reason,
             }
             extra: dict[str, Any] = {}
             if full_reasoning:

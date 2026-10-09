@@ -14,11 +14,12 @@ from logox.anamnesis.service import AnamesisService
 from logox.anamnesis.sources import SourceCollector
 from logox.config.schema import AnamesisConfig
 from logox.kernel.bus import EventBus
-from logox.providers.base import DeltaEvent, StopEvent
+from logox.providers.base import DeltaEvent, StopEvent, ToolCallEvent
 from logox.tui.render.app import InlineApp
 from logox.tui.render.fullscreen import FullscreenApp
 from logox.tui.render.keys import Key
 from logox.tui.render.terminal import FakeTerminal
+from tests.anamnesis.support import finish_calls
 from tests.anamnesis.test_runtime import TempCase
 
 
@@ -92,8 +93,12 @@ class MixedProvider:
                         status="observed",
                     )
                 )
-            response = MemoryProposal(analyses=[analysis], changes=changes).model_dump()
-        yield DeltaEvent(kind="text", text=json.dumps(response, ensure_ascii=False))
+            response = MemoryProposal(analyses=[analysis], changes=changes, complete=True).model_dump()
+        if "changes" not in payload:
+            for call in finish_calls(payload, response):
+                yield call
+        else:
+            yield DeltaEvent(kind="text", text=json.dumps(response, ensure_ascii=False))
         yield StopEvent(stop_reason="end_turn")
 
 
@@ -123,7 +128,7 @@ class PartialAcceptanceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         return service
 
     async def finish(self, service):
-        self.assertEqual(await service.start("nap"), "已开始入梦")
+        self.assertEqual(await service.start(), "已开始入梦")
         await asyncio.wait_for(service._task, 5)
 
     async def test_mixed_acceptance_saves_only_approved_and_keeps_candidates_in_history(self):
@@ -147,7 +152,7 @@ class PartialAcceptanceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         history = await service.history("chat")
         candidates = [e for e in history[0]["events"] if e.change and e.change.status == "candidate"]
         self.assertEqual(len(candidates), 2)
-        self.assertEqual(await service.start("nap"), "无可整理内容")
+        self.assertEqual(await service.start(), "无可整理内容")
         self.assertEqual(len(provider.requests), 2)
 
     async def test_all_candidates_are_completed_review_and_do_not_retry_unchanged_sources(self):
@@ -160,7 +165,7 @@ class PartialAcceptanceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.home / "ANAMNESIS.md").exists())
         self.assertFalse((self.project / "ANAMNESIS.md").exists())
         self.assertEqual(len(service.store.global_processed()), 2)
-        self.assertEqual(await service.start("nap"), "无可整理内容")
+        self.assertEqual(await service.start(), "无可整理内容")
         self.assertEqual(len(provider.requests), 1)
 
     async def test_semantic_rejection_is_candidate_but_bad_review_contract_still_fails(self):
@@ -250,6 +255,13 @@ class PartialAcceptanceTests(TempCase, unittest.IsolatedAsyncioTestCase):
         class SameEntryProvider(MixedProvider):
             async def stream(self, request):
                 async for event in super().stream(request):
+                    if isinstance(event, ToolCallEvent) and event.name == "propose_memory":
+                        response = dict(event.arguments)
+                        if response["changes"]:
+                            change = response["changes"][0]
+                            change.update(entry_id="known_gaps", scope="project", status="observed")
+                            response["changes"] = [change]
+                            event = event.model_copy(update={"arguments": response})
                     if isinstance(event, DeltaEvent):
                         response = json.loads(event.text)
                         if "changes" in response:
@@ -259,7 +271,7 @@ class PartialAcceptanceTests(TempCase, unittest.IsolatedAsyncioTestCase):
                             event = DeltaEvent(kind="text", text=json.dumps(response, ensure_ascii=False))
                     yield event
 
-        service = self.service(SameEntryProvider(), window=8000)
+        service = self.service(SameEntryProvider(), window=10000)
         self.addAsyncCleanup(service.aclose)
         await self.finish(service)
         run_id = service.status().run_id
@@ -344,7 +356,7 @@ class FreshnessTests(TempCase, unittest.IsolatedAsyncioTestCase):
             analysis_record_id="a",
             status="observed" if scope == "project" else "explicit",
         )
-        return MemoryProposal(analyses=[analysis], changes=[change])
+        return MemoryProposal(complete=True, analyses=[analysis], changes=[change])
 
     async def test_old_tool_plus_new_assistant_cannot_make_historical_state_current(self):
         old = next(r for r in self.refs if r.kind == "tool_result")

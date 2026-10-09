@@ -20,6 +20,7 @@ from typing import Any
 from logox.context.anamnesis import AnamesisMemory
 from logox.context.compaction import CompactionResult, Compactor, FoldedEpoch
 from logox.context.memory import ProjectMemory, find_project_memory
+from logox.context.persona import PersonaMemory
 from logox.context.storage import SessionTranscriptWriter
 from logox.context.tokens import TokenEstimator, TokenLedger, estimate_text_tokens
 from logox.kernel.events import Usage
@@ -202,6 +203,9 @@ class HierarchicalContextBuilder:
         anamnesis_home: Path | None = None,
         anamnesis_enabled: bool = False,
         anamnesis_ratio: float = 0.05,
+        #: ★ 用户级人设文件（``~/.logox/LOGOX.md``）。存在则作为 system 第一段注入；
+        #: 缺失/超限/损坏时回落内置人设，并在 ``/reload`` 报告里说明原因。
+        persona_path: Path | None = None,
     ) -> None:
         self.base_system = system
         self.skill_manager = skill_manager
@@ -237,6 +241,9 @@ class HierarchicalContextBuilder:
         )
 
         self.project_memory_enabled = project_memory_enabled
+        #: 用户级人设（★ 2026-10-09 接通）：这份文件以前**没有任何读取方**，
+        #: 于是"改了 ~/.logox/LOGOX.md 却毫无反应"。现在它是 system 的第一段。
+        self.persona = PersonaMemory(persona_path)
         self.anamnesis_memory = AnamesisMemory(self.cwd, anamnesis_home,
                                                enabled=anamnesis_enabled, project_enabled=project_memory_enabled,
                                                ratio=anamnesis_ratio)
@@ -284,6 +291,46 @@ class HierarchicalContextBuilder:
         self.anamnesis_memory._cache.clear()
         return self.memory
 
+    def refresh_persona(self) -> PersonaMemory:
+        """重新读取用户级人设（`/reload` 用；见 D197 与 `docs/development/designs/2026-10-09-user-persona-loading.md`）。
+
+        为什么单独一个方法：它和项目记忆**发现方式不同**（一个固定路径、一份文件），
+        失败语义也不同 —— 项目规范缺失不算问题，人设读不进来必须能被说出来。
+        """
+        self.persona.load()
+        return self.persona
+
+    def _persona_block(self) -> str:
+        """人设段的文本；若该文件已作为**项目记忆**被发现，则不重复注入。
+
+        重复从哪来：项目记忆的发现规则包含"每一层的 ``.logox/`` 子目录"，而
+        ``~/.logox/LOGOX.md`` 正是 home 那一层的 ``.logox/LOGOX.md``。于是当 cwd
+        恰好是 home（``~/.logox/anamnesis/windows.json`` 里就有这种记录）时，
+        同一份文本会被两条规则同时找到。此时保留项目记忆那一份（它带路径标注），
+        人设段让位，避免同一段文本在 system 里出现两次。
+        """
+        if not self.persona.loaded:
+            return ""
+        persona_path = self.persona.source()
+        if persona_path:
+            for src in self.memory.sources:
+                if os.path.normcase(str(src.path).replace("\\", "/")) == os.path.normcase(persona_path):
+                    return ""
+        return self.persona.block
+
+    def memory_source_paths(self) -> list[str]:
+        """本次请求**实际会用到**的记忆来源（统一正斜杠），供 `/status` 与事件展示。
+
+        以前这里有两处各写一遍的列表推导（只算项目记忆 + 背景记忆，漏掉人设），
+        而 `app.py` 的 `SessionStart` 又写了第三遍（只算项目记忆）。三处口径不同 ⇒
+        界面显示"记忆文件 1 份"，而请求里其实有三份。现在只有这一个入口。
+        """
+        paths = [str(s.path) for s in self.memory.sources]
+        if self._persona_block() and self.persona.path is not None:
+            paths.insert(0, str(self.persona.path))
+        paths.extend(self.anamnesis_memory.sources)
+        return [p.replace("\\", "/") for p in paths]
+
     def record_usage(self, estimated_tokens: int, usage: Usage) -> None:
         """在收到大模型返回时，利用真实的 input_tokens 动态校准估算器。"""
         if usage.input_tokens > 0 and estimated_tokens > 0:
@@ -320,8 +367,14 @@ class HierarchicalContextBuilder:
         self.anamnesis_memory.refresh(window=self.window_capacity, available=available)
 
     def _assemble_system_prompt(self, *, include_anamnesis: bool = True) -> str:
-        """组装顶层系统人设：基础人设 + LOGOX.md 长期记忆 + 技能包渐进索引 + 回合摘要契约。"""
-        parts = [self.base_system.rstrip()] if self.base_system.strip() else []
+        """组装顶层系统人设：用户级人设 + 基础人设 + LOGOX.md 长期记忆 + 技能包索引 + 回合摘要契约。"""
+        parts: list[str] = []
+        # ★ 人设在最前：身份先立，规则随后（越具体越靠后的既有拓扑不变）。
+        persona_block = self._persona_block()
+        if persona_block:
+            parts.append(persona_block)
+        if self.base_system.strip():
+            parts.append(self.base_system.rstrip())
         memory_block = self.memory.render_system_prompt_block()
         if memory_block:
             parts.append(memory_block.strip())
@@ -428,7 +481,7 @@ class HierarchicalContextBuilder:
             sent_count=len(result.messages), predicted_tokens=result.tokens_after
         )
 
-        memory_paths = [str(s.path).replace("\\", "/") for s in self.memory.sources] + self.anamnesis_memory.sources
+        memory_paths = self.memory_source_paths()
 
         # ★ D156：把"压缩到底做了什么"翻译成**内核侧的中性报告**（纯数据，不做 IO）。
         #   内核拿到它才会发布 `CompactionFinished` —— 在补上这条线之前，
@@ -500,7 +553,7 @@ class HierarchicalContextBuilder:
             sent_count=len(result.messages), predicted_tokens=result.tokens_after
         )
 
-        memory_paths = [str(s.path).replace("\\", "/") for s in self.memory.sources] + self.anamnesis_memory.sources
+        memory_paths = self.memory_source_paths()
 
         folded = result.folded_from_index > 0
         report: CompactionReport | None = None

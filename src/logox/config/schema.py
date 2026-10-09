@@ -201,31 +201,15 @@ class AnamesisConfig(BaseModel):
     enabled: bool = True
     memory_enabled: bool = True
     idle_seconds: int = Field(default=1800, gt=0)
-    sleep_start: str = "00:00"
-    sleep_end: str = "08:00"
     provider: Literal["ollama", "lm-studio"] = "ollama"
     model: str = ""
     request_timeout_s: float = Field(default=180.0, gt=0, description="入梦连续无模型数据期限（秒），非请求总时长")
-    nap_max_steps: int = Field(default=4, gt=0)
-    sleep_max_steps: int = Field(default=64, gt=0)
+    repeat_trigger_count: int = Field(default=3, gt=0)
+    self_check_max_attempts: int = Field(default=2, gt=0)
     user_archive_tokens: int = Field(default=800, gt=0)
     project_archive_tokens: int = Field(default=1600, gt=0)
     prompt_memory_max_ratio: float = Field(default=0.05, gt=0, le=0.2)
 
-    @field_validator("sleep_start", "sleep_end")
-    @classmethod
-    def _clock_time(cls, value: str) -> str:
-        import re
-
-        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
-            raise ValueError("时段必须是 HH:MM，例如 00:00")
-        return value
-
-    @model_validator(mode="after")
-    def _distinct_times(self) -> AnamesisConfig:
-        if self.sleep_start == self.sleep_end:
-            raise ValueError("长眠开始和结束时刻不能相同")
-        return self
 
 
 class ShellConfig(BaseModel):
@@ -459,6 +443,8 @@ class LastUsed(BaseModel):
     model: str | None = None
     theme: str | None = None
     effort: str | None = None
+    anamnesis_provider: str | None = None
+    anamnesis_model: str | None = None
     #: **从端点抓到的真实模型列表**（`provider_name -> [model_id, ...]`）。
     #:
     #: 为什么要缓存它：抓取要发一次网络请求（本机实测很慢），而 `/model` 是个

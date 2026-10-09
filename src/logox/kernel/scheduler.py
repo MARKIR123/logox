@@ -181,6 +181,21 @@ class Scheduler:
     # 主入口
     # ------------------------------------------------------------------ #
 
+    async def reject_batch(
+        self, turn: Turn, calls: Sequence[ToolCallEvent], *, content: str, error_kind: str
+    ) -> list[ToolResultBlock]:
+        """不完整响应中的整批调用只配对结果，不授权、不执行。"""
+        for call in calls:
+            await self._emit_requested(turn, call, batch_size=len(calls))
+        results = []
+        for call in calls:
+            await self._emit_pair(
+                turn, call, ok=False, digest=content, content=content, error_kind=error_kind
+            )
+            results.append(ToolResultBlock(id=call.call_id, ok=False, content=content))
+        turn.tool_call_count += len(calls)
+        return results
+
     async def run_batch(self, turn: Turn, calls: Sequence[ToolCallEvent]) -> list[ToolResultBlock]:
         """执行一批工具调用，返回**按模型给出顺序**排列的工具结果。"""
         if not calls:

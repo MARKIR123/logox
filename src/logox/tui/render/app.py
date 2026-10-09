@@ -1010,14 +1010,16 @@ class InlineApp:
 
 
     async def ask_continuation(self, turn: Any, iteration: int) -> bool:
-        """（HITL 人在回路轮次续期）当达到 50 步工具循环预算时，弹出 Pi 风格独占提示框询问是否继续。"""
+        """达到模型请求步数预算时，询问是否按当前配置继续。"""
         from logox.tui.content.overlay import Choice, PickerState
         from logox.tui.render.components.overlay import PickerComponent
 
-        title = "人在回路确认 (HITL)"
+        config = getattr(self.runtime, "config", None)
+        steps = getattr(getattr(config, "kernel", None), "max_iterations", 50)
+        title = f"人在回路确认 (HITL) · 已运行 {iteration} 步"
         choices = [
-            Choice(value="continue", label="[1] 继续执行 50 步工具调用"),
-            Choice(value="stop", label="[2] 终止执行并让助手回答"),
+            Choice(value="continue", label=f"[1] 继续执行 {steps} 步模型请求"),
+            Choice(value="stop", label="[2] 停止本回合（尚未完成）"),
         ]
         state = PickerState(
             title=title,

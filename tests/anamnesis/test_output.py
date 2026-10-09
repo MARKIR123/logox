@@ -60,7 +60,7 @@ class OutputTests(TempCase, unittest.IsolatedAsyncioTestCase):
     async def test_long_reasoning_is_complete_on_disk_bounded_in_preview_and_restored(self):
         provider = LongProvider()
         service = self.service(provider)
-        await service.start("nap")
+        await service.start()
         await service._task
         self.assertEqual(service.status().phase, "completed", service.status().reason)
         self.assertTrue(all(r.max_tokens is None for r in provider.requests))
@@ -101,7 +101,7 @@ class OutputTests(TempCase, unittest.IsolatedAsyncioTestCase):
 
     async def test_server_truncation_preserves_reasoning_usage_and_never_commits_even_valid_json(self):
         service = self.service(TruncatedProvider())
-        await service.start("nap")
+        await service.start()
         await service._task
         self.assertEqual(service.status().phase, "failed")
         self.assertIn("4096 token", service.status().reason)
@@ -128,7 +128,7 @@ class OutputTests(TempCase, unittest.IsolatedAsyncioTestCase):
         await reopened.aclose()
 
     async def test_large_final_text_is_not_cut_by_previous_character_limit(self):
-        body = " " * 130000 + MemoryProposal().model_dump_json()
+        body = " " * 130000 + MemoryProposal(complete=True).model_dump_json()
 
         class Provider:
             async def stream(self, request):

@@ -188,6 +188,15 @@ class StateStore:
 
         self.update(transform)
 
+    def set_last_anamnesis_model(self, *, provider: str, model: str) -> None:
+        """Persist sleep selection independently of the foreground model."""
+        def transform(state: StateFile) -> StateFile:
+            state.last.anamnesis_provider = provider
+            state.last.anamnesis_model = model
+            return state
+
+        self.update(transform)
+
     def set_theme(self, theme: str) -> None:
         def transform(state: StateFile) -> StateFile:
             state.last.theme = theme
@@ -399,6 +408,12 @@ class LayeredStateStore:
         if self.project_store.path != self.global_store.path:
             with contextlib.suppress(Exception):
                 self.project_store.set_last_model(provider=provider, model=model)
+
+    def set_last_anamnesis_model(self, *, provider: str, model: str) -> None:
+        self.global_store.set_last_anamnesis_model(provider=provider, model=model)
+        if self.project_store.path != self.global_store.path:
+            with contextlib.suppress(Exception):
+                self.project_store.set_last_anamnesis_model(provider=provider, model=model)
 
     def set_theme(self, theme: str) -> None:
         self.global_store.set_theme(theme)

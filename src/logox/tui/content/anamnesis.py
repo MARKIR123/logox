@@ -28,7 +28,7 @@ PHASES = {
 @dataclass
 class AnamesisCard:
     run_id: str
-    mode: str = "nap"
+    mode: str = ""
     phase: str = "collecting"
     question: str = ""
     reason: str = ""
@@ -41,6 +41,9 @@ class AnamesisCard:
     operations: dict = field(default_factory=dict)
     findings: list[str] = field(default_factory=list)
     plan: list[str] = field(default_factory=list)
+    research_items: list[dict] = field(default_factory=list)
+    research_item_count: int = 0
+    self_checks: list[dict] = field(default_factory=list)
     revision: int = 0
     detail_revision: int = 0
     started_at: float = 0
@@ -64,6 +67,15 @@ class AnamesisCard:
         self.reason = event.reason if event.kind == "started" else event.reason or self.reason
         self.report_path = event.report_path or self.report_path
         self.started_at = event.started_at or self.started_at
+        research_state = getattr(event, "research_state", None)
+        if research_state is not None:
+            self.research_items = research_state.get("items", [])[-64:]
+            self.research_item_count = len(research_state.get("items", []))
+            self.detail_revision += 1
+        check = getattr(event, "self_check", None)
+        if check:
+            self.self_checks = [*self.self_checks, check][-16:]
+            self.detail_revision += 1
         if event.timestamp and self.started_at:
             self.elapsed = int(max(0, event.timestamp - self.started_at))
         if event.delta:
@@ -111,6 +123,9 @@ class AnamesisCard:
         card.operations = dict(list(preview.get("operations", {}).items())[-32:])
         card.findings = preview.get("findings", [])[-30:]
         card.plan = preview.get("plan", [])[-30:]
+        card.research_items = preview.get("research_items", [])[-64:]
+        card.research_item_count = preview.get("research_item_count", len(card.research_items))
+        card.self_checks = preview.get("self_checks", [])[-16:]
         phase = preview.get("phase", "interrupted")
         if not active and phase == "continuing":
             phase = "paused"
@@ -121,7 +136,7 @@ class AnamesisCard:
                 kind="restored",
                 run_id=card.run_id,
                 phase=phase,
-                mode=preview.get("mode", "nap"),
+                mode=preview.get("mode", ""),
                 session_id=preview.get("session_id", ""),
                 sequence=preview.get("sequence", 0),
                 started_at=preview.get("started_at", 0),
@@ -172,7 +187,7 @@ class AnamesisCard:
         if self._rendered_key == key and self._rendered is not None:
             return self._rendered
         out = Text()
-        mode = "长眠" if self.mode == "sleep" else "小憩"
+        mode = {"sleep": "历史长眠 · ", "nap": "历史小憩 · "}.get(self.mode, "")
         phase = PHASES.get(self.phase, self.phase)
         terminal_glyphs = {
             "completed": "✓",
@@ -184,7 +199,7 @@ class AnamesisCard:
         }
         activity = terminal_glyphs.get(self.phase, SPINNER_FRAMES[self.animation_frame])
         out.append(
-            f"{'▾' if expanded else '▸'} {activity} Anamnesis · {mode} · {phase} · {self.elapsed // 60}m{self.elapsed % 60:02d}s\n",
+            f"{'▾' if expanded else '▸'} {activity} Anamnesis · {mode}{phase} · {self.elapsed // 60}m{self.elapsed % 60:02d}s\n",
             style=f"bold {color}",
         )
         if self.question:
@@ -204,6 +219,36 @@ class AnamesisCard:
         header = out
         out = Text()
         if expanded:
+            labels = {
+                "pending": "待研究",
+                "active": "进行中",
+                "resolved": "有依据结论",
+                "waiting_evidence": "待验证",
+            }
+            if self.research_items:
+                out.append("\n  研究事项\n", style="bold")
+                for item in self.research_items:
+                    out.append(
+                        f"    {labels.get(item['status'], item['status'])} · {item['question'][:500]}\n"
+                    )
+                    for label, value in (
+                        ("纳入原因", item.get("reason")),
+                        ("结论", item.get("conclusion")),
+                        ("缺失依据", item.get("missing_evidence")),
+                    ):
+                        if value:
+                            out.append(f"      {label}：{value[:1200]}\n")
+                hidden = self.research_item_count - len(self.research_items)
+                if hidden:
+                    out.append(f"    另有 {hidden} 项，完整清单见报告\n", style="dim")
+            for check in self.self_checks:
+                out.append(
+                    f"\n  {'已保护暂停' if check['paused'] else '自检提醒'} · 第 {check['attempt']} 次\n",
+                    style="bold",
+                )
+                out.append(
+                    f"    {check['prompt'][:1800]}\n    提醒不代表已自愈；以之后的实际读取和事项处置为准。\n"
+                )
             for analysis in self.analyses.values():
                 out.append(f"\n  阶段 {analysis.stage_id}：{analysis.question[:350]}\n", style="bold")
                 for label, value in (

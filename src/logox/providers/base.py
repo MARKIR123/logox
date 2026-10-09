@@ -43,7 +43,10 @@ __all__ = [
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
-StopReason = Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "unknown"]
+StopReason = Literal[
+    "end_turn", "tool_use", "max_tokens", "stop_sequence", "unknown",
+    "pause_turn", "refusal", "content_filter", "context_limit",
+]
 
 #: 结束原因归一化。厂商用词不同（``stop`` / ``tool_calls`` / ``end_turn`` …），
 #: 内核需要的是**语义**而不是各家字符串。
@@ -53,14 +56,15 @@ _STOP_REASONS: dict[str, StopReason] = {
     "length": "max_tokens",
     "tool_calls": "tool_use",
     "function_call": "tool_use",
-    "content_filter": "end_turn",
+    "content_filter": "content_filter",
     # Anthropic
     "end_turn": "end_turn",
     "tool_use": "tool_use",
     "max_tokens": "max_tokens",
     "stop_sequence": "stop_sequence",
-    "pause_turn": "end_turn",
-    "refusal": "end_turn",
+    "pause_turn": "pause_turn",
+    "refusal": "refusal",
+    "model_context_window_exceeded": "context_limit",
 }
 
 
@@ -158,6 +162,7 @@ class UsageEvent(ProviderEvent):
 
 class StopEvent(ProviderEvent):
     stop_reason: StopReason
+    raw_stop_reason: str | None = None
     model: str = ""
 
 

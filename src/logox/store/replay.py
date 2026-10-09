@@ -20,6 +20,7 @@ from logox.kernel.messages import (
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    complete_tool_results,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,8 @@ def reconstruct_messages(
     2. 还原 tool 结果消息时，确保其与紧跟的前序 assistant 消息的 tool_calls 严格对齐；
        若历史记录因异常中断或历史格式缺陷导致 assistant 未登记该 tool_call，
        自动自愈（Self-Healing）向前序 assistant 补齐对应的 ToolUseBlock，
-       彻底避免 OpenAI / DeepSeek 端点报 400（'Messages with role tool must be a response to a preceding message with tool_calls'）。
+    3. 每批调用缺少结果时，在下一条非工具消息之前补失败结果，尾部批次同样补齐；
+       不重新执行工具、不修改原始记录。两种方向共同避免 OpenAI / DeepSeek 端点报 400（'Messages with role tool must be a response to a preceding message with tool_calls'）。
     """
     messages: list[Message] = []
     #: 最近一次追加的 assistant 消息下标；`turn_finished` 记录靠它把摘要**回刻**上去（F-33）。
@@ -239,7 +241,9 @@ def reconstruct_messages(
             for message, number in zip(messages, lines, strict=True)
         ]
 
-    return messages
+    # 另一方向也要恢复：中断或未开始的调用可能根本没有 tool_result 记录。
+    # 在盖完真实行号后补齐，合成消息不冒充原始记录。
+    return complete_tool_results(messages)
 
 
 

@@ -10,7 +10,14 @@ from pathlib import Path
 
 from logox.anamnesis.coordinator import project_identity
 from logox.anamnesis.io import FileLock, atomic_write, guarded_path, read_json, write_json
-from logox.anamnesis.models import ArchiveSnapshot, MemoryChange, MemoryEntry, SourceRef, digest_text
+from logox.anamnesis.models import (
+    ArchiveSnapshot,
+    MemoryChange,
+    MemoryEntry,
+    MemoryProposal,
+    SourceRef,
+    digest_text,
+)
 from logox.context.tokens import estimate_text_tokens
 
 MARKER = "<!-- LOGOX ANAMNESIS v1 -->"
@@ -183,9 +190,45 @@ class ArchiveStore:
         return results
 
     def progress(self) -> dict:
-        return read_json(
+        value = read_json(
             self._path(f"progress/{self.project_key}.json"), {"processed": [], "sleep_fingerprint": ""}
         )
+        if not isinstance(value, dict) or not isinstance(value.get("processed"), list):
+            raise ValueError("已审资料进度损坏")
+        return {
+            **value,
+            "code_fingerprint": value.get("code_fingerprint", value.get("sleep_fingerprint", "")),
+            "code_files": value.get("code_files", {}),
+        }
+
+    def committed_proposal(self, proposal: MemoryProposal, snapshots: dict, started_at: float) -> dict:
+        """A completed journal plus the current managed digest proves an interrupted commit.
+
+        Matching MD text alone is insufficient: it may have been written by the user.
+        """
+        found = {}
+        folder = self._path("revisions")
+        if not folder.exists():
+            return found
+        expected = {(c.scope, c.entry_id): c.model_dump() for c in proposal.changes}
+        for path in sorted(folder.glob("*.json")):
+            data = read_json(path, {})
+            scope = data.get("scope")
+            snapshot = snapshots.get(scope)
+            if (
+                data.get("state") != "committed"
+                or data.get("project_id") != self.project_id
+                or data.get("time", 0) < started_at
+                or snapshot is None
+                or not snapshot.managed
+                or snapshot.digest != data.get("new_digest")
+            ):
+                continue
+            for change in data.get("changes", []):
+                key = (scope, change["entry_id"])
+                if expected.get(key) == change:
+                    found[key] = data["id"]
+        return found
 
     def save_source(self, source: SourceRef) -> None:
         if source.kind != "code" or source.project_id != self.project_id or not source.source_id.isalnum():
@@ -209,15 +252,23 @@ class ArchiveStore:
         return set(read_json(self._path("progress/user.json"), {"processed": []})["processed"])
 
     def save_progress(
-        self, processed: set[str], *, project_processed: set[str] | None = None, sleep_fingerprint: str = ""
+        self,
+        processed: set[str],
+        *,
+        project_processed: set[str] | None = None,
+        code_fingerprint: str = "",
+        code_files: dict | None = None,
     ) -> None:
         with FileLock(self._path("locks/progress.lock")):
             old = self.progress()
             old["processed"] = sorted(
                 set(old["processed"]) | (processed if project_processed is None else project_processed)
             )
-            if sleep_fingerprint:
-                old["sleep_fingerprint"] = sleep_fingerprint
+            old["schema_version"] = 2
+            old.pop("sleep_fingerprint", None)
+            if code_fingerprint:
+                old["code_fingerprint"] = code_fingerprint
+                old["code_files"] = code_files or {}
             write_json(self._path(f"progress/{self.project_key}.json"), old)
             user = self.global_processed() | processed
             write_json(self._path("progress/user.json"), {"processed": sorted(user)})
@@ -314,9 +365,15 @@ class ArchiveStore:
         preview.update(run_id=run_id, session_id=data["session_id"], sequence=data["sequence"])
         if data.get("kind") == "started":
             preview["reason"] = ""
-        for key in ("mode", "phase", "question", "reason", "started_at", "report_path"):
+        for key in ("schema_version", "mode", "phase", "question", "reason", "started_at", "report_path"):
             if data.get(key):
                 preview[key] = data[key]
+        if data.get("research_state") is not None:
+            state = data["research_state"]
+            preview["research_items"] = state.get("items", [])[-64:]
+            preview["research_item_count"] = len(state.get("items", []))
+        if data.get("self_check"):
+            preview["self_checks"] = [*preview.get("self_checks", []), data["self_check"]][-16:]
         preview["timestamp"] = data["timestamp"]
         for key in ("findings", "plan"):
             if data.get(key):

@@ -97,11 +97,11 @@ class PlainTurnTests(unittest.IsolatedAsyncioTestCase):
         await env.kernel.submit("在吗")
         self.assertEqual(env.kernel.history[0].role, "user")
 
-    async def test_t06_empty_reply_still_ends_the_turn(self) -> None:
-        """模型什么都没说也要正常收尾——否则界面的转圈动画永远停不下来。"""
+    async def test_t06_empty_reply_ends_as_failed(self) -> None:
+        """空响应明确报错并收尾，不能标记成功或继续转圈。"""
         env = install([{"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}])
         turn = await env.kernel.submit("在吗")
-        self.assertIs(turn.status, TurnStatus.DONE)
+        self.assertIs(turn.status, TurnStatus.FAILED)
         self.assertEqual(env.kernel.history[-1].text, "")
 
     async def test_t07_turn_index_increments(self) -> None:
@@ -576,7 +576,7 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(finished.cost_usd)
 
     async def test_t62_reported_usage_sets_the_flag_and_the_cost(self) -> None:
-        env = install([chunks(*text_chunks("你好")[:-1], usage_chunk(1000, 500, cached=400))])
+        env = install([chunks(*text_chunks("你好"), usage_chunk(1000, 500, cached=400))])
         await env.kernel.submit("在吗")
         finished = env.recorder.find("model_request_finished")
         self.assertTrue(finished.usage_reported)
@@ -584,17 +584,17 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_t63_cached_none_and_zero_stay_distinct_end_to_end(self) -> None:
         """D39：未上报 → 状态栏整项不显示；真的 0 → 显示 ``cache 0%``。"""
-        env = install([chunks(*text_chunks("a")[:-1], usage_chunk(10, 5))])
+        env = install([chunks(*text_chunks("a"), usage_chunk(10, 5))])
         await env.kernel.submit("一")
         self.assertIsNone(env.recorder.of("model_request_finished")[0].usage.cached_input_tokens)
 
-        env = install([chunks(*text_chunks("b")[:-1], usage_chunk(10, 5, cached=0))])
+        env = install([chunks(*text_chunks("b"), usage_chunk(10, 5, cached=0))])
         await env.kernel.submit("二")
         self.assertEqual(env.recorder.of("model_request_finished")[0].usage.cached_input_tokens, 0)
 
     async def test_t64_turn_usage_is_the_sum_of_requests(self) -> None:
-        script = [chunks(*tool_chunks([("c1", "read", {})])[:-1], usage_chunk(100, 10)),
-                  chunks(*text_chunks("ok")[:-1], usage_chunk(200, 20))]
+        script = [chunks(*tool_chunks([("c1", "read", {})]), usage_chunk(100, 10)),
+                  chunks(*text_chunks("ok"), usage_chunk(200, 20))]
         env = install(script, tools=[StubTool()])
         turn = await env.kernel.submit("读")
         self.assertEqual(turn.usage_total.input_tokens, 300)
@@ -603,8 +603,8 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_t65_unreported_cache_never_becomes_a_fake_zero_in_the_total(self) -> None:
         """保守合并：任一次未上报，整个回合就记为未上报（``None``）。"""
-        script = [chunks(*tool_chunks([("c1", "read", {})])[:-1], usage_chunk(100, 10, cached=50)),
-                  chunks(*text_chunks("ok")[:-1], usage_chunk(200, 20))]
+        script = [chunks(*tool_chunks([("c1", "read", {})]), usage_chunk(100, 10, cached=50)),
+                  chunks(*text_chunks("ok"), usage_chunk(200, 20))]
         env = install(script, tools=[StubTool()])
         turn = await env.kernel.submit("读")
         self.assertIsNone(turn.usage_total.cached_input_tokens)
@@ -684,8 +684,8 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
         finished = env.recorder.find("turn_finished")
         self.assertEqual(finished.turn_summary, "直接修复了某问题")
 
-    async def test_t71_pure_reasoning_triggers_silent_continuation(self) -> None:
-        """D118：模型第 1 次仅返回纯思考时，不结轮、不生成摘要，自动发起静默续写接力。"""
+    async def test_t71_natural_reasoning_only_does_not_continue(self) -> None:
+        """自然停止但没有正文：失败，不把它猜成截断。"""
         chunk_stream_1 = [
             {"choices": [{"index": 0, "delta": {"reasoning_content": "我在推导动画算法..."}, "finish_reason": None}]},
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
@@ -694,14 +694,10 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
         env = install([chunk_stream_1, chunk_stream_2])
 
         turn = await env.kernel.submit("帮我写个网页")
-        self.assertIs(turn.status, TurnStatus.DONE)
-        # 验证历史记录严格保持角色交替且包含系统续写提示
-        roles = [m.role for m in env.kernel.history]
-        self.assertEqual(roles, ["user", "assistant", "user", "assistant"])
-        self.assertIn("思考已结束或单次输出已达上限", env.kernel.history[2].text)
-        # 验证最终输出了正文，且提取了正文的摘要
-        self.assertEqual(env.kernel.history[-1].text, "这是最终的网页正文内容")
-        self.assertEqual(turn.turn_summary, "这是最终的网页正文内容")
+        self.assertIs(turn.status, TurnStatus.FAILED)
+        self.assertEqual([m.role for m in env.kernel.history], ["user", "assistant"])
+        self.assertEqual(len(env.recorder.of("model_request_started")), 1)
+        self.assertIsNone(turn.summary_source)
 
     async def test_t72_pure_reasoning_does_not_generate_turn_summary_when_empty(self) -> None:
         """D118：纯思考未产出有效交付物时，严禁伪造‘完成第 X 轮交互’假摘要。"""
@@ -716,13 +712,13 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
         # 绝不出现兜底的"完成第 1 轮交互"
         self.assertNotEqual(turn.turn_summary, "完成第 1 轮交互")
 
-    async def test_t73_pure_reasoning_continuation_limit_enforced(self) -> None:
-        """D118：续写次数超过 max_continuations 时安全退出，绝不陷入死循环。"""
+    async def test_t73_truncated_reasoning_iteration_limit_enforced(self) -> None:
+        """截断续写共用回合迭代限制。"""
         chunk_stream = [
             {"choices": [{"index": 0, "delta": {"reasoning_content": "一直思考停不下来"}, "finish_reason": None}]},
-            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
         ]
-        env = install([chunk_stream, chunk_stream, chunk_stream])
+        env = install([chunk_stream, chunk_stream, chunk_stream], max_iterations=3)
         turn = await env.kernel.submit("提问")
         self.assertIs(turn.status, TurnStatus.FAILED)
         finished = env.recorder.find("turn_finished")
@@ -769,13 +765,13 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
         turn = await env.kernel.submit("修改动画代码")
         self.assertIs(turn.status, TurnStatus.DONE)
 
-        # 验证截断前的半句话与自愈提示均已保留进历史
-        user_healing_msgs = [m for m in env.kernel.history if m.role == "user" and "严禁使用 write 工具" in m.text]
-        self.assertEqual(len(user_healing_msgs), 1, "必须注入一条自愈指引消息")
+        # 部分正文保留，控制指引不能制造新的用户回合。
+        self.assertEqual(sum(m.role == "user" for m in env.kernel.history), 1)
+        self.assertEqual(env.kernel.history[1].text, "我来给动画加交互：")
         self.assertEqual(env.kernel.history[-1].text, "已改用局部修改，动画交互已成功加入！")
 
     async def test_t76_tool_argument_truncation_limit_enforced(self) -> None:
-        """D121：工具参数截断连续超出自愈次数限制时安全报错退出，防死循环。"""
+        """工具参数截断使用同一回合步数上限，防止无限继续。"""
         chunk_stream_fail = [
             {
                 "choices": [
@@ -795,8 +791,8 @@ class MeasurementTests(unittest.IsolatedAsyncioTestCase):
                 ]
             },
         ]
-        # 两次都因截断失败
-        env = install([chunk_stream_fail, chunk_stream_fail])
+        # 连续参数截断，耗尽统一步数预算。
+        env = install([chunk_stream_fail], max_iterations=3)
         turn = await env.kernel.submit("修改代码")
         self.assertIs(turn.status, TurnStatus.FAILED)
         finished = env.recorder.find("turn_finished")

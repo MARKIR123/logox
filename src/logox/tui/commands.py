@@ -61,7 +61,7 @@ AVAILABLE_COMMANDS: dict[str, str] = {
     "reload": "重扫记忆/技能/模板命令/主题，并校验配置（不改代码）",
     "mode": "切换权限模式（/mode default|creative）",
     "summary": "查看当前会话演进脉络与用量大盘",
-    "anamnesis": "入梦：/anamnesis [nap|sleep|stop|status|history|report [run_id]|trace [run_id]]",
+    "anamnesis": "入梦：/anamnesis 开始；[stop|status|history|report [run_id]|trace [run_id]|model [名称|refresh]]",
     "permissions": "查看与管理权限规则及物理沙箱（弹窗）",
 }
 

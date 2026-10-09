@@ -437,20 +437,10 @@ class AnthropicProvider:
             if isinstance(finalized, ToolCallEvent):
                 yield finalized
             else:
-                # ★ D160：与 `openai_compat` **对齐**，打上 `is_truncated` 标记。
-                #
-                # 为什么必须打：`kernel/loop.py:607` 的 D121 自愈闭环**只认这一个标记** ——
-                #     if failure.is_truncated and truncation_healing_count < max_truncation_healings:
-                # 而此前**只有 OpenAI 那条路打了它**（`openai_compat.py:388`），
-                # 于是 Anthropic 用户撞到"参数被输出上限截断"时，
-                # 得到的仍是那个**无可挽回的闪退**，D121 承诺的自愈一次都不会触发。
-                #
-                # 判据：Anthropic 用 `max_tokens` 表示"被输出上限截断"（对应 OpenAI 的 `length`）。
-                # 与 openai 侧同样，**只改消息与标记，不改 category**：
-                # `BAD_REQUEST` 的 `feedable_to_model=True`，所以它本来就会回灌给模型，
-                # 只是少了"这是截断、请分批"这条关键提示。
+                # 与 OpenAI 兼容路径对齐：只有明确限制结束信号才标记参数截断。
+                # 内核继续收集 usage/stop，拒绝整批工具后提示重新生成完整参数。
                 base_msg = str(finalized.get("error", "工具调用装配失败"))
-                is_truncated = stop_raw in ("max_tokens", "length")
+                is_truncated = stop_raw in ("max_tokens", "length", "model_context_window_exceeded")
                 if is_truncated:
                     msg = f"{base_msg}（输出已达到 Token 上限并被截断，请简化操作或分批写入）"
                 else:
@@ -466,7 +456,7 @@ class AnthropicProvider:
         if usage is not None:
             yield UsageEvent(usage=usage)
 
-        yield StopEvent(stop_reason=normalize_stop_reason(stop_raw), model=model)
+        yield StopEvent(stop_reason=normalize_stop_reason(stop_raw), raw_stop_reason=stop_raw, model=model)
 
     # ------------------------------------------------------------------ #
     # 主入口

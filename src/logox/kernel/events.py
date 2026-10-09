@@ -216,6 +216,7 @@ class ModelRequestFinished(Event):
     duration_ms: int = Field(ge=0)
     first_token_ms: int | None = None
     stop_reason: str = "stop"
+    raw_stop_reason: str | None = None
     cost_usd: float | None = None
     #: 厂商**是否真的上报了**用量。
     #:

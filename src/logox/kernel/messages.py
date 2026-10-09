@@ -31,6 +31,7 @@ __all__ = [
     "ToolUseBlock",
     "text_message",
     "user_message",
+    "complete_tool_results",
 ]
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
@@ -114,9 +115,7 @@ class MessageMeta(BaseModel):
     #: * ``model_tag`` —— 模型仍用了旧的 `<turn_summary>` 标签（过渡期的兼容路径）
     #: * ``model_fallback`` —— 末尾行不合规，**又调了一次模型**补写（第 2 层兜底）
     #: * ``deterministic`` —— 连补写都失败，本地自动生成（第 3 层兜底）
-    summary_source: Literal[
-        "model_last_line", "model_tag", "model_fallback", "deterministic"
-    ] | None = None
+    summary_source: Literal["model_last_line", "model_tag", "model_fallback", "deterministic"] | None = None
 
     #: ★ CHANGE-052：这条消息来自 ``transcript.jsonl`` 的第几行（1-based）。
     #:
@@ -188,3 +187,40 @@ def user_message(text: str) -> Message:
 
 def text_message(role: Literal["system", "user", "assistant"], text: str) -> Message:
     return Message(role=role, blocks=[TextBlock(text=text)])
+
+
+def complete_tool_results(
+    messages: list[Message],
+    *,
+    missing_content: str = "该工具没有返回结果：执行被中断或结果未保存，请核对实际状态后再决定是否重试。",
+) -> list[Message]:
+    """按 assistant 批次补齐缺失结果，保留已有消息与元数据，不执行工具。"""
+    repaired: list[Message] = []
+    pending: dict[str, None] = {}
+    last_tool_index: int | None = None
+
+    def finish_batch() -> None:
+        if not pending:
+            return
+        missing = [ToolResultBlock(id=call_id, ok=False, content=missing_content) for call_id in pending]
+        if last_tool_index is None:
+            repaired.append(Message(role="tool", blocks=missing))
+        else:
+            previous = repaired[last_tool_index]
+            repaired[last_tool_index] = previous.model_copy(update={"blocks": [*previous.blocks, *missing]})
+        pending.clear()
+
+    for message in messages:
+        if message.role != "tool":
+            # 结果必须位于当前调用之后、下一条非工具消息之前。
+            finish_batch()
+            last_tool_index = None
+            if message.role == "assistant":
+                pending = dict.fromkeys(block.id for block in message.blocks_of(ToolUseBlock))
+        else:
+            for block in message.blocks_of(ToolResultBlock):
+                pending.pop(block.id, None)
+            last_tool_index = len(repaired)
+        repaired.append(message)
+    finish_batch()
+    return repaired

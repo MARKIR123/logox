@@ -478,7 +478,7 @@ async def _chat_main(
                 base_dir=paths.sessions, session_id=bus.session_id
             ),
             # ★ D157：`[context]` 配置同样接线（两条装配路径不能漂移 —— F-07 的教训）
-            **_context_params(bundle),
+            **_context_params(bundle, paths),
         ),
         model=model,
         temperature=provider_config.temperature,
@@ -606,12 +606,15 @@ class _ChatRenderer:  # noqa: D101 - 内部类型，模块文档已说明其职�
 
 
 
-def _context_params(bundle: Any) -> dict[str, Any]:
+def _context_params(bundle: Any, paths: Any = None) -> dict[str, Any]:
     """把 ``[context]`` 配置展开成 `HierarchicalContextBuilder` 的关键字参数（D157）。
 
     为什么抽出来：装配有**两条路径**（TUI 的 `app.py` 与 `--chat` 的 `cli.py`），
     F-07 已经因为"两套装配各写一遍"漂移过一次。这里让 chat 路径复用同一份映射，
     宁可多一个函数也不要第二个真相。
+
+    ``paths`` 用来接用户级人设文件（``~/.logox/LOGOX.md``）——它不属于 ``[context]``
+    配置，但同样是"忘了传就没反应"，所以一起收在这里。
     """
     config = getattr(getattr(bundle, "config", None), "context", None)
     return {
@@ -624,6 +627,7 @@ def _context_params(bundle: Any) -> dict[str, Any]:
         "rehydrate_files": getattr(config, "rehydrate_files", 5),
         "rehydrate_max_chars": getattr(config, "rehydrate_max_chars", 2000),
         "project_memory_enabled": getattr(config, "project_memory_enabled", True),
+        "persona_path": getattr(paths, "memory", None),
     }
 
 
